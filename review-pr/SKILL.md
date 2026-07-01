@@ -1,8 +1,10 @@
 ---
 name: review-pr
-description: Review PR
+description: Use when asked to review a specific GitHub pull request or GitLab merge request (given by number or URL) and post the code-review findings back on the PR — as opposed to reviewing the local working diff.
 ---
 
-# Review PR Skill
+# Review a Pull Request
 
-Do a code review of provided PR and post prioritized findings (P0/P1/P2 etc.) as a PR comment. If there is no findings and all is good – don't leave any comments in the PR, just report the result to the user.
+Do a thorough code review of the provided pull request and post the findings as a single PR comment, prioritized by severity (P0/P1/P2).
+
+If there are no findings and everything looks good, don't leave any comment on the PR — just report the result to the user.
