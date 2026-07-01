@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# Symlink every skill in this repo into each agent runtime's skills directory.
+#
+# A "skill" is any immediate subdirectory containing a SKILL.md. Symlinks point
+# back at this checkout, so edits here are picked up by all runtimes at once.
+# Safe to re-run: existing links are refreshed, stale ones are repointed, and
+# real (non-symlink) entries are left untouched.
+
+set -euo pipefail
+shopt -s nullglob
+
+# Resolve this repo's root (the parent of bin/), following symlinks to the script.
+source="${BASH_SOURCE[0]}"
+while [ -L "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" && pwd)"
+  source="$(readlink "$source")"
+  [[ $source != /* ]] && source="$dir/$source"
+done
+repo_root="$(cd -P "$(dirname "$source")/.." && pwd)"
+
+# One skills directory per agent runtime.
+targets=(
+  "$HOME/.claude/skills"
+  "$HOME/.codex/skills"
+  "$HOME/.zcode/skills"
+)
+
+# Collect skill directories (those holding a SKILL.md).
+skills=()
+for skill_md in "$repo_root"/*/SKILL.md; do
+  skills+=("$(dirname "$skill_md")")
+done
+
+if [ ${#skills[@]} -eq 0 ]; then
+  echo "No skills found in $repo_root (expected <skill>/SKILL.md)." >&2
+  exit 1
+fi
+
+link_skill() {
+  local src="$1" dest="$2"
+  if [ -L "$dest" ]; then
+    if [ "$(readlink "$dest")" = "$src" ]; then
+      echo "  ok        $(basename "$dest")"
+    else
+      ln -sfn "$src" "$dest"
+      echo "  repointed $(basename "$dest")"
+    fi
+  elif [ -e "$dest" ]; then
+    echo "  skip      $(basename "$dest") (exists, not a symlink)"
+  else
+    ln -s "$src" "$dest"
+    echo "  linked    $(basename "$dest")"
+  fi
+}
+
+for target in "${targets[@]}"; do
+  mkdir -p "$target"
+  echo "$target"
+  for skill in "${skills[@]}"; do
+    link_skill "$skill" "$target/$(basename "$skill")"
+  done
+done
+
+echo
+echo "Linked ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
