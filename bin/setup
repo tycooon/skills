@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 #
-# Symlink every skill in this repo into each agent runtime's skills directory.
+# Copy every skill in this repo into each agent runtime's skills directory.
 #
-# A "skill" is any immediate subdirectory containing a SKILL.md. Symlinks point
-# back at this checkout, so edits here are picked up by all runtimes at once.
-# Safe to re-run: existing links are refreshed, stale ones are repointed, and
-# real (non-symlink) entries are left untouched.
+# A "skill" is any immediate subdirectory containing a SKILL.md. Each skill is
+# rsync'd (mirrored) into every runtime's skills dir as a real copy rather than
+# a symlink, because some runtimes (e.g. ZCODE) don't reliably follow symlinked
+# skill directories. Safe to re-run: copies are re-synced in place, any
+# pre-existing symlink (e.g. from an earlier version of this script) is replaced
+# with a real copy, and unrelated skills already in the target dirs are left
+# untouched. Re-run after editing a skill to propagate the changes.
 
 set -euo pipefail
 shopt -s nullglob
+
+command -v rsync >/dev/null 2>&1 || {
+  echo "rsync is required but was not found in PATH." >&2
+  exit 1
+}
 
 # Resolve this repo's root (the parent of bin/), following symlinks to the script.
 source="${BASH_SOURCE[0]}"
@@ -37,30 +45,23 @@ if [ ${#skills[@]} -eq 0 ]; then
   exit 1
 fi
 
-link_skill() {
+sync_skill() {
   local src="$1" dest="$2"
-  if [ -L "$dest" ]; then
-    if [ "$(readlink "$dest")" = "$src" ]; then
-      echo "  ok        $(basename "$dest")"
-    else
-      ln -sfn "$src" "$dest"
-      echo "  repointed $(basename "$dest")"
-    fi
-  elif [ -e "$dest" ]; then
-    echo "  skip      $(basename "$dest") (exists, not a symlink)"
-  else
-    ln -s "$src" "$dest"
-    echo "  linked    $(basename "$dest")"
+  # Replace a pre-existing symlink (or stray non-directory) with a real copy.
+  if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -d "$dest" ]; }; then
+    rm -f "$dest"
   fi
+  rsync -a --delete --exclude='.DS_Store' "$src/" "$dest/"
+  echo "  synced    $(basename "$dest")"
 }
 
 for target in "${targets[@]}"; do
   mkdir -p "$target"
   echo "$target"
   for skill in "${skills[@]}"; do
-    link_skill "$skill" "$target/$(basename "$skill")"
+    sync_skill "$skill" "$target/$(basename "$skill")"
   done
 done
 
 echo
-echo "Linked ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
+echo "Synced ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
