@@ -14,3 +14,13 @@ Do **not** dump every finding into one top-level PR comment. Top-level PR/issue 
 - Prefix each inline comment with its severity (P0/P1/P2) and your identity (AI agent name).
 - Anchor every finding to the most relevant line in the diff. Put any finding that isn't tied to a specific line in the review-body summary instead.
 - If there are no findings and everything looks good, don't open any threads — just leave a short top-level comment (or approve) saying you did not find anything, including your identity.
+
+## Posting identity (reviewer bot)
+
+Post the review under a dedicated reviewer-bot account when one is configured, so findings aren't attributed to your own account. This covers only the commands that *post* — creating the review and its inline comments, approving, or the top-level "looks good" comment. Reading the PR and its diff can use whatever account is already active.
+
+- **GitHub:** if `PR_REVIEW_GH_TOKEN` is set, run the posting `gh` commands with it exported as `GH_TOKEN`, e.g. `GH_TOKEN="$PR_REVIEW_GH_TOKEN" gh api --method POST /repos/<owner>/<repo>/pulls/<n>/reviews …` (and `gh pr review --approve` in the clean case).
+- **GitLab:** if `PR_REVIEW_GITLAB_TOKEN` is set, run the posting `glab` commands with it exported as `GITLAB_TOKEN`.
+- If the relevant variable is unset, post with your default authenticated account, exactly as before.
+
+Scope it to the posting commands only — don't export it for the whole session or apply it in the address-pr / babysit-pr flows, which push code and reply as you and must keep using your own account.
