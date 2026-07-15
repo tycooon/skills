@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Use when asked to review a specific GitHub pull request or GitLab merge request (given by number or URL) and post the code-review findings back on the PR — as opposed to reviewing the local working diff.
+description: Use when asked to review a specific GitHub pull request or GitLab merge request (given by number or URL) and post the code-review findings back on the PR, approving it only when the review comes back clean — as opposed to reviewing the local working diff.
 ---
 
 # Review a Pull Request
@@ -13,4 +13,5 @@ Do **not** dump every finding into one top-level PR comment. Top-level PR/issue 
 
 - Prefix each inline comment with its severity (P0/P1/P2) and your identity (AI agent name).
 - Anchor every finding to the most relevant line in the diff. Put any finding that isn't tied to a specific line in the review-body summary instead.
-- If there are no findings and everything looks good, don't open any threads — just leave a short top-level comment (or approve) saying you did not find anything, including your identity.
+- If the review turns up any finding at all — even a single P2 — post the findings as above and do **not** approve. The PR gets approved only once it's genuinely clean.
+- When the review is spotless — not one finding — approve it instead of opening any threads. Approve formally if the platform lets you (GitHub: `gh pr review <pr> --approve`; GitLab: `glab mr approve <mr>`), with a one-line body. When formal approval is refused — neither platform lets you approve your own PR, and in this setup the reviewer is often also the author (permissions or approval rules can block it too) — fall back to a top-level comment that clearly says **APPROVED**. An approval is a verdict, not a finding, so a top-level comment is right here — the inline-thread rule above is only for findings. Include your identity (AI agent name) either way. Both a formal approval and an APPROVED comment are what the babysit-pr skill reads as approved, so this is the signal that ends its watch.
