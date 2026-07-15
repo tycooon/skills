@@ -13,6 +13,8 @@ Run this as a repeating watch, not a single sweep: make a fresh pass about every
 
 Before reviewing a PR, check whether it has already been reviewed: look for the most recent review you left under your identity (AI agent name), then compare its timestamp against both the PR's latest commit and the latest reply on the review threads you left. Skip the PR only when neither is newer — no new code, and nobody has come back to you. Always review PRs you have never reviewed.
 
+Count only genuine new code, though. A commit that merely syncs the branch with its base branch — a merge of master/main into the branch, or a rebase onto it — is **not** new code: it leaves the PR's introduced diff (`base...head`, e.g. `gh pr diff` / `glab mr diff`) unchanged. Judge by that introduced diff, not the raw commit list, since a rebase rewrites every commit SHA without touching a line of code. When such a base-sync is the only thing that has landed since your last review, there is nothing to re-review — leave nothing at all: no findings, no summary, no new APPROVED comment. (If new replies also landed, still answer those, per the cases below.)
+
 A PR can need you again with no new commit at all: instead of pushing code, the author often pushes back on a finding in its thread, explaining why they did not make the change — exactly what the address-pr skill does when it judges a comment wrong. Going by commits alone leaves that pushback unanswered forever.
 
 So when you pick a PR back up:

@@ -7,17 +7,17 @@ description: Use when asked to review a specific GitHub pull request or GitLab m
 
 Do a thorough code review of the provided pull request (GitHub) or merge request (GitLab).
 
-Post each finding as an **inline review comment** anchored to the specific file and line it refers to, submitted together as a single review (GitHub: a PR review whose per-line review comments each open a thread; GitLab: resolvable discussions positioned on the MR diff). Put a short severity-ordered summary in the review body, but keep the actual findings in the inline comments — one thread per finding.
+Post each finding as an **inline review comment** anchored to the specific file and line it refers to, submitted together as a single review (GitHub: a PR review whose per-line review comments each open a thread; GitLab: resolvable discussions positioned on the MR diff). Put a short severity-ordered summary alongside the findings — on GitHub in the review body; on GitLab as a plain MR comment (a note, e.g. `glab mr note`), **not** a discussion, so the summary doesn't sit there as its own unresolved thread. Keep the actual findings in the inline comments — one thread per finding.
 
 Do **not** dump every finding into one top-level PR comment. Top-level PR/issue comments are invisible to Claude's "address comments" auto-fix and to the address-pr skill — both act only on unresolved *review threads*. Inline comments are what make each finding individually addressable and resolvable.
 
 - Prefix each inline comment with its severity (P0/P1/P2) and your identity (AI agent name).
-- Anchor every finding to the most relevant line in the diff. Put any finding that isn't tied to a specific line in the review-body summary instead.
+- Anchor every finding to the most relevant line in the diff. Put any finding that isn't tied to a specific line in the summary instead.
 - On low-priority (P2) findings, add a line letting the author know they can resolve the thread themselves if they decide it isn't worth fixing. A P2 is a nit, not a blocker — self-resolving is how the author declines one deliberately, so it doesn't linger as an unaddressed thread.
 - If the review turns up any finding at all — even a single P2 — post the findings as above and do **not** approve. The PR gets approved only once it's genuinely clean.
 - When the review is spotless — not one finding — approve it instead of opening any threads, with a one-line body that includes your identity (AI agent name). An approval is a verdict, not a finding — it goes in a formal approval or a top-level comment, never an inline thread (the inline-thread rule above is only for findings). The two platforms differ:
   - **GitHub** — approve formally with `gh pr review <pr> --approve`. When that's refused — GitHub won't let you approve your own PR, and in this setup the reviewer is often also the author (permissions or approval rules can block it too) — fall back to a top-level comment that clearly says **APPROVED**.
-  - **GitLab** — do **not** cast a formal approval (`glab mr approve`); it registers the reviewer bot as an official approver and counts toward the MR's approval rules, and we only want a visible verdict here. Post a top-level comment that clearly says **APPROVED** instead — always a comment, never the formal approve.
+  - **GitLab** — do **not** cast a formal approval (`glab mr approve`); it registers the reviewer bot as an official approver and counts toward the MR's approval rules, and we only want a visible verdict here. Post a plain MR comment (a note, not a discussion) that clearly says **APPROVED** instead — always a comment, never the formal approve.
 
   Both a formal approval and an APPROVED comment are what the babysit-pr skill reads as approved, so this is the signal that ends its watch.
 
