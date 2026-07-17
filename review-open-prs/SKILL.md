@@ -1,6 +1,6 @@
 ---
 name: review-open-prs
-description: Use when asked to review all open pull requests / merge requests in a repository at once (rather than one specific PR) and post code-review findings back on each — enumerates every open non-draft PR and reviews each the way review-pr handles a single one (skipping any unchanged since its last review), and keeps sweeping on a ~5-minute loop until an hour passes with no new activity on any PR.
+description: Use when asked to review all open pull requests / merge requests in a repository at once (rather than one specific PR) and post code-review findings back on each — enumerates every open non-draft PR and reviews each the way review-pr handles a single one (skipping any unchanged since its last review), and keeps sweeping on a loop that backs off as things go quiet, until the repo has had no new activity for hours.
 ---
 
 # Review All Open Pull Requests
@@ -9,7 +9,9 @@ Find every open, non-draft pull request (GitHub) or merge request (GitLab) in th
 
 ## Keep watching on a loop
 
-Run this as a repeating watch, not a single sweep: make a fresh pass about every 5 minutes, so PRs get re-reviewed as they gain commits and replies and newly-opened PRs get picked up. Drive the loop with the same self-paced watch mechanism the babysit-pr skill uses — schedule a non-blocking resume ~5 minutes out (no foreground `sleep`), carry your state across wake-ups, run the first pass immediately, stay silent on quiet passes, and fall back gracefully where no scheduled resume exists; see babysit-pr for those details. Stop on the same rule as babysit-pr: quit once about an hour has passed with no update anywhere. For a whole-repo watch, an "update" is any pass with something to do — a PR reviewed (new or newly-changed), replies answered, or a newly-opened PR seen — so a pass where every PR is skipped as unchanged is a quiet round, and about an hour of consecutive quiet rounds ends the watch. Carry the timestamp of the last pass that had an update across wake-ups, and refresh it whenever a pass does something.
+Run this as a repeating watch, not a single sweep, so PRs get re-reviewed as they gain commits and replies and newly-opened PRs get picked up. Drive it with the self-paced watch the babysit-pr skill specifies, and take that whole thing as written — read its *Waiting between rounds* section and its *Gone quiet* stop rule and apply them here: the non-blocking scheduled resume (never a foreground `sleep`), the wait that backs off while nothing is happening and snaps back on any update, the state carried across wake-ups, the first pass run immediately, the silence on quiet passes, and the graceful fallback where no scheduled resume exists. The two watches are deliberately identical, so don't invent a different cadence or cap for this one — babysit-pr is the single source of both.
+
+Only one thing differs here: what counts as an "update". For a whole-repo watch it's any pass with something to do — a PR reviewed (new or newly-changed), replies answered, or a newly-opened PR seen — so a pass where every PR is skipped as unchanged is a quiet round. Refresh the last-update timestamp whenever a pass does something; the backoff and the quiet cap both follow from that timestamp exactly as babysit-pr describes.
 
 Before reviewing a PR, check whether it has already been reviewed: look for the most recent review you left under your identity (AI agent name), then compare its timestamp against both the PR's latest commit and the latest reply on the review threads you left. Skip the PR only when neither is newer — no new code, and nobody has come back to you. Always review PRs you have never reviewed.
 

@@ -1,11 +1,11 @@
 ---
 name: babysit-pr
-description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting about 5 minutes between rounds, and stops once the PR gets a formal approval or an approval comment (or is merged/closed). Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
+description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR gets a formal approval or an approval comment (or is merged/closed). Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
 ---
 
 # Babysit a Pull Request
 
-Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it's approved (or merged/closed), polling about every 5 minutes.
+Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it's approved (or merged/closed), polling every few minutes at first and backing off as it stays quiet.
 
 ## The loop
 
@@ -13,7 +13,7 @@ Resolve the target PR once, then keep watching that same one. Each round:
 
 1. **Check for a stop signal first** (see below). If one is met, stop and give the final report — don't keep working an already-approved or closed PR.
 2. **Otherwise run one address-pr pass** by invoking the address-pr skill: it resolves conflicts with the base, addresses the open/unresolved review comments, handles failing CI, and pushes once — but only if something actually changed. Just invoke it every round and let it no-op when nothing has changed; don't try to pre-detect new activity yourself. A round with nothing new is a no-op, and that's expected; most rounds while you wait on a reviewer will be quiet.
-3. **Wait about 5 minutes**, then repeat from step 1 — the wait is *between* rounds, so run the first round right away rather than waiting first.
+3. **Wait** — how long is under *Waiting between rounds* below, and it grows as the PR stays quiet — then repeat from step 1. The wait is *between* rounds, so run the first round right away rather than waiting first.
 
 ## When to stop
 
@@ -21,14 +21,18 @@ Stop the loop and report as soon as any of these is true:
 
 - **Approved** — a reviewer's *latest* review is a formal approval (GitHub: that user's newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a reviewer left a comment that genuinely signals go (LGTM, "approved", "ship it", 👍). Judge intent, not keywords — "not approving until you fix X" is not approval. Ignore the PR author's own reviews and comments.
 - **Merged or closed.**
-- **Gone quiet** — about an hour has passed with no update to the PR: a run of quiet rounds (roughly a dozen) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned.
+- **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly ten, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned.
 - **Hard error** — the PR or branch is gone, auth fails, or a push is rejected in a way a retry won't fix. Stop and report rather than spinning on it.
 
 Transient trouble — rate limits, a flaky network, a single failed API call — is *not* a stop: treat that round as a no-op and try again next round.
 
 ## Waiting between rounds
 
-You run as one continuous, self-paced task — not a fresh invocation per round — so between rounds wait about 5 minutes *without blocking*: hand control back and schedule yourself to resume, rather than a foreground `sleep` (which is typically blocked). In Claude Code that's `ScheduleWakeup`, the mechanism `/loop`'s dynamic mode uses: resume ~5 minutes out (a little under, say 270s, is fine and keeps each wake-up cheap) and end the loop with its `stop` once a stop condition is met. Keep the wake-up's `reason` short — on a silent watch it's the one line the user sees each round. Each wake-up re-enters this skill, so carry your state along in it: the target PR and the timestamp of the most recent update you've seen, refreshed to now on any round that finds one. That timestamp is how the next round knows which PR to look at and whether the watch has gone quiet — stop once about an hour has passed with no update. If your runtime has no way to resume without blocking, don't busy-wait or fake the delay — tell the user this skill needs a scheduled-resume capability (e.g. running it on a recurring interval) and stop.
+You run as one continuous, self-paced task — not a fresh invocation per round — so between rounds wait *without blocking*: hand control back and schedule yourself to resume, rather than a foreground `sleep` (which is typically blocked). In Claude Code that's `ScheduleWakeup`, the mechanism `/loop`'s dynamic mode uses; end the loop with its `stop` once a stop condition is met.
+
+Let the wait grow while the PR sits idle. Start at **5 minutes**, and after each quiet round double it — 5, 10, 20, 30 — with **30 minutes the cap**. Any round that finds an update drops it straight back to 5, so a PR that just came alive gets polled tightly again while one nobody has touched costs two wake-ups an hour instead of twelve. Pick the wait from how fast the PR is actually moving, and never shorten it just to keep your context warm — that buys nothing and burns a round.
+
+Keep the wake-up's `reason` short — on a silent watch it's the one line the user sees each round. Each wake-up re-enters this skill, so carry your state along in it: the target PR, the timestamp of the most recent update you've seen (refreshed to now on any round that finds one), and the current wait. That timestamp is how the next round knows which PR to look at and whether the watch has gone quiet — stop once about **4 hours** have passed with no update, measured from that timestamp rather than from when the watch started. If your runtime has no way to resume without blocking, don't busy-wait or fake the delay — tell the user this skill needs a scheduled-resume capability (e.g. running it on a recurring interval) and stop.
 
 ## Detecting the stop signal
 
