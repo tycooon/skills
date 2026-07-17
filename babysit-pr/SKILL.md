@@ -30,9 +30,20 @@ Transient trouble — rate limits, a flaky network, a single failed API call —
 
 You run as one continuous, self-paced task — not a fresh invocation per round — so between rounds wait *without blocking*: hand control back and schedule yourself to resume, rather than a foreground `sleep` (which is typically blocked). In Claude Code that's `ScheduleWakeup`, the mechanism `/loop`'s dynamic mode uses; end the loop with its `stop` once a stop condition is met.
 
-Let the wait grow while the PR sits idle. Start at **5 minutes**, and after each quiet round double it — 5, 10, 20, 30 — with **30 minutes the cap**. Any round that finds an update drops it straight back to 5, so a PR that just came alive gets polled tightly again while one nobody has touched costs two wake-ups an hour instead of twelve. Pick the wait from how fast the PR is actually moving, and never shorten it just to keep your context warm — that buys nothing and burns a round.
+Let the wait grow while the PR sits idle. How long to wait depends on one thing only — how many quiet rounds you have behind you right now, a quiet round being one where nothing had changed and there was nothing to do:
 
-Keep the wake-up's `reason` short — on a silent watch it's the one line the user sees each round. Each wake-up re-enters this skill, so carry your state along in it: the target PR, the timestamp of the most recent update you've seen (refreshed to now on any round that finds one), and the current wait. That timestamp is how the next round knows which PR to look at and whether the watch has gone quiet — stop once about **4 hours** have passed with no update, measured from that timestamp rather than from when the watch started. If your runtime has no way to resume without blocking, don't busy-wait or fake the delay — tell the user this skill needs a scheduled-resume capability (e.g. running it on a recurring interval) and stop.
+| Quiet rounds in a row so far | Wait before the next round |
+|---|---|
+| 0 — the round you just ran did something | 5 min — `delaySeconds: 300` |
+| 1 | 10 min — `600` |
+| 2 | 20 min — `1200` |
+| 3 or more | 30 min — `1800`, the cap |
+
+Read that table after every round and take the wait from it; don't track a wait that you double by hand. Any round that finds an update puts the count back to 0, so a PR that just came alive returns to a 5-minute pulse immediately, while one nobody has touched costs two wake-ups an hour instead of twelve. Never shorten a wait to keep your context warm — that buys nothing and burns a round.
+
+Measured from the last update, that puts rounds at 5, 15, 35 and 65 minutes, then every 30 after — about ten rounds to reach the 4-hour stop.
+
+Keep the wake-up's `reason` short — on a silent watch it's the one line the user sees each round. Each wake-up re-enters this skill, so carry your state along in it: the target PR, the timestamp of the most recent update you've seen (refreshed to now on any round that finds one), and how many quiet rounds have run in a row (back to 0 on any round that finds one — that count is what the table above reads). That timestamp is how the next round knows which PR to look at and whether the watch has gone quiet — stop once about **4 hours** have passed with no update, measured from that timestamp rather than from when the watch started. If your runtime has no way to resume without blocking, don't busy-wait or fake the delay — tell the user this skill needs a scheduled-resume capability (e.g. running it on a recurring interval) and stop.
 
 ## Detecting the stop signal
 
