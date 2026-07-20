@@ -19,7 +19,7 @@ Resolve the target PR once, then keep watching that same one. Each round:
 
 Stop the loop and report as soon as any of these is true:
 
-- **Approved** — a reviewer's *latest* review is a formal approval (GitHub: that user's newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a reviewer left a comment that genuinely signals go (LGTM, "approved", "ship it", 👍). Judge intent, not keywords — "not approving until you fix X" is not approval. Ignore the PR author's own reviews and comments.
+- **Approved** — a *latest* review is a formal approval (GitHub: that user's newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a review/comment genuinely signals go (LGTM, "approved", "ship it", 👍). The go-signal counts **even when it comes from the PR author's own account** — an automated code review commonly posts its `APPROVED` verdict there, and that is a real approval, not self-approval to discard. Judge intent, not keywords: "not approving until you fix X" is not approval, and neither is a comment that merely describes or acknowledges the change — in particular, the loop's own address-pr replies never count as a go-signal.
 - **Merged or closed.**
 - **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly ten, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned.
 - **Hard error** — the PR or branch is gone, auth fails, or a push is rejected in a way a retry won't fix. Stop and report rather than spinning on it.
@@ -47,8 +47,8 @@ Keep the wake-up's `reason` short — on a silent watch it's the one line the us
 
 ## Detecting the stop signal
 
-- **GitHub:** `gh pr view <pr> --json state,mergedAt,author,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, a reviewer whose *latest* `reviews` entry is `APPROVED`, or an approval-style go-signal from a non-`author`, whether that lands as a top-level `comments` entry or in the body of a `reviews` entry (a "LGTM" left as a plain comment or review, not just the Approve button). GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
-- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, an approval, or an approval-style note from someone other than the author.
+- **GitHub:** `gh pr view <pr> --json state,mergedAt,author,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, a reviewer whose *latest* `reviews` entry is `APPROVED`, or an approval-style go-signal (a "LGTM"/`APPROVED` left as a plain comment or review, not just the Approve button) whether it lands as a top-level `comments` entry or in a `reviews` body — **from any account, including the PR `author`** (an automated review often posts its verdict there), but never the loop's own address-pr replies. GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
+- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, an approval, or an approval-style note **from anyone, including the author** (an automated review often posts its `APPROVED` verdict under the author's account), but never the loop's own address-pr replies.
 
 ## Report
 
