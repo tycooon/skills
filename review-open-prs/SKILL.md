@@ -22,13 +22,15 @@ Count only genuine new code, though. A commit that merely syncs the branch with 
 
 A PR can need you again with no new commit at all: instead of pushing code, the author often pushes back on a finding in its thread, explaining why they did not make the change — exactly what the address-pr skill does when it judges a comment wrong. Going by commits alone leaves that pushback unanswered forever.
 
+Resolving threads is your job as reviewer, not the author's: the address-pr flow replies on each thread but leaves it open, so on re-review you resolve every thread that's been settled — the finding's fix has landed, or you've accepted the author's pushback — and leave open only the ones that still stand.
+
 So when you pick a PR back up:
 
-- **New commits** — review the new code, following the conventions below.
+- **New commits** — review the new code, following the conventions below, and resolve each earlier thread whose finding the new code has genuinely fixed; leave a thread open when the change doesn't actually settle it, saying what's still wrong.
 - **New replies, no new code** — don't re-review unchanged code and don't re-post findings you already made. Answer each new reply on its own thread: concede and resolve the thread when the pushback is right, or hold the finding, with your reasoning, when it isn't.
 - **Both** — do both.
 
-After answering the replies, re-audit every finding you left. If none remain, approve the current head/diff using the review-pr flow below unless that state is already approved. Do this even when no code changed: the approval is the final clean verdict, not a re-review of unchanged code. If any finding remains, do not approve.
+After answering the replies and resolving the threads that are now settled, re-audit every finding you left. If none remain, approve the current head/diff using the review-pr flow below unless that state is already approved. Do this even when no code changed: the approval is the final clean verdict, not a re-review of unchanged code. If any finding remains, do not approve.
 
 Never open a second thread for a finding that already has one — reply on the existing thread rather than duplicating it.
 

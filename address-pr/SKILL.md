@@ -1,6 +1,6 @@
 ---
 name: address-pr
-description: Use when asked to address a pull request or merge request — syncs with the base branch (rebasing a stacked PR onto the default branch once the PR underneath it has merged) and resolves merge conflicts, then reads and addresses the open/unresolved review comments (making code changes, replying on each thread, resolving them), and fixes or retries failing CI checks, then pushes. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The counterpart to review-pr, which posts comments rather than addressing them.
+description: Use when asked to address a pull request or merge request — syncs with the base branch (rebasing a stacked PR onto the default branch once the PR underneath it has merged) and resolves merge conflicts, then reads and addresses the open/unresolved review comments (making code changes and replying on each thread, but leaving the threads open for the reviewer to resolve), and fixes or retries failing CI checks, then pushes. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The counterpart to review-pr, which posts comments rather than addressing them.
 ---
 
 # Address a Pull Request
@@ -43,9 +43,9 @@ Flag any resolution you're unsure about in the final report. If a conflict genui
 Find the open review comments and unresolved threads and work through them:
 
 - Understand each comment. Apply technical rigor: don't blindly implement. Make the code change when the comment is right; when it's wrong, misguided, or based on a misunderstanding, don't make a bad change — explain your reasoning in the reply instead. When a comment is genuinely ambiguous or a judgment call, ask the user rather than guessing.
-- For each actionable comment, make the code change. Group related comments so a single change can resolve several threads.
-- Reply on each thread saying what you did, or why you didn't. Resolve threads you've addressed. Replies should include your identity (AI agent name).
-- Skip already-resolved threads and comments that are just approval or acknowledgement.
+- For each actionable comment, make the code change. Group related comments so a single change can address several threads.
+- Reply on each thread saying what you did, or why you didn't, then leave the thread open. Resolving a thread is the reviewer's call, not the author's — the reviewer verifies the fix (or your reasoning) and resolves it on re-review. Replies should include your identity (AI agent name).
+- Skip already-resolved threads and comments that are just approval or acknowledgement. Also skip any thread whose latest reply is already your own: you've addressed it and it's now waiting on the reviewer, so replying again would only duplicate — re-engage such a thread only once someone has replied back after you.
 
 ## 3. Check and fix CI failures
 
