@@ -21,7 +21,7 @@ Stop the loop and report as soon as any of these is true:
 
 - **Approved** — a *latest* review is a formal approval (GitHub: that user's newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a review/comment genuinely signals go (LGTM, "approved", "ship it", 👍). The go-signal counts **even when it comes from the PR author's own account** — an automated code review commonly posts its `APPROVED` verdict there, and that is a real approval, not self-approval to discard. Judge intent, not keywords: "not approving until you fix X" is not approval, and neither is a comment that merely describes or acknowledges the change — in particular, the loop's own address-pr replies never count as a go-signal.
 - **Merged or closed.**
-- **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly ten, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned.
+- **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly a dozen, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned.
 - **Hard error** — the PR or branch is gone, auth fails, or a push is rejected in a way a retry won't fix. Stop and report rather than spinning on it.
 
 Transient trouble — rate limits, a flaky network, a single failed API call — is *not* a stop: treat that round as a no-op and try again next round.
@@ -34,14 +34,14 @@ Let the wait grow while the PR sits idle. How long to wait depends on one thing 
 
 | Quiet rounds in a row so far | Wait before the next round |
 |---|---|
-| 0 — the round you just ran did something | 5 min — `delaySeconds: 300` |
-| 1 | 10 min — `600` |
-| 2 | 20 min — `1200` |
-| 3 or more | 30 min — `1800`, the cap |
+| 0 (the round you just ran did something) or 1 | 5 min — `delaySeconds: 300` |
+| 2 or 3 | 10 min — `600` |
+| 4 or 5 | 20 min — `1200` |
+| 6 or more | 30 min — `1800`, the cap |
 
 Read that table after every round and take the wait from it; don't track a wait that you double by hand. Any round that finds an update puts the count back to 0, so a PR that just came alive returns to a 5-minute pulse immediately, while one nobody has touched costs two wake-ups an hour instead of twelve. Never shorten a wait to keep your context warm — that buys nothing and burns a round.
 
-Measured from the last update, that puts rounds at 5, 15, 35 and 65 minutes, then every 30 after — about ten rounds to reach the 4-hour stop.
+Measured from the last update, that puts rounds at 5, 10, 20, 30, 50 and 70 minutes, then every 30 after — about a dozen rounds to reach the 4-hour stop.
 
 Keep the wake-up's `reason` short — on a silent watch it's the one line the user sees each round. Each wake-up re-enters this skill, so carry your state along in it: the target PR, the timestamp of the most recent update you've seen (refreshed to now on any round that finds one), and how many quiet rounds have run in a row (back to 0 on any round that finds one — that count is what the table above reads). That timestamp is how the next round knows which PR to look at and whether the watch has gone quiet — stop once about **4 hours** have passed with no update, measured from that timestamp rather than from when the watch started. If your runtime has no way to resume without blocking, don't busy-wait or fake the delay — tell the user this skill needs a scheduled-resume capability (e.g. running it on a recurring interval) and stop.
 
