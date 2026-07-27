@@ -40,12 +40,12 @@ Flag any resolution you're unsure about in the final report. If a conflict genui
 
 ## 2. Address the review comments
 
-Find the open review comments and unresolved threads and work through them:
+A thread is yours to act on when it is **unresolved and its last comment is not yours**. Both halves matter and both are read from the thread itself — never from a timestamp, and never from "what arrived since the last round". A time window drops anything that landed while you were busy elsewhere in that round, and it never comes back; the last-commenter test keeps failing until you actually answer. Select the threads that way, then work through them:
 
 - Understand each comment. Apply technical rigor: don't blindly implement. Make the code change when the comment is right; when it's wrong, misguided, or based on a misunderstanding, don't make a bad change — explain your reasoning in the reply instead. When a comment is genuinely ambiguous or a judgment call, ask the user rather than guessing.
 - For each actionable comment, make the code change. Group related comments so a single change can address several threads.
 - Reply on each thread saying what you did, or why you didn't, then leave the thread open. Resolving a thread is the reviewer's call, not the author's — the reviewer verifies the fix (or your reasoning) and resolves it on re-review. Replies should include your identity (AI agent name).
-- Skip already-resolved threads and comments that are just approval or acknowledgement. Also skip any thread whose latest reply is already your own: you've addressed it and it's now waiting on the reviewer, so replying again would only duplicate — re-engage such a thread only once someone has replied back after you.
+- Skip comments that are just approval or acknowledgement. The two structural skips fall out of the selection rule above: a resolved thread is settled, and a thread whose last comment is your own is waiting on the reviewer, so replying again would only duplicate — re-engage that one only once someone has replied back after you. Age is not a skip: a reviewer reply you have never answered is yours to act on however long it has been sitting, and it stays yours every round until you do.
 
 ## 3. Check and fix CI failures
 
