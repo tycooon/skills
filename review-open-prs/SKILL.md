@@ -7,6 +7,8 @@ description: Use when asked to review all open pull requests / merge requests in
 
 Find every open, non-draft pull request (GitHub) or merge request (GitLab) in the current repository, then review each one — dispatching a subagent per PR so the reviews run in parallel.
 
+Review the code, not the pipeline — the same scope review-pr sets, and it binds every subagent you dispatch. Don't pull up any PR's check or pipeline status, and never turn a failing, pending, or missing check into a finding, into a reason to withhold approval, or into a line in the per-PR notes or the closing summary. CI is the address-pr skill's business, not the reviewer's.
+
 ## Keep watching on a loop
 
 Run this as a repeating watch, not a single sweep, so PRs get re-reviewed as they gain commits and replies and newly-opened PRs get picked up. Drive it with the self-paced watch the babysit-pr skill specifies, and take that whole thing as written — read its *Waiting between rounds* section and its *When to stop* rules and apply them here: the non-blocking scheduled resume (never a foreground `sleep`), the wait that backs off while nothing is happening and snaps back on any update, the state carried across wake-ups, the first pass run immediately, the silence on quiet passes, and the graceful fallback where no scheduled resume exists. Its *Gone quiet* and *Hard error* stops both apply, along with the carve-out that comes with them: transient trouble — a rate limit, a flaky network, one failed API call — is a no-op pass, not a stop. Only *Approved* and *Merged or closed* don't carry over; those judge a single PR, not a whole repo. The two watches are otherwise deliberately identical, so don't invent a different cadence or cap for this one — babysit-pr is the single source of both.
