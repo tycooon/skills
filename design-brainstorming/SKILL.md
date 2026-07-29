@@ -26,10 +26,10 @@ You MUST create a task for each of these items and complete them in order:
 3. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
 4. **Propose 2-3 approaches** — with trade-offs and your recommendation
 5. **Present design** — in sections scaled to their complexity, get user approval after each section
-6. **Write design doc** — save to `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md` and commit
+6. **Write design doc** — save to `~/.claude/plans/YYYY-MM-DD-<topic>-design.md`, do NOT commit it
 7. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 8. **User reviews written spec** — ask user to review the spec file before proceeding
-9. **Transition to implementation** — invoke superpowers:writing-plans skill to create implementation plan
+9. **Transition to implementation** — invoke design-implementation skill, which plans and then implements in one flow
 
 ## Process Flow
 
@@ -43,7 +43,7 @@ digraph brainstorming {
     "Write design doc" [shape=box];
     "Spec self-review\n(fix inline)" [shape=box];
     "User reviews spec?" [shape=diamond];
-    "Invoke superpowers:writing-plans skill" [shape=doublecircle];
+    "Invoke design-implementation skill" [shape=doublecircle];
 
     "Explore project context" -> "Ask clarifying questions";
     "Ask clarifying questions" -> "Propose 2-3 approaches";
@@ -54,11 +54,11 @@ digraph brainstorming {
     "Write design doc" -> "Spec self-review\n(fix inline)";
     "Spec self-review\n(fix inline)" -> "User reviews spec?";
     "User reviews spec?" -> "Write design doc" [label="changes requested"];
-    "User reviews spec?" -> "Invoke superpowers:writing-plans skill" [label="approved"];
+    "User reviews spec?" -> "Invoke design-implementation skill" [label="approved"];
 }
 ```
 
-**The terminal state is invoking superpowers:writing-plans.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is superpowers:writing-plans.
+**The terminal state is invoking design-implementation.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is design-implementation.
 
 ## The Process
 
@@ -103,10 +103,10 @@ digraph brainstorming {
 
 **Documentation:**
 
-- Write the validated design (spec) to `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`
+- Write the validated design (spec) to `~/.claude/plans/YYYY-MM-DD-<topic>-design.md`
   - (User preferences for spec location override this default)
 - Use elements-of-style:writing-clearly-and-concisely skill if available
-- Commit the design document to git
+- **Never commit the spec.** It is a working document, not a deliverable, and it lives outside any repo precisely so it can't dirty a working tree or leak into a PR diff. Do not copy it into the repo, do not `git add` it, and do not commit it "just to keep it safe."
 
 **Spec Self-Review:**
 After writing the spec document, look at it with fresh eyes:
@@ -121,14 +121,14 @@ Fix any issues inline. No need to re-review — just fix and move on.
 **User Review Gate:**
 After the spec review loop passes, ask the user to review the written spec before proceeding:
 
-> "Spec written and committed to `<path>`. Please review it and let me know if you want to make any changes before we start writing out the implementation plan."
+> "Spec written to `<path>` (uncommitted). Please review it and let me know if you want to make any changes before we start writing out the implementation plan."
 
 Wait for the user's response. If they request changes, make them and re-run the spec review loop. Only proceed once the user approves.
 
 **Implementation:**
 
-- Invoke the superpowers:writing-plans skill to create a detailed implementation plan
-- Do NOT invoke any other skill. superpowers:writing-plans is the next step.
+- Invoke the design-implementation skill. It writes the detailed plan and then implements it, without coming back for plan approval.
+- Do NOT invoke any other skill. design-implementation is the next step.
 
 ## Key Principles
 
