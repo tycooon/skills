@@ -7,6 +7,8 @@ description: Use when asked to review a specific GitHub pull request or GitLab m
 
 Do a thorough code review of the provided pull request (GitHub) or merge request (GitLab).
 
+Review the code, not the pipeline. CI belongs to the address-pr skill — don't pull up the PR's check or pipeline status, and never turn a failing, pending, or missing check into a finding, a line in the review body, or a remark to the user: a red pipeline is not a defect in the diff. It doesn't gate the verdict either — a diff you found nothing wrong with is clean and gets approved, whatever the checks are doing.
+
 A review is **one inline comment per finding, and nothing else** — each anchored to the specific file and line it refers to, all submitted together as a single review (GitHub: a PR review whose per-line review comments each open a thread; GitLab: resolvable discussions positioned on the MR diff). The threads are the review, and nothing summarizes them. GitHub's API rejects a review submitted with a blank body, so give it a single line naming your identity (AI agent name) — that line is not a summary slot, so don't recap the findings in it. (The only other thing that ever belongs in the body is a finding with no line to anchor to, per the anchoring rule below.) GitLab needs no such body: post the discussions and no accompanying note.
 
 Do **not** dump every finding into one top-level PR comment. Top-level PR/issue comments are invisible to Claude's "address comments" auto-fix and to the address-pr skill — both act only on unresolved *review threads*. Inline comments are what make each finding individually addressable and resolvable.
