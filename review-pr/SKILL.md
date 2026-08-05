@@ -27,6 +27,25 @@ Do **not** dump every finding into one top-level PR comment. Top-level PR/issue 
 
   Both a formal approval and an APPROVED comment are what the babysit-pr skill reads as approved, so this is the signal that ends its watch — but only once it can tell the verdict is its own agent's, which it does by reading the identity out of the body. A verdict that doesn't name its agent is unattributable, and the watch runs straight past it.
 
+## Re-reviewing a PR you have already reviewed
+
+Usually the PR already carries threads from an earlier review of yours — this skill runs again on every push. A re-review is mostly about those threads, not about restating them.
+
+**An open thread is the finding.** It says "this still stands" for as long as it stays open, and nothing else needs to say it. A new push is not a reason to comment on an open thread: a "still not fixed" note on every push tells the author nothing the open thread didn't, and it buries the comments that do need reading. Silence on an open thread means the finding stands.
+
+Take each thread you left open and judge it against the current code:
+
+- **Fixed** — resolve the thread. Resolving is the reviewer's job, not the author's: the address-pr flow replies and deliberately leaves threads open for you to verify and close. Resolve every thread that is genuinely settled — the fix landed, or you have accepted the author's pushback — and only those.
+- **Nothing about this finding moved** — the push went elsewhere (another thread's fix, a CI fix, a base sync, unrelated work) and this finding simply wasn't addressed. Leave the thread open and post nothing at all.
+- **It was addressed and fell short** — a partial fix, one that misses a case, one that relocates the problem or introduces a new one in the same place, or a reply claiming a fix that isn't in the code. The author acted and doesn't yet know it didn't work, so that is worth a comment: reply on the thread with what is still wrong. Say it once, for that attempt — if a later push leaves the finding untouched again, that's the silent case above, not a repeat.
+- **The author asked you something** — a direct question, or an argument that the finding is wrong (what address-pr does when it judges a comment mistaken). Answer that on its own thread: concede and resolve when the pushback is right, or hold the finding, with your reasoning, when it isn't. A reply that only reports what they did ("fixed in `abc123`") asks nothing — judge that one by the code, per the cases above.
+
+Never open a second thread for a finding that already has one — reply on the existing thread instead of duplicating it. And review only what is new since your last review; don't re-audit unchanged code or re-post findings you have already made.
+
+A commit that merely syncs the branch with its base — a merge of master/main in, or a rebase onto it — is **not** new code: it leaves the PR's introduced diff (`base...head`, e.g. `gh pr diff` / `glab mr diff`) unchanged. Judge by that introduced diff rather than the commit list, since a rebase rewrites every SHA without touching a line. When such a base-sync is all that has landed since your last review, there is nothing to re-review — leave nothing at all: no findings, no summary, no fresh APPROVED comment.
+
+Then re-audit the findings still standing. If none remain, approve the current state per the clean-review rule above — unless **you** have already approved this same state, in which case post nothing. Approve even when no code changed: the approval is the final clean verdict, not a re-review of unchanged code. If any finding still stands, don't approve. Only your own verdict counts as already-approved — a person's Approve, or another agent's, doesn't stand in for yours (read the identity off it the way babysit-pr's *Whose approval counts* describes), and treating someone else's as yours would leave the PR with no verdict from you, which a babysit-pr watch never stops on.
+
 ## Posting mechanics
 
 Review text is made of backticked code spans and `$`, and a shell will happily run and expand them. Keep review text out of the shell entirely:
@@ -40,6 +59,7 @@ Review text is made of backticked code spans and `$`, and a shell will happily r
 - If you do reach for a heredoc, quote the delimiter — `<<'EOF'`, never bare `<<EOF`. Unquoted, the shell executes backticks and expands `$` *inside* the heredoc, so a comment reading ``use `secure_compare` instead of `==` `` runs `secure_compare` as a command and posts its output. Quoting the delimiter turns all of it off.
 - The Write tool solves *shell* quoting, not *JSON* escaping. Inside a JSON string a newline is `\n`, a double quote is `\"`, a backslash is `\\` — a raw newline is invalid JSON and the API will reject it.
 - Anchor to lines that are actually in the diff: GitHub 422s a `line` outside it, and a positioned GitLab discussion needs the MR's `diff_refs` (`base_sha`/`start_sha`/`head_sha`, read from `glab api projects/<id>/merge_requests/<iid>`) in its `position`.
+- On re-review, a reply to an existing thread is not a new review, and resolving is a separate call again — **GitHub:** reply with `POST /repos/<owner>/<repo>/pulls/<n>/comments/<comment_id>/replies`, resolve with the `resolveReviewThread` GraphQL mutation on the thread id from a `reviewThreads` query; **GitLab:** reply with `POST projects/<id>/merge_requests/<iid>/discussions/<discussion_id>/notes`, resolve with `PUT projects/<id>/merge_requests/<iid>/discussions/<discussion_id>` and `resolved=true`.
 
 ## Posting identity (reviewer bot)
 
