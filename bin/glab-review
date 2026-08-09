@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# Run `glab` as the dedicated MR-review bot account.
+#
+# Drop-in replacement for `glab`: same subcommands, same flags, different
+# account. The bot's credential lives in its own glab config directory, so it is
+# never in the environment of whatever invokes this wrapper and cannot be echoed,
+# logged, or expanded into a transcript by accident.
+#
+# One-time setup:
+#
+#   mkdir -p ~/.config/glab-review
+#   GLAB_CONFIG_DIR=~/.config/glab-review glab auth login   # authenticate as the bot
+#   ln -s "$PWD/bin/glab-review" ~/bin/glab-review
+#
+# Override the config directory with GLAB_REVIEW_CONFIG_DIR (a path, not a secret).
+
+set -eu
+
+exec env GLAB_CONFIG_DIR="${GLAB_REVIEW_CONFIG_DIR:-$HOME/.config/glab-review}" glab "$@"
