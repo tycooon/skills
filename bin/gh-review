@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# Run `gh` as the dedicated PR-review bot account.
+#
+# Drop-in replacement for `gh`: same subcommands, same flags, different account.
+# The bot's credential lives in its own gh config directory, so it is never in
+# the environment of whatever invokes this wrapper and cannot be echoed, logged,
+# or expanded into a transcript by accident.
+#
+# One-time setup:
+#
+#   mkdir -p ~/.config/gh-review
+#   GH_CONFIG_DIR=~/.config/gh-review gh auth login --with-token   # paste the bot's token
+#   ln -s "$PWD/bin/gh-review" ~/bin/gh-review
+#
+# Override the config directory with GH_REVIEW_CONFIG_DIR (a path, not a secret).
+
+set -eu
+
+exec env GH_CONFIG_DIR="${GH_REVIEW_CONFIG_DIR:-$HOME/.config/gh-review}" gh "$@"
