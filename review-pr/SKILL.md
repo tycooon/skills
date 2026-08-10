@@ -65,23 +65,9 @@ Review text is made of backticked code spans and `$`, and a shell will happily r
 
 Post the review under a dedicated reviewer-bot account when one is configured, so findings aren't attributed to your own account. This covers only the commands that *post* — submitting the review and its inline comments, and approving (a formal approval or a top-level APPROVED comment). Reading the PR and its diff can use whatever account is already active.
 
-The bot's credential is held by a wrapper command, never by anything you can read:
+- **GitHub:** if `PR_REVIEW_GH_TOKEN` is set, run the posting `gh` commands with it exported as `GH_TOKEN`, e.g. `GH_TOKEN="$PR_REVIEW_GH_TOKEN" gh api --method POST /repos/<owner>/<repo>/pulls/<n>/reviews --input body.json` (and `gh pr review --approve` in the clean case).
+- **GitLab:** if `PR_REVIEW_GITLAB_TOKEN` is set, run the posting `glab` commands with it exported as `GITLAB_TOKEN`.
+- If the relevant variable is unset, post with your default authenticated account, exactly as before.
+- Test whether the variable is set **without printing it** — `[ -n "${PR_REVIEW_GH_TOKEN:-}" ] && echo set || echo unset`, or `${PR_REVIEW_GH_TOKEN:+set}`. Never `echo "$PR_REVIEW_GH_TOKEN"`, and never `${PR_REVIEW_GH_TOKEN:-unset}`: `:-` substitutes the token's **real value** whenever it is set, dumping the credential into the transcript — `:+` is the one that yields a placeholder. Pass the token by name, as above, so its value never reaches a command line, a log, or your output.
 
-- **GitHub:** if `gh-review` is on PATH, run every posting command through it in place of `gh` — `gh-review api --method POST /repos/<owner>/<repo>/pulls/<n>/reviews --input body.json`, `gh-review pr review --approve`, and so on. Subcommands and flags are identical; only the account differs.
-- **GitLab:** likewise, use `glab-review` in place of `glab` for the posting commands.
-- Check with `command -v gh-review` (or `glab-review`). That is safe to run and safe to print.
-- If the wrapper isn't on PATH, post with your default authenticated account and **say so in your report**, so the attribution is never silently wrong.
-
-**Never handle the bot's token yourself — there isn't one to handle.** Don't read it, echo it, export it, or test whether some variable holds it. No token belongs in your environment or on a command line, so any command that looks like it needs one is a mistake. Earlier versions of this skill passed `PR_REVIEW_GH_TOKEN` / `PR_REVIEW_GITLAB_TOKEN`; those are gone because presence-testing a secret leaks it sooner or later — `${VAR:-}` substitutes the **real value** and sits one character away from the `${VAR:+}` that doesn't, so the safe and unsafe spellings are indistinguishable at a glance. A wrapper on PATH removes the choice: there is nothing secret-shaped to expand.
-
-Scope the wrapper to the posting commands only — reads can use whatever account is active, and don't apply it in the address-pr / babysit-pr flows, which push code and reply as you and must keep using your own account.
-
-**Operator setup (one-time, not something the agent does).** `bin/gh-review` and `bin/glab-review` in this repo are the wrappers: each points its CLI at a separate config directory holding the bot's login. Authenticate the bot once, then put the wrapper on PATH:
-
-```sh
-mkdir -p ~/.config/gh-review
-GH_CONFIG_DIR=~/.config/gh-review gh auth login --with-token   # paste the bot's token
-ln -s "$PWD/bin/gh-review" ~/bin/gh-review
-```
-
-Same shape for GitLab with `glab auth login`, `~/.config/glab-review`, and `bin/glab-review`. Once this is done, unset `PR_REVIEW_GH_TOKEN` / `PR_REVIEW_GITLAB_TOKEN` wherever they are still exported — nothing reads them any more, and leaving them in the environment re-creates the leak this design removes.
+Scope it to the posting commands only — don't export it for the whole session or apply it in the address-pr / babysit-pr flows, which push code and reply as you and must keep using your own account.
