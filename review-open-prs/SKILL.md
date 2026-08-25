@@ -46,13 +46,13 @@ Independent targets can also back off independently — a repo nobody has touche
 
 ### Keep the scan cheap
 
-The scan runs every tick, so it must not cost what a review costs. Shortlist from the cheapest listing available — a group- or repo-level PR list returns head sha and last-activity for every open PR in one call — and do the expensive per-PR work (paginated discussions, diff-version history) only for the PRs whose head or activity has moved since your recorded state, plus any you have never reviewed.
+The scan runs every tick, so it must not cost what a review costs. Shortlist from the cheapest listing available — a group- or repo-level PR list returns head sha and last-activity for every open PR in one call — and do the expensive per-PR work (paginated discussions, diff-version history) only for the PRs whose head or activity has moved since your recorded state, plus any you have never reviewed. That same listing carries the dormancy cutoff described in *PRs nobody has touched in weeks*, so apply it here, off the one field you already have, before anything else costs you a call.
 
 Skip that and the scan grows with the size of the sweep: paginating every discussion of every open PR across several groups eventually takes longer than the interval it is supposed to fit inside, at which point the watch is spending its life deciding there is nothing to do.
 
 ## What a PR still owes you
 
-Before picking up a PR, work out what it still owes you, from three independent checks. **New code:** compare the current head against the commit you last reviewed — and count only genuine new code, per the base-sync rule in review-pr's *Re-reviewing a PR you have already reviewed*. **Threads waiting on you:** go thread by thread and find the open ones whose *last comment is not yours* and that you have not already weighed at the current head. **A sibling moved under it:** a PR whose own head and threads are untouched can still have been invalidated by another PR in the sweep — see *When a sibling moves under a quiet PR* below. Skip the PR only when all three come back empty. Always review PRs you have never reviewed.
+Before picking up a PR, work out what it still owes you, from three independent checks. **New code:** compare the current head against the commit you last reviewed — and count only genuine new code, per the base-sync rule in review-pr's *Re-reviewing a PR you have already reviewed*. **Threads waiting on you:** go thread by thread and find the open ones whose *last comment is not yours* and that you have not already weighed at the current head. **A sibling moved under it:** a PR whose own head and threads are untouched can still have been invalidated by another PR in the sweep — see *When a sibling moves under a quiet PR* below. Skip the PR only when all three come back empty. Always review PRs you have never reviewed — unless they are dormant, which is settled first and on its own.
 
 Decide the thread question by last commenter, never by a timestamp. Comparing "the most recent review I left" against "the most recent reply on the PR" collapses per-thread state into two numbers, and then any thread whose reply is older than your latest action *anywhere on the PR* hides behind it: answer one thread, and every older thread reads as caught up — permanently, because your own timestamp only moves forward. The same goes for asking which replies arrived since the last round, which silently drops anything that landed while you were busy elsewhere in that round. Last-commenter has no such blind spot: a thread you haven't weighed keeps failing the test every round until you do. On GitHub that is one `reviewThreads` query and a look at `comments.nodes[-1].author`; on GitLab, the last note on each unresolved discussion.
 
@@ -61,6 +61,20 @@ Decide the thread question by last commenter, never by a timestamp. Comparing "t
 Weighing a thread usually ends in posting nothing — review-pr leaves an unfixed finding's thread open and silent rather than nagging it on every push — and such a thread keeps the author's reply as its last comment, so on last-commenter alone it would read as waiting on you every round forever. So: once you have weighed a thread at a given head and chosen to stay silent, it is settled for you until something new lands on it — a new push, or a new reply. Carry that with the rest of your per-PR state. Losing it costs one extra look and nothing else, since the silent outcome posts nothing either time.
 
 A PR can need you again with no new commit at all: instead of pushing code, the author often pushes back on a finding in its thread, explaining why they did not make the change — exactly what the address-pr skill does when it judges a comment wrong. Going by commits alone leaves that pushback unanswered forever.
+
+### PRs nobody has touched in weeks
+
+A sweep is for work in flight. Read the last-activity timestamp the listing already handed you, and **skip any PR whose last activity is more than two weeks old** — including one you have never reviewed. Don't fetch its threads, don't diff it, don't dispatch an agent for it.
+
+Left in, abandoned PRs are re-examined on every tick forever, and they are the expensive ones: a branch months behind its base has an enormous diff against today's head and yields findings nobody is waiting for, while the PR someone opened this morning queues behind it.
+
+- **Read the clock before you spend anything.** A dormancy check that runs *after* you have paginated a PR's discussions has already given away most of what it saves. It belongs in the cheap scan, next to the head-sha comparison.
+- **Your own comments count as activity, and that's correct.** Posting a review bumps the timestamp, so a PR you reviewed yesterday stays in the sweep even if its author last spoke months ago — you are mid-conversation there. It costs only the three owed-work checks, which will come back empty.
+- **Revival needs no bookkeeping.** A push, a reply, a retarget — any of them moves the timestamp and the PR is back on the next tick. Don't maintain a skip-list that something has to clear.
+- **Say what you skipped**, as a count and the PR names, in the first report and the closing summary. Quietly reviewing less than the user asked for is the one way this rule does damage, and one line of output prevents it. An explicit ask always wins: if the user names a dormant PR, review it.
+- **Two weeks is the default, not a law.** Name the cutoff you used so the user can set a different one.
+
+Be honest about the trade. A long-dormant PR is not automatically harmless — one abandoned for months can carry an early draft of work that has since landed by another route, so merging it would revert the better version. This rule accepts that risk deliberately: it belongs to whoever merges the PR, not to a sweep that would otherwise never converge.
 
 ### When a sibling moves under a quiet PR
 
@@ -111,6 +125,6 @@ Posting mechanics live in review-pr's *Posting mechanics* section and every agen
 
 ## Report
 
-Skip draft PRs. Stay quiet on a pass with nothing to do; when the watch ends, tell the user why it stopped and, across the whole watch, which PRs you reviewed, which you only replied on or resolved threads on, which still carry findings you left standing untouched, which never changed, and any you dropped on an error (with what failed). Group that by target when there is more than one, and give the resolved scope alongside it — including the filter calls you made — so the user can see what was and wasn't looked at.
+Skip draft PRs. Stay quiet on a pass with nothing to do; when the watch ends, tell the user why it stopped and, across the whole watch, which PRs you reviewed, which you only replied on or resolved threads on, which still carry findings you left standing untouched, which never changed, which you skipped as dormant and the cutoff that decided it, and any you dropped on an error (with what failed). Group that by target when there is more than one, and give the resolved scope alongside it — including the filter calls you made — so the user can see what was and wasn't looked at.
 
 Whenever you name a PR/MR in anything the user reads — progress notes and the closing summary alike — give it as a clickable markdown link to the PR/MR's full URL (e.g. `[!170](https://gitlab.domain.com/group/repo/-/merge_requests/170)`), never a bare number or title.
