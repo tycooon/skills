@@ -35,12 +35,15 @@ The obvious shape — dispatch a batch, wait for every agent, then schedule the 
 
 So don't wait. On each wake-up: scan, dispatch whatever needs work and is not already in flight, schedule the next wake-up, and end the turn. Reviews finish on their own and report as they land — a completion is an event to record, not a thing to block on.
 
+**Schedule the next wake-up before you write a word of the report.** Reporting is where a turn actually ends, so a turn that reports first and schedules second is one distraction away from never scheduling at all — and then the watch is simply over: no error, no final summary, nothing in the output saying it stopped. It is the easiest way to kill a sweep and the hardest to notice, because each individual turn looks finished. Treat the order as fixed — scan, dispatch, **schedule**, report — and if you are composing prose and cannot point at the wake-up you just armed, stop and arm it. The same applies on a pass that dispatches nothing: an empty pass still has to schedule the next one.
+
 - **Carry an in-flight set** with the rest of your state: PR → the agent handling it → the head it was dispatched for. Never dispatch a second agent for a PR that already has one running; that is how the same finding gets posted twice.
 - **If a PR is pushed to while its review is in flight, leave it alone.** The running agent's verdict is for the head it was given — record it against *that* head, and let the next tick see the delta and pick it up. Interrupting or double-dispatching buys nothing.
 - **Record a reviewed head when the agent reports, not when a pass ends.** With no barrier there is no "end of pass" to hang bookkeeping on.
 - **Quiet-round counting is unchanged in spirit:** a tick that dispatched nothing and recorded nothing is quiet; a completion landing is an update. A tick is not "busy" merely because something is still running elsewhere — otherwise one long review pins the wait at its shortest value for as long as it runs.
 - **Bound how many reviews run at once.** At the cap, dispatch nothing this tick and re-schedule; don't queue more on top.
 - **A review still running after several ticks is not an error.** Say it is still in flight and move on. Only give up if it never returns, and then name the PR and say its result was lost.
+- **When a review dies mid-flight, check what it already posted before re-dispatching.** Agents get killed — a usage limit, a process exit — and one that died while posting may have left half a review on the PR: some findings up, others not, no verdict. Re-dispatching blind then duplicates whatever landed. So query the PR's notes for anything of yours newer than the dispatch time, and re-dispatch only once you know what is there; tell the replacement what it will find. This costs one API call and is the difference between a clean retry and a PR carrying the same finding twice.
 
 Independent targets can also back off independently — a repo nobody has touched all day does not need the cadence of the one people are pushing to. Keep one scheduler: give each target its own due time, wake at the soonest, and scan only the targets that are actually due.
 
@@ -49,6 +52,8 @@ Independent targets can also back off independently — a repo nobody has touche
 The scan runs every tick, so it must not cost what a review costs. Shortlist from the cheapest listing available — a group- or repo-level PR list returns head sha and last-activity for every open PR in one call — and do the expensive per-PR work (paginated discussions, diff-version history) only for the PRs whose head or activity has moved since your recorded state, plus any you have never reviewed. That same listing carries the dormancy cutoff described in *PRs nobody has touched in weeks*, so apply it here, off the one field you already have, before anything else costs you a call.
 
 Skip that and the scan grows with the size of the sweep: paginating every discussion of every open PR across several groups eventually takes longer than the interval it is supposed to fit inside, at which point the watch is spending its life deciding there is nothing to do.
+
+**The first pass of a watch is the exception: do the full per-PR check on every open PR, not the cheap delta.** The delta compares your recorded state against now, so it can only ever see movement *since you started recording* — anything that moved before the first snapshot is invisible to it, permanently, and no later pass will surface it. That is not a small gap: a PR pushed to yesterday, or one nobody has ever reviewed, looks identical to a settled one. In one sweep it hid three PRs, including one recorded as "verified settled" that had in fact been pushed to a day earlier, and one never reviewed at all. Pay the full pass once, at the start; the delta is correct from the second pass onward. If a watch is resumed after a long gap, or state was lost, pay it again.
 
 ## What a PR still owes you
 
@@ -95,6 +100,8 @@ When you do have to reconstruct — first run, or state lost — the least-bad s
 
 When the checks disagree, re-review. A false "already reviewed" silently drops real code; a false "changed" costs one agent that reports finding nothing new. Those are not close in cost.
 
+**Consult that record *after* the threads-waiting-on-you check, never before.** The record's whole job is to stop a head you deliberately said nothing about from reporting as new work forever — but the same head can perfectly well owe a reply, because the author answered a thread without pushing. Order the checks so the record can only ever settle the *new code* question: threads first, record second. Getting that backwards turns your own bookkeeping into a way to lose replies, which is worse than the re-flagging it was there to prevent.
+
 ### Telling your own comments from everyone else's
 
 Across several repos your reviews will not all sit on one account: a dedicated bot where one is configured, your own account where that bot has no access, and older reviews from before the bot existed. **The comment body is the record, not the account.**
@@ -116,6 +123,8 @@ Each subagent handles one pull request. When there is new code to review, it doe
 Give each agent what it cannot cheaply work out for itself: the host and project, the exact base/start/head shas, where the local clone is, which posting credential that target takes, which of its threads are waiting and which are yours, and any repo-local convention that overrides the defaults.
 
 **Your brief goes stale while the agent runs.** Authors push during a pass, and on a busy repo a head can move twice before an agent finishes. So require every agent to read the PR's threads from the API itself and judge against the live head — never against your summary of a finding. Summarise a thread only as a pointer; the agent reads the real text. An agent that finds your brief contradicted by the code should trust the code, say so, and act on it — including withdrawing a finding you told it was still standing.
+
+**That applies to your claims about the code, not only to your summaries of threads — and those are the ones that mislead.** A brief is written from a scan, so its factual assertions age badly and some were shaky when written: which shas moved and why, whether a code path is dead, whether a file is on master yet, whether anyone has replied. Over one multi-repo sweep, six such assertions of mine were wrong, every one caught by an agent that read the source instead of accepting the framing — a path called dead was live because the schema was non-strict; a module described as merged existed only on an unmerged branch; "the author answered in code" was said of a pure base sync that changed nothing. None of that was malice or haste; a scan simply cannot carry that much truth. So say plainly in every brief that your factual claims are starting points to verify, not premises, and ask to be told when one is wrong. An agent that silently works around a bad premise wastes the correction; one that names it improves every later brief.
 
 **Related PRs across repos are where the best findings are.** When one change spans a contract, a producer and a consumer, tell each agent about the others — repo path, current head, what it is for — so it can check the halves against each other instead of against the prose. Say which PR owns which kind of finding, too, so one disagreement doesn't get filed three times; a defect that lives purely in another PR's code belongs to that PR's reviewer.
 
