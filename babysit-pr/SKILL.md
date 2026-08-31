@@ -1,11 +1,11 @@
 ---
 name: babysit-pr
-description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR is done — its own AI reviewer has approved the current head (approvals from people or from other agents don't count), every discussion is resolved, the pipeline is green and the base branch is synced — or it's merged/closed. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
+description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR is done — an external AI reviewer has approved the current head (a person's approval doesn't count), every discussion is resolved, the pipeline is green and the base branch is synced — or it's merged/closed. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
 ---
 
 # Babysit a Pull Request
 
-Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — approved by your own agent on the current head, every discussion resolved, pipeline green, base synced — or it's merged/closed, polling every few minutes at first and backing off as it stays quiet.
+Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — approved by an external AI reviewer on the current head, every discussion resolved, pipeline green, base synced — or it's merged/closed, polling every few minutes at first and backing off as it stays quiet.
 
 ## The loop
 
@@ -19,7 +19,7 @@ Resolve the target PR once, then keep watching that same one. Each round:
 
 Stop the loop and report when the PR is **done** — which takes all four of these together, not any one of them:
 
-1. **Approved by your own agent** — see *What counts as your agent's approval* below.
+1. **Approved by the external AI reviewer** — see *What counts as an approval* below.
 2. **Every discussion resolved.**
 3. **The pipeline green** on the current head.
 4. **Synced with the base branch** — no commits behind it, no conflicts.
@@ -32,9 +32,13 @@ Stop immediately, without waiting for the four, when any of these is true instea
 - **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly a dozen, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned. The clock also never predates this watch, so it can't already be spent when you arrive: a PR nobody has touched in days still gets its first round and then its full four hours (see *Waiting between rounds*). This stop is for a PR that goes quiet **while you watch it**, never a reason to decline to start.
 - **Hard error** — the PR or branch is gone, auth fails, or a push is rejected in a way a retry won't fix. Stop and report rather than spinning on it.
 
-### What counts as your agent's approval
+### What counts as an approval
 
-Condition 1 needs the PR to carry an approval **and** that approval to be yours. Both tests must pass, and they're independent. It's an *approval* when a latest review is a formal approval (GitHub: that user's newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a review/comment genuinely signals go (LGTM, "approved", "ship it", 👍) — judge intent, not keywords: "not approving until you fix X" is not approval, and neither is a comment that merely describes or acknowledges the change, the loop's own address-pr replies included. It's *yours* only when it carries your own agent's identity — a person's approval and another agent's approval both leave the condition unmet. See *Whose approval counts* below.
+Condition 1 is met when an external AI reviewer has signed off on the current head. It's an *approval* when that reviewer's latest review is a formal approval (GitHub: its newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a review/comment genuinely signals go (LGTM, "approved", "ship it", 👍) — judge intent, not keywords: "not approving until you fix X" is not approval, and neither is a comment that merely describes or acknowledges the change, the loop's own address-pr replies included.
+
+**The watch never supplies that approval itself.** It waits for whatever AI reviewer covers this repo's PRs; reviewing the PR yourself and then stopping on your own verdict is the watch approving its own work. If nothing reviews this PR, condition 1 simply never comes true and the watch ends at the quiet cap — report that plainly instead of signing off in the reviewer's place.
+
+A person's approval is not it either. A teammate clicking Approve, or a human "LGTM", means a person is happy — it says nothing about whether the AI reviewer has signed off. Keep working, and name it in the final report so the user knows the PR is human-approved.
 
 An approval speaks for the head it named. Once a push or a rebase moves the head, it no longer describes what is on the PR, so condition 1 is unmet again until the reviewer approves the new head — even when the rebase changed nothing but the sha.
 
@@ -69,21 +73,13 @@ If your runtime has no way to resume without blocking, don't busy-wait or fake t
 
 Conditions 2-4 come straight off the host: unresolved threads from the PR's discussions, the pipeline status for the current head (not for an older one — a stale green says nothing), and the base comparison for commits-behind and mergeability. Read all four each round rather than assuming an earlier round's answer still holds.
 
-### Whose approval counts
-
-Only the AI agent you are yourself running as can end this watch. The review-pr / review-open-prs flow stamps every verdict it posts with its identity (AI agent name), so attribution is read out of the approval's *text*: stop only when that identity names your agent.
-
-- **A person's approval is not a stop.** A teammate clicking Approve, or a human "LGTM", means a person is happy — it says nothing about whether your reviewer has signed off. Keep working, and name it in the final report so the user knows the PR is human-approved.
-- **Another agent's approval is not a stop.** These skills are installed across several agent runtimes, so a verdict identified as some other agent is that agent's business, not yours.
-- **An approval you can't attribute is not a stop** — a bare Approve click with nothing in its body, an unsigned "looks good". Unverifiable counts as not yours.
-- **Match the agent, not the model.** A verdict from your own agent under a different model version is still yours.
-- **The posting account decides nothing; the identity line does.** Your reviewer posts under a dedicated bot account when one is configured and under the PR author's own account when none is — so a verdict sitting on the author's account is neither automatically yours nor automatically self-approval to discard. Read the text, not the avatar.
-
 ### Reading it off the PR
 
-- **GitHub:** `gh pr view <pr> --json state,mergedAt,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, or count condition 1 met on an approval that passes both tests above: a reviewer whose *latest* `reviews` entry is `APPROVED`, or an approval-style go-signal (a "LGTM"/`APPROVED` left as a plain comment or review, not just the Approve button) landing either as a top-level `comments` entry or in a `reviews` body — in each case with your agent's identity in that entry's `body`. GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
-- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, or count condition 1 met on an approval-style note carrying your agent's identity. A *formal* GitLab approval has no body to identify, so it can never be attributed and never ends the watch; that costs nothing, because review-pr deliberately never casts one — your reviewer's verdict always arrives as a note that names its agent.
+- **GitHub:** `gh pr view <pr> --json state,mergedAt,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, or count condition 1 met on a reviewer whose *latest* `reviews` entry is `APPROVED`, or on an approval-style go-signal (a "LGTM"/`APPROVED` left as a plain comment or review, not just the Approve button) landing either as a top-level `comments` entry or in a `reviews` body. GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
+- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, or count condition 1 met on an approval-style note. An AI reviewer's verdict usually arrives as a note rather than a formal approval, so read the notes and not just the approvals list.
+
+An AI reviewer names itself in its verdict, which is what separates it from a teammate's Approve. The posting account does not settle it: a reviewer posts under a dedicated bot account when one is configured for the repo and under the PR author's own account when none is.
 
 ## Report
 
-Stay silent on quiet rounds. Most rounds while you wait on a reviewer find nothing new — address-pr makes no change and there's nothing to say, so say nothing, and don't surface address-pr's own per-round report on those rounds either. Speak up only on a round that actually did something — a brief note of what it changed or pushed. When the loop ends, give one summary: why it stopped (all four conditions met — say who approved and on which head — or merged, closed, cap reached, or the error), and where any condition still stands unmet if you stopped for one of the other reasons, everything addressed across all the rounds (conflicts resolved, comment fixes, CI handled), and anything still uncertain or unresolved — the same honesty address-pr reports with on a single pass. If the PR picked up an approval you deliberately didn't stop on — a person's, or another agent's — say so there too, so the user knows it's sitting on the PR and can decide what it's worth.
+Stay silent on quiet rounds. Most rounds while you wait on a reviewer find nothing new — address-pr makes no change and there's nothing to say, so say nothing, and don't surface address-pr's own per-round report on those rounds either. Speak up only on a round that actually did something — a brief note of what it changed or pushed. When the loop ends, give one summary: why it stopped (all four conditions met — say who approved and on which head — or merged, closed, cap reached, or the error), and where any condition still stands unmet if you stopped for one of the other reasons, everything addressed across all the rounds (conflicts resolved, comment fixes, CI handled), and anything still uncertain or unresolved — the same honesty address-pr reports with on a single pass. If the PR picked up a person's approval, say so there too, so the user knows it's sitting on the PR and can decide what it's worth.
