@@ -46,9 +46,9 @@ Stopping when you hit a genuine blocker is different, and still required — see
 
 ## Plan Document Location
 
-**Save plans to:** `~/.claude/plans/YYYY-MM-DD-<feature-name>-plan.md`
+**Save plans to:** `<working-dir>/.plans/YYYY-MM-DD-<feature-name>-plan.md`, the same git-ignored directory the spec lives in. Inside the working directory so the desktop app can open it; `~/.claude/plans/` is what the app refuses to open. Before the first write, make sure the directory is ignored: `git check-ignore -q .plans || echo '.plans/' >> "$(git rev-parse --git-path info/exclude)"` (per repo, never committed, shared by every worktree of that repo). If the spec was written into another worktree's `.plans/`, copy it into this working directory's `.plans/` first, so both documents open from this session.
 
-**Never commit the plan.** It lives outside any repo precisely so it can't dirty a working tree or leak into a PR diff. Do not copy it into the repo, do not `git add` it, do not mention it in a commit message.
+**Never commit the plan.** `.plans/` is excluded precisely so it can't dirty a working tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, do not mention it in a commit message.
 
 ## Scope Check
 

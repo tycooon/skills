@@ -26,7 +26,7 @@ You MUST create a task for each of these items and complete them in order:
 3. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
 4. **Propose 2-3 approaches** — with trade-offs and your recommendation
 5. **Present design** — in sections scaled to their complexity, get user approval after each section
-6. **Write design doc** — save to `~/.claude/plans/YYYY-MM-DD-<topic>-design.md`, do NOT commit it
+6. **Write design doc** — save to `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md` (a git-ignored directory inside the working directory, see below), do NOT commit it
 7. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 8. **User reviews written spec** — ask user to review the spec file before proceeding
 9. **Transition to implementation** — invoke design-implementation skill, which plans and then implements in one flow
@@ -103,10 +103,12 @@ digraph brainstorming {
 
 **Documentation:**
 
-- Write the validated design (spec) to `~/.claude/plans/YYYY-MM-DD-<topic>-design.md`
+- Write the validated design (spec) to `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md`, where `<working-dir>` is the session's primary working directory (the worktree, when there is one)
   - (User preferences for spec location override this default)
+  - Inside the working directory on purpose: the desktop app can only open files under it, and a spec the user cannot click open is not reviewable. `~/.claude/plans/` is where specs used to go, and it is exactly what the app refuses.
+  - Before the first write, make sure `.plans/` is ignored: `git check-ignore -q .plans || echo '.plans/' >> "$(git rev-parse --git-path info/exclude)"`. The exclude file is per repo, never committed, and shared by every worktree of that repo, so it cannot leak into a PR the way a `.gitignore` edit would.
 - Use elements-of-style:writing-clearly-and-concisely skill if available
-- **Never commit the spec.** It is a working document, not a deliverable, and it lives outside any repo precisely so it can't dirty a working tree or leak into a PR diff. Do not copy it into the repo, do not `git add` it, and do not commit it "just to keep it safe."
+- **Never commit the spec.** It is a working document, not a deliverable. It sits in the working directory only so it can be opened; `.plans/` is excluded so it can't dirty the tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, and do not commit it "just to keep it safe."
 
 **Spec Self-Review:**
 After writing the spec document, look at it with fresh eyes:
