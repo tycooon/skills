@@ -52,6 +52,15 @@ A commit that merely syncs the branch with its base — a merge of master/main i
 
 Then re-audit the findings still standing. If none remain, approve the current state per the clean-review rule above — unless **you** have already approved this same state, in which case post nothing. Approve even when no code changed: the approval is the final clean verdict, not a re-review of unchanged code. If any finding still stands, don't approve. Only your own verdict counts as already-approved — a person's Approve doesn't stand in for it, and treating one as yours would leave the PR with no review verdict at all, which a babysit-pr watch never stops on.
 
+## When the PR merged before the review was ready
+
+A review takes minutes, and a merge does not wait for it. Re-read the PR's state right before posting, not only at the start. If it has merged by then, the findings no longer belong in threads that address-pr and the author will pick up, and the two hosts differ in where they go instead:
+
+- **GitHub** — post everything as **one new issue**: not a review on the merged PR, and not an issue per finding. Title it after the PR (`Review findings on #<n>, merged before the review was posted`); in the body put the identity line, one sentence saying the PR merged before the review was ready, then one section per finding — its severity, a permalink to the lines at the merge commit on the base branch (not the PR head, so the link shows the code as it now stands), what is wrong, and a **Suggested fix**. "Everything" is what this review would have posted — new findings, and the replies it would have left where a fix fell short — plus any earlier finding this review confirms still stands, since a merged PR's open threads are nobody's to-do list any more. Post it with `gh api --method POST /repos/<owner>/<repo>/issues --input body.json`, and search the repo's open issues first so a re-run does not file a duplicate.
+- **GitLab** — post on the merged MR itself, exactly as on an open one: positioned, resolvable discussions and replies per *Posting mechanics* below. A merged MR still takes and resolves discussions, and they stay attached to the change they describe.
+
+A merged PR gets no verdict: when the review is clean, post nothing.
+
 ## Posting mechanics
 
 Review text is made of backticked code spans and `$`, and a shell will happily run and expand them. Keep review text out of the shell entirely:
@@ -72,7 +81,7 @@ Review text is made of backticked code spans and `$`, and a shell will happily r
 
 ## Posting identity (reviewer bot)
 
-Post the review under a dedicated reviewer-bot account when one is configured, so findings aren't attributed to your own account. This covers only the commands that *post* — submitting the review and its inline comments, and approving (a formal approval or a top-level APPROVED comment). Reading the PR and its diff can use whatever account is already active.
+Post the review under a dedicated reviewer-bot account when one is configured, so findings aren't attributed to your own account. This covers only the commands that *post* — submitting the review and its inline comments, approving (a formal approval or a top-level APPROVED comment), and the findings issue for a PR that merged before the review was ready. Reading the PR and its diff can use whatever account is already active.
 
 - **GitHub:** if `PR_REVIEW_GH_TOKEN` is set, run the posting `gh` commands with it exported as `GH_TOKEN`, e.g. `GH_TOKEN="$PR_REVIEW_GH_TOKEN" gh api --method POST /repos/<owner>/<repo>/pulls/<n>/reviews --input body.json` (and `gh pr review --approve` in the clean case).
 - **GitLab:** if `PR_REVIEW_GITLAB_TOKEN` is set, run the posting `glab` commands with it exported as `GITLAB_TOKEN`.
