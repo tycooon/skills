@@ -80,7 +80,7 @@ Conditions 2-4 come straight off the host: unresolved threads from the PR's disc
 ### Reading it off the PR
 
 - **GitHub:** `gh pr view <pr> --json state,mergedAt,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, or count condition 1 met on a reviewer whose *latest* `reviews` entry is `APPROVED`, or on an approval-style go-signal (a "LGTM"/`APPROVED` left as a plain comment or review, not just the Approve button) landing either as a top-level `comments` entry or in a `reviews` body. GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
-- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, or count condition 1 met on an approval-style note. An AI reviewer's verdict usually arrives as a note rather than a formal approval, so read the notes and not just the approvals list.
+- **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, or count condition 1 met on an approval-style note. An AI reviewer's verdict usually arrives as a note, with or without a formal approval, so read the notes and not just the approvals list.
 
 An AI reviewer names itself in its verdict, which is what separates it from a teammate's Approve. The posting account does not settle it: a reviewer posts under a dedicated bot account when one is configured for the repo and under the PR author's own account when none is.
 
