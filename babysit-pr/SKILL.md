@@ -1,11 +1,11 @@
 ---
 name: babysit-pr
-description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR is done — an external AI reviewer has approved the current head (a person's approval doesn't count), every discussion is resolved, the pipeline is green and the base branch is synced — or it's merged/closed. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
+description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR is done — an external AI reviewer has approved the current head (a person's approval doesn't count), every discussion is resolved, the pipeline is green and the base doesn't block the merge — or it's merged/closed. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
 ---
 
 # Babysit a Pull Request
 
-Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — approved by an external AI reviewer on the current head, every discussion resolved, pipeline green, base synced — or it's merged/closed, polling every few minutes at first and backing off as it stays quiet.
+Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — approved by an external AI reviewer on the current head, every discussion resolved, pipeline green, mergeable with the base — or it's merged/closed, polling every few minutes at first and backing off as it stays quiet.
 
 ## The loop
 
@@ -13,6 +13,8 @@ Resolve the target PR once, then keep watching that same one. Each round:
 
 1. **Check the stop conditions first** (see below). If the PR is done, or merged/closed, stop and give the final report — don't keep working a finished PR. An approval alone does not finish it: if a condition is still unmet, this round works that condition.
 2. **Otherwise run one address-pr pass** by invoking the address-pr skill: it resolves conflicts with the base, addresses the open/unresolved review comments, handles failing CI, and pushes once — but only if something actually changed. Just invoke it every round and let it no-op when nothing has changed; don't try to pre-detect new activity yourself. A round with nothing new is a no-op, and that's expected; most rounds while you wait on a reviewer will be quiet.
+
+   **Merge the base only when you have to.** In a babysit round the pass merges `origin/<base>` only in three cases: the PR conflicts with the base, the host refuses to merge a branch that is behind (see *Detecting the stop signal*), or the round pushes other changes anyway. A base that merely moved ahead is not a reason to merge or push. A sync-only push reruns the whole pipeline on an unchanged branch and cancels the run in progress, and the base branch's own pipeline tests the merged result after the merge anyway. Unstacking a PR whose PR underneath has merged is not a sync; it still happens as address-pr describes.
 3. **Wait** — how long is under *Waiting between rounds* below, and it grows as the PR stays quiet — then repeat from step 1. The wait is *between* rounds, so run the first round right away rather than waiting first.
 
 ## When to stop
@@ -22,9 +24,9 @@ Stop the loop and report when the PR is **done** — which takes all four of the
 1. **Approved by the external AI reviewer** — see *What counts as an approval* below.
 2. **Every discussion resolved.**
 3. **The pipeline green** on the current head.
-4. **Synced with the base branch** — no commits behind it, no conflicts.
+4. **Mergeable with the base** — no conflicts, and not held back for being behind where the host requires an up-to-date branch. Otherwise, being behind doesn't count against this; see step 2 of the loop.
 
-An approval on its own is not done. A PR can carry a current approval and still be unmergeable: a red pipeline, one unresolved thread, or a base that moved underneath it each leave it stuck, and none of them resolve themselves. Keep working the remaining conditions — that is what the address-pr pass is for — and stop only once all four hold at the same time, on the same head. Anything that moves the head resets the ones that depend on it.
+An approval on its own is not done. A PR can carry a current approval and still be unmergeable: a red pipeline, one unresolved thread, or a base that blocks the merge each leave it stuck, and none of them resolve themselves. Keep working the remaining conditions — that is what the address-pr pass is for — and stop only once all four hold at the same time, on the same head. Anything that moves the head resets the ones that depend on it.
 
 Stop immediately, without waiting for the four, when any of these is true instead:
 
@@ -75,7 +77,9 @@ If your runtime has no way to resume without blocking, don't busy-wait or fake t
 
 ## Detecting the stop signal
 
-Conditions 2-4 come straight off the host: unresolved threads from the PR's discussions, the pipeline status for the current head (not for an older one — a stale green says nothing), and the base comparison for commits-behind and mergeability. Read all four each round rather than assuming an earlier round's answer still holds.
+Conditions 2-4 come straight off the host: unresolved threads from the PR's discussions, the pipeline status for the current head (not for an older one — a stale green says nothing), and whether the base blocks the merge. Read all four each round rather than assuming an earlier round's answer still holds.
+
+For the base, GitHub reports `mergeable` and `mergeStateStatus` (`gh pr view <pr> --json mergeable,mergeStateStatus`). `CONFLICTING` is a conflict. `BEHIND` means branch protection requires the branch to be up to date. Right after the head or the base moves, `mergeable` reads `UNKNOWN` for a while. Then fetch and run `git merge-tree --write-tree origin/<base> HEAD`: it exits 1 on a conflict and touches neither the worktree nor the index. On GitLab, the MR's `detailed_merge_status` (`glab api projects/:id/merge_requests/<iid>`) reads `conflict` for a conflict, and `need_rebase` when the project's merge method requires an up-to-date branch.
 
 ### Reading it off the PR
 
