@@ -9,9 +9,7 @@ description: "Use when you have a spec or requirements for a multi-step task, be
 
 Write a comprehensive implementation plan, then implement it in this session. The plan and the execution are one continuous flow — there is no handoff, no menu, and no review gate between them.
 
-Write the plan assuming the engineer has zero context for this codebase and questionable taste. Document everything they need: which files to touch for each task, code, testing, docs they might need to check, how to test it. Give them the whole plan as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
-
-Assume they are a skilled developer, but know almost nothing about our toolset or problem domain. Assume they don't know good test design very well.
+You are the plan's only reader — in this session and after any context compaction — so write down what a later you would otherwise have to rediscover: which files each task touches, the interfaces between tasks, exact commands with expected output, and how each task is tested. Give it to yourself as bite-sized tasks. DRY. YAGNI. TDD. Frequent commits.
 
 **Announce at start:** "I'm using the design-implementation skill to plan and implement this."
 
@@ -187,9 +185,7 @@ Never start implementation on main/master without explicit user consent.
 
 ## Completing the Work
 
-After all tasks are complete and verified:
-- Announce: "I'm using the finishing-a-development-branch skill to complete this work."
-- **REQUIRED SUB-SKILL:** Use `superpowers:finishing-a-development-branch`
+After all tasks are complete and verified, finish the branch per the global workflow rules — a non-draft PR, then babysit-pr — rather than offering a menu of ways to finish it.
 
 ## When to Stop and Ask for Help
 
@@ -219,4 +215,3 @@ If the user updates the spec or the approach needs rethinking, revise the plan a
 
 - **superpowers:using-git-worktrees** — ensures isolated workspace
 - **design-brainstorming** — produces the spec this skill consumes
-- **superpowers:finishing-a-development-branch** — completes development after all tasks
