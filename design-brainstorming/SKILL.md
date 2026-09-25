@@ -103,7 +103,6 @@ digraph brainstorming {
   - (User preferences for spec location override this default)
   - Inside the working directory on purpose: the desktop app can only open files under it, and a spec the user cannot click open is not reviewable. That rules out `~/.claude/plans/`, which the app refuses to open.
   - Before the first write, make sure `.plans/` is ignored: `git check-ignore -q .plans || echo '.plans/' >> "$(git rev-parse --git-path info/exclude)"`. The exclude file is per repo, never committed, and shared by every worktree of that repo, so it cannot leak into a PR the way a `.gitignore` edit would.
-- Use elements-of-style:writing-clearly-and-concisely skill if available
 - **Never commit the spec.** It is a working document, not a deliverable. It sits in the working directory only so it can be opened; `.plans/` is excluded so it can't dirty the tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, and do not commit it "just to keep it safe."
 
 **Spec Self-Review:**
