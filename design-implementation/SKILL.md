@@ -185,9 +185,7 @@ Never start implementation on main/master without explicit user consent.
 
 ## Completing the Work
 
-After all tasks are complete and verified:
-- Announce: "I'm using the finishing-a-development-branch skill to complete this work."
-- **REQUIRED SUB-SKILL:** Use `superpowers:finishing-a-development-branch`
+After all tasks are complete and verified, finish the branch per the global workflow rules — a non-draft PR, then babysit-pr — rather than offering a menu of ways to finish it.
 
 ## When to Stop and Ask for Help
 
@@ -217,4 +215,3 @@ If the user updates the spec or the approach needs rethinking, revise the plan a
 
 - **superpowers:using-git-worktrees** — ensures isolated workspace
 - **design-brainstorming** — produces the spec this skill consumes
-- **superpowers:finishing-a-development-branch** — completes development after all tasks
