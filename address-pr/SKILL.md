@@ -34,6 +34,8 @@ Do **not** reach for a plain `git rebase origin/<default>` instead. The PR under
 
 If the PR was never stacked — an ordinary one straight onto the default branch — merge `origin/<base>` into the branch: merge, not rebase, so the follow-up push stays a plain `git push` with no force-push. Rebasing to unstack is the one exception, and it makes the final push a `git push --force-with-lease`.
 
+**When babysit-pr runs this pass, merge the base here only when you have to.** That is when the PR conflicts with the base, or when the host refuses to merge it while it is behind; babysit-pr says how to tell both. Otherwise leave the merge for step 4, which does it only when the pass pushes other changes anyway. A base that merely moved on is no reason for a pass to push. Unstacking is unaffected. Run on its own, the pass syncs as described above.
+
 If the merge or rebase is clean, there's nothing to resolve. If it conflicts, resolve each conflict with real code judgment: understand what both sides changed, preserve the intent of each, and favor a correct result over mechanically taking one side.
 
 Flag any resolution you're unsure about in the final report. If a conflict genuinely can't be resolved with confidence, stop and ask rather than pushing a broken merge — and never force-push a branch you couldn't rebase cleanly.
@@ -58,5 +60,5 @@ Take one snapshot of the PR's checks — don't poll or wait for in-progress runs
 
 ## 4. Push and report
 
-- Push once, carrying the conflict resolution, comment fixes, and CI fixes together — a plain `git push`, or `git push --force-with-lease` if you rebased to unstack. If there was genuinely nothing to change — no conflicts, no actionable comments, no fixable CI failures — don't push a no-op; a job retry stands on its own and needs no push.
+- Push once, carrying the conflict resolution, comment fixes, and CI fixes together — a plain `git push`, or `git push --force-with-lease` if you rebased to unstack. In a babysit round that skipped the base merge in step 1, merge `origin/<base>` right before this push. If there was genuinely nothing to change — no conflicts, no actionable comments, no fixable CI failures — don't push a no-op; a job retry stands on its own and needs no push.
 - Give the user a short report: what changed, what you pushed back on, which conflicts you resolved (calling out anything uncertain), and how each failing check was handled — fixed, retried, or left (and why). If you pushed, a fresh CI run starts on the new commit; the skill doesn't wait for it.
