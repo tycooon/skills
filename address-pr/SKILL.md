@@ -49,6 +49,16 @@ A thread is yours to act on when it is **unresolved and its last comment is not 
 - Reply on each thread saying what you did, or why you didn't, then leave the thread open. Resolving a thread is the reviewer's call, not the author's — the reviewer verifies the fix (or your reasoning) and resolves it on re-review. Replies should include your identity (AI agent name).
 - Skip comments that are just approval or acknowledgement. The two structural skips fall out of the selection rule above: a resolved thread is settled, and a thread whose last comment is your own is waiting on the reviewer, so replying again would only duplicate — re-engage that one only once someone has replied back after you. Age is not a skip: a reviewer reply you have never answered is yours to act on however long it has been sitting, and it stays yours every round until you do.
 
+**On an RFC PR** — one whose title carries `[RFC]`; the rfc skill writes them — the threads on its open questions are settled with the reviewer first, and the user hears only about what the two of you can't settle:
+
+- **Settle it** when the reviewer agrees with your recommendation, or argues for an option that convinces you: move the question from the spec's open questions to its decisions, with the answer and `Settled with <reviewer>`, and reply on the thread.
+- **Answer once** when its argument doesn't convince you: say why, with evidence.
+- **A question the reviewer raised** that the RFC missed goes into the open questions under the next free ID, with your recommendation — or straight into the decisions, when the evidence settles it. Reply either way.
+- **Take it to the user** only when the reviewer still holds its position after your answer (or two reviewers disagree and neither moves), or when you both judge it a call only the owner can make. For these threads, that replaces asking the user on a judgment call: the reviewer is asked first, and the user only after.
+- **Taking it to the user** means marking the question `Waiting on the owner` in the spec and in the PR description, with each side's position and what each option would change, and saying so on the thread. Then ask the user in the session, with a push notification where your runtime has one: every question now waiting, in one message, each answerable in a line. A mention on the PR won't reach them when you post under their account.
+- **The owner's answer** comes in the session or on the thread. Record it among the decisions as `Decided by the owner on <date>`, reply on the thread, and push. The reviewer resolves the thread.
+- **The push that settles the last question** also sets each doc's Status to `RFC: questions settled on <date>`, so the approval lands on the final text and nothing needs editing after it.
+
 ## 3. Check and fix CI failures
 
 Take one snapshot of the PR's checks — don't poll or wait for in-progress runs (GitHub: `gh pr checks`, then `gh run view --log-failed` on a failing run; GitLab: the MR's pipeline and its failed job traces). Failing CI is reason enough to act on its own — check it even when there were no conflicts and no review comments.
