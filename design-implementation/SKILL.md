@@ -48,6 +48,14 @@ Stopping when you hit a genuine blocker is different, and still required — see
 
 **Never commit the plan.** `.plans/` is excluded precisely so it can't dirty a working tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, do not mention it in a commit message.
 
+## When the Spec Is a Merged RFC
+
+A spec that came through an RFC PR (the rfc skill) lives in the repo, and that copy is the text its review settled, so work from it rather than from a `.plans/` copy. The plan still goes in `.plans/`.
+
+- Link the RFC doc from each implementation PR's description, so its reviewer can hold the code to the design.
+- When the implementation departs from the design, update the RFC doc in the same PR, so the merged design never describes code that doesn't exist. When the change overturns one of its decisions, say so in the PR description so the reviewer weighs it; a decision the owner made goes back to the owner before you change it.
+- The PR that completes the RFC's delivery list sets its Status to `Implemented in <PRs>`.
+
 ## Scope Check
 
 If the spec covers multiple independent subsystems, it should have been broken into sub-project specs during brainstorming. If it wasn't, suggest breaking this into separate plans — one per subsystem. Each plan should produce working, testable software on its own.

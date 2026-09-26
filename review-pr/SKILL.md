@@ -62,6 +62,16 @@ A commit that merely syncs the branch with its base — a merge of master/main i
 
 Then re-audit the findings still standing. If none remain, approve the current state per the clean-review rule above — unless **you** have already approved this same state, in which case post nothing. Approve even when no code changed: the approval is the final clean verdict, not a re-review of unchanged code. If any finding still stands, don't approve. Only your own verdict counts as already-approved — a person's Approve doesn't stand in for it, and treating one as yours would leave the PR with no review verdict at all, which a babysit-pr watch never stops on.
 
+## RFC pull requests
+
+A PR whose title carries `[RFC]` proposes a design and changes no code; the rfc skill writes them. It asks two things of you: a review of the design, and a position on each of its open questions. It is approved only once no question is left.
+
+- **Review the design as you would review code.** Check each claim it makes about today's code against the code, and look for what designs get wrong: a gap, a race, a broken invariant, a rollout hazard, two parts that contradict each other. These are ordinary findings, P0 to P2.
+- **Take a position on every open question** that has no thread of yours yet: one thread per question, anchored on its line in the spec and prefixed with its ID in place of a severity (`[Q3]`, qualified with the doc's name when two docs reuse an ID) and your identity. Agree with the author's recommendation or argue for another option — or, where the RFC recommends none, for the one you would take — with evidence either way; that exchange is what lets the author settle a question without the user. Call a question the owner's only when no evidence either of you can reach would settle it: a priority, an appetite for risk or cost, an irreversible step, a fact outside the repo and its data. Before you do, look for an answer the owner already gave: earlier RFCs' decisions, the docs, TODO, and the PRs that built earlier designs.
+- **A question the RFC missed** gets a thread of its own, prefixed `[new question]`, and the author adds it to the open questions.
+- **A question thread counts as a finding**, even one that agrees with the recommendation, and it blocks approval as a P1 does: on GitHub it makes the review `REQUEST_CHANGES`. Never approve while any spec in the PR still lists an open question, one waiting on the owner included, even when nothing else was found. The author moves each settled question into the spec's decisions, so a question still listed is still undecided, and approving then would approve a design nobody has settled.
+- **On re-review**, question threads follow the rules above. Resolve one once the spec records an answer you accept, or the owner's decision. When the author argues back, concede or hold with your reasoning, as for any finding. A question waiting on the owner stays open, with nothing more from you, until the spec records the decision.
+
 ## When the PR merged before the review was ready
 
 A review takes minutes, and a merge does not wait for it. Re-read the PR's state right before posting, not only at the start. If it has merged by then, the findings no longer belong in threads that address-pr and the author will pick up, and the two hosts differ in where they go instead:

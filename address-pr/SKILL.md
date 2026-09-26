@@ -42,12 +42,22 @@ Flag any resolution you're unsure about in the final report. If a conflict genui
 
 ## 2. Address the review comments
 
-A thread is yours to act on when it is **unresolved and its last comment is not yours**. Both halves matter and both are read from the thread itself — never from a timestamp, and never from "what arrived since the last round". A time window drops anything that landed while you were busy elsewhere in that round, and it never comes back; the last-commenter test keeps failing until you actually answer. Select the threads that way, then work through them:
+A thread is yours to act on when it is **unresolved and its last comment is not yours**. A comment is yours when it came from your account and carries your identity line: you often post under the user's own account, and what they write there is theirs. Both halves matter and both are read from the thread itself — never from a timestamp, and never from "what arrived since the last round". A time window drops anything that landed while you were busy elsewhere in that round, and it never comes back; the last-commenter test keeps failing until you actually answer. Select the threads that way, then work through them:
 
 - Understand each comment. Apply technical rigor: don't blindly implement. Make the code change when the comment is right; when it's wrong, misguided, or based on a misunderstanding, don't make a bad change — explain your reasoning in the reply instead. When a comment is genuinely ambiguous or a judgment call, ask the user rather than guessing.
 - For each actionable comment, make the code change. Group related comments so a single change can address several threads.
 - Reply on each thread saying what you did, or why you didn't, then leave the thread open. Resolving a thread is the reviewer's call, not the author's — the reviewer verifies the fix (or your reasoning) and resolves it on re-review. Replies should include your identity (AI agent name).
 - Skip comments that are just approval or acknowledgement. The two structural skips fall out of the selection rule above: a resolved thread is settled, and a thread whose last comment is your own is waiting on the reviewer, so replying again would only duplicate — re-engage that one only once someone has replied back after you. Age is not a skip: a reviewer reply you have never answered is yours to act on however long it has been sitting, and it stays yours every round until you do.
+
+**On an RFC PR** — one whose title carries `[RFC]`; the rfc skill writes them — the threads on its open questions are settled with the reviewer first, and the user is asked only about what the two of you can't settle. Write each change in the entry shapes the rfc skill's step 4 gives; step 4 below carries it into the PR description's table and decisions.
+
+- **Settle it** when the reviewer agrees with your recommendation, or argues for an option that convinces you: move the question from the spec's open questions to its decisions, settled with that reviewer, and reply on the thread.
+- **Answer once** when its argument doesn't convince you: say why, with evidence.
+- **A question the reviewer raised** that the RFC missed goes into the open questions under the next free ID, with your recommendation. When the evidence settles it, make the choice in the design instead, with its reason, as the rfc skill does with any choice the evidence settles. Reply either way.
+- **Take it to the user** only when the reviewer still holds its position after your answer (or two reviewers disagree and neither moves), or when you both judge it a call only the owner can make. For these threads, that replaces asking the user on a judgment call: the reviewer is asked first, and the user only after.
+- **Taking it to the user** means marking the question as waiting on the owner — in the spec, with each side's position and what each option would change, and as its state in the description's table — and saying so on the thread. Then ask the user in the session, with a push notification where your runtime has one: every question now waiting, in one message, each answerable in a line. A mention on the PR won't reach them when you post under their account.
+- **The owner's answer** comes in the session or on the thread. Record it among the decisions as the owner's, with the date, reply on the thread, and push. The reviewer resolves the thread.
+- **The push that settles the last question** also sets each doc's Status to `RFC: questions settled on <date>`, so the approval lands on the final text and nothing needs editing after it.
 
 ## 3. Check and fix CI failures
 
