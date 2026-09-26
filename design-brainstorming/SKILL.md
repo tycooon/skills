@@ -7,7 +7,7 @@ description: "You MUST use this before any creative work - creating features, bu
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
 
-Start by understanding the current project context, then ask questions one at a time to refine the idea. Once you understand what you're building, present the design and get user approval.
+Start by understanding the current project context, then ask questions one at a time to refine the idea. Once you understand what you're building, present the design in the spec file and get user approval.
 
 <HARD-GATE>
 Before any implementation action — invoking an implementation skill, writing code, scaffolding a project — present a design and get the user's approval. Small changes go through this too, because unexamined assumptions in "simple" work waste the most effort; their design can be a few sentences.
@@ -20,11 +20,11 @@ Create a task for each of these items and complete them in order:
 1. **Explore project context** — check files, docs, recent commits
 2. **Offer the visual companion just-in-time** — NOT upfront. The first time a question would genuinely be clearer shown than described, offer it then (its own message); on approval its browser tab opens for you. If no visual question ever arises, never offer it. See the Visual Companion section below.
 3. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
-4. **Propose 2-3 approaches** — with trade-offs and your recommendation
-5. **Present design** — in sections scaled to their complexity, get user approval after each section
-6. **Write design doc** — save to `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md` (a git-ignored directory inside the working directory, see below), do NOT commit it
+4. **Propose 2-3 approaches** — with trade-offs and your recommendation, written into the spec file and handed over (see *The spec file is how you present* below)
+5. **Present design** — in sections scaled to their complexity, each added to the spec file and handed over, with user approval after each section
+6. **Finalize the spec** — fold in the answers you got and drop the options not taken; it lives at `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md` (a git-ignored directory inside the working directory, see below), and is never committed
 7. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
-8. **User reviews written spec** — ask user to review the spec file before proceeding
+8. **User reviews written spec** — hand the file over again and ask the user to review it before proceeding
 9. **Transition to implementation** — invoke design-implementation skill, which plans and then implements in one flow
 
 ## Process Flow
@@ -33,23 +33,23 @@ Create a task for each of these items and complete them in order:
 digraph brainstorming {
     "Explore project context" [shape=box];
     "Ask clarifying questions" [shape=box];
-    "Propose 2-3 approaches" [shape=box];
-    "Present design sections" [shape=box];
+    "Propose 2-3 approaches\n(in the spec file)" [shape=box];
+    "Present design sections\n(in the spec file)" [shape=box];
     "User approves design?" [shape=diamond];
-    "Write design doc" [shape=box];
+    "Finalize spec" [shape=box];
     "Spec self-review\n(fix inline)" [shape=box];
     "User reviews spec?" [shape=diamond];
     "Invoke design-implementation skill" [shape=doublecircle];
 
     "Explore project context" -> "Ask clarifying questions";
-    "Ask clarifying questions" -> "Propose 2-3 approaches";
-    "Propose 2-3 approaches" -> "Present design sections";
-    "Present design sections" -> "User approves design?";
-    "User approves design?" -> "Present design sections" [label="no, revise"];
-    "User approves design?" -> "Write design doc" [label="yes"];
-    "Write design doc" -> "Spec self-review\n(fix inline)";
+    "Ask clarifying questions" -> "Propose 2-3 approaches\n(in the spec file)";
+    "Propose 2-3 approaches\n(in the spec file)" -> "Present design sections\n(in the spec file)";
+    "Present design sections\n(in the spec file)" -> "User approves design?";
+    "User approves design?" -> "Present design sections\n(in the spec file)" [label="no, revise"];
+    "User approves design?" -> "Finalize spec" [label="yes"];
+    "Finalize spec" -> "Spec self-review\n(fix inline)";
     "Spec self-review\n(fix inline)" -> "User reviews spec?";
-    "User reviews spec?" -> "Write design doc" [label="changes requested"];
+    "User reviews spec?" -> "Finalize spec" [label="changes requested"];
     "User reviews spec?" -> "Invoke design-implementation skill" [label="approved"];
 }
 ```
@@ -71,7 +71,7 @@ digraph brainstorming {
 **Exploring approaches:**
 
 - Propose 2-3 different approaches with trade-offs
-- Present options conversationally with your recommendation and reasoning
+- Write them into the spec file with your recommendation and reasoning
 - Lead with your recommended option and explain why
 
 **Presenting the design:**
@@ -81,6 +81,13 @@ digraph brainstorming {
 - Ask after each section whether it looks right so far
 - Cover: architecture, components, data flow, error handling, testing
 - Be ready to go back and clarify if something doesn't make sense
+
+**The spec file is how you present:**
+
+- Approaches and design sections go into the spec file, and the chat message carries a one-line pointer and the question. Chat text is easy to miss: an approval prompt can cover it, and the user may be following from another device.
+- Create the file as soon as you have approaches to show, and add each design section to it as you present it.
+- Hand the file over every time it changes — with the harness's file-sending tool where there is one (SendUserFile in the Claude app), otherwise as a clickable link to its absolute path.
+- Clarifying questions stay in chat: each is one short question.
 
 **Design for isolation and clarity:**
 
@@ -99,14 +106,15 @@ digraph brainstorming {
 
 **Documentation:**
 
-- Write the validated design (spec) to `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md`, where `<working-dir>` is the session's primary working directory (the worktree, when there is one)
+- The spec lives at `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md`, where `<working-dir>` is the session's primary working directory (the worktree, when there is one)
   - (User preferences for spec location override this default)
   - Inside the working directory on purpose: the desktop app can only open files under it, and a spec the user cannot click open is not reviewable. That rules out `~/.claude/plans/`, which the app refuses to open.
   - Before the first write, make sure `.plans/` is ignored: `git check-ignore -q .plans || echo '.plans/' >> "$(git rev-parse --git-path info/exclude)"`. The exclude file is per repo, never committed, and shared by every worktree of that repo, so it cannot leak into a PR the way a `.gitignore` edit would.
+- Once the design is approved, finalize the spec: fold in the answers you got and drop the options not taken.
 - **Never commit the spec.** It is a working document, not a deliverable. It sits in the working directory only so it can be opened; `.plans/` is excluded so it can't dirty the tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, and do not commit it "just to keep it safe."
 
 **Spec Self-Review:**
-After writing the spec document, look at it with fresh eyes:
+After finalizing the spec, look at it with fresh eyes:
 
 1. **Placeholder scan:** Any "TBD", "TODO", incomplete sections, or vague requirements? Fix them.
 2. **Internal consistency:** Do any sections contradict each other? Does the architecture match the feature descriptions?
@@ -116,9 +124,9 @@ After writing the spec document, look at it with fresh eyes:
 Fix any issues inline. No need to re-review — just fix and move on.
 
 **User Review Gate:**
-After the spec review loop passes, ask the user to review the written spec before proceeding:
+After the spec review loop passes, hand the file over again and ask the user to review it before proceeding:
 
-> "Spec written to `<path>` (uncommitted). Please review it and let me know if you want to make any changes before we start writing out the implementation plan."
+> "Spec finalized at `<path>` (uncommitted). Please review it and let me know if you want to make any changes before we start writing out the implementation plan."
 
 Wait for the user's response. If they request changes, make them and re-run the spec review loop. Only proceed once the user approves.
 
