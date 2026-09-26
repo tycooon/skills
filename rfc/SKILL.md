@@ -100,7 +100,7 @@ Title it `[RFC] <imperative summary>`. Where the host or the repo requires title
 Write the description in this order:
 
 1. Two to four sentences: what it proposes and why.
-2. One bullet list per doc, headed by its repository-relative path as a clickable Markdown link to that file on the PR/MR source branch. Use the source repository for fork PRs. GitHub links use `https://github.com/<owner>/<repo>/blob/<source-branch>/<path>`; GitLab links use `https://<host>/<namespace>/<repo>/-/blob/<source-branch>/<path>`. Anchor these links to the branch name so they follow RFC revisions; keep them current if the source branch or document path changes. Verify each linked file exists on that branch.
+2. One bullet list per doc, headed by its document title (the top-level heading) as the clickable Markdown link text to that file on the PR/MR source branch. Use the source repository for fork PRs. GitHub links use `https://github.com/<owner>/<repo>/blob/<source-branch>/<path>`; GitLab links use `https://<host>/<namespace>/<repo>/-/blob/<source-branch>/<path>`. Anchor these links to the branch name so they follow RFC revisions; keep them current if the source branch or document path changes. Verify each linked file exists on that branch.
 3. **Open questions** — a table of ID, question, recommendation and state (`open` or `waiting on the owner`). The full text lives in the spec; the table is the view at a glance. Leave it out when there are none.
 4. **Decisions** — each settled question's ID and answer, and who settled it.
 5. **Found on the way**, when the survey found anything.
@@ -110,7 +110,7 @@ Write the description in this order:
 For example, a document heading on GitHub reads:
 
 ```markdown
-### [docs/rfcs/routing-design.md](https://github.com/owner/repo/blob/codex/routing-rfc/docs/rfcs/routing-design.md)
+### [Registry routing design](https://github.com/owner/repo/blob/codex/routing-rfc/docs/rfcs/routing-design.md)
 ```
 
 Where the host has a description template of its own, fill that and carry these parts inside it; the review block goes in verbatim either way. It tells every reviewer, the ones that don't run review-pr included, what approving this PR means:
