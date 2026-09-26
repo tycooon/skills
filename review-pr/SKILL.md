@@ -34,9 +34,18 @@ Do **not** dump every finding into one top-level PR comment. Top-level PR/issue 
 
 Usually the PR already carries threads from an earlier review of yours — this skill runs again on every push. A re-review is mostly about those threads, not about restating them.
 
+**Whose comment it is.** A comment — a finding, a reply, a verdict — is yours when both of these hold, and a thread is yours when its opening comment is:
+
+- **An account you post reviews from posted it** — the reviewer bot, or your default account where you post without one. A teammate may run an AI review under their own account and post your exact banner; that comment is still theirs.
+- **It carries your identity line**, in whatever wording an earlier run of yours used: another model or version of the same agent, an older phrasing, the bot's name standing in for the identity. Your name quoted in someone's reply is not an identity line, and neither is another AI reviewer's signature on an account it shares with you.
+
+Write your identity line the same way every time, match earlier wordings generously, and never drop either condition. Miss one of yours and it never gets resolved; claim someone else's and you end up nagging or closing their finding.
+
+**It doesn't matter which run posted it.** A thread from an earlier review — another session, another watch, an earlier model — is yours the moment you read it, and you take it over without asking: everything below applies to it exactly as if you had posted it in this run. An earlier APPROVED verdict of yours is your own verdict too.
+
 **An open thread is the finding.** It says "this still stands" for as long as it stays open, and nothing else needs to say it. A new push is not a reason to comment on an open thread: a "still not fixed" note on every push tells the author nothing the open thread didn't, and it buries the comments that do need reading. Silence on an open thread means the finding stands.
 
-Take each thread you left open and judge it against the current code:
+Take each open thread of yours and judge it against the current code:
 
 - **Fixed** — resolve the thread. Resolving is the reviewer's job, not the author's: the address-pr flow replies and deliberately leaves threads open for you to verify and close. Resolve every thread that is genuinely settled — the fix landed, or you have accepted the author's pushback — and only those.
 - **Nothing about this finding moved** — the push went elsewhere (another thread's fix, a CI fix, a base sync, unrelated work) and this finding simply wasn't addressed. Leave the thread open and post nothing at all.
@@ -87,6 +96,7 @@ Post the review under a dedicated reviewer-bot account when one is configured, s
 - **GitHub:** if `PR_REVIEW_GH_TOKEN` is set, run the posting `gh` commands with it exported as `GH_TOKEN`, e.g. `GH_TOKEN="$PR_REVIEW_GH_TOKEN" gh api --method POST /repos/<owner>/<repo>/pulls/<n>/reviews --input body.json` (and `gh pr review --approve` in the clean case).
 - **GitLab:** if `PR_REVIEW_GITLAB_TOKEN` is set, run the posting `glab` commands with it exported as `GITLAB_TOKEN`.
 - If the relevant variable is unset, post with your default authenticated account, exactly as before.
+- **The bot can be refused a resolve** — on a thread it did not open, or on a repo where it can only read. Threads of yours from runs that posted under your default account are the usual case. Resolve those with your default account.
 - **Never print a token, and never write a shell test for whether one is set.** No version of that check is worth the risk: `${PR_REVIEW_GH_TOKEN:-unset}` substitutes the token's **real value** whenever it is set, and the safe-looking variants sit one character away — `${VAR:+set}${VAR:-unset}` reads as "set or unset" and expands to `set<the-actual-token>`. Pass the token by name, as in the commands above, so its value never reaches a command line, a log, or your output.
 - Establish a credential by **asking who it authenticates as** — the question that actually matters, and one that cannot leak: `GH_TOKEN="$PR_REVIEW_GH_TOKEN" gh api user --jq .login`, or `GITLAB_TOKEN="$PR_REVIEW_GITLAB_TOKEN" glab api user | jq -r .username`. If the bot's name comes back, post with it; if your own does, there is no bot token in play — fall back to your default account and keep the identity line in the comment body.
 - **Judge that by the name, never by the status.** Anything that is not a name — an error, or a bare `null` where the username should be — means the variable is set but the token is dead: expired, revoked, or wrong. Treat that as no usable bot token and fall back, rather than posting into a 401 on the first comment. GitLab project and group tokens carry a mandatory expiry, so this is the ordinary way a configured token stops working. It is quiet on GitLab, too: `glab` exits non-zero on a 401, but `glab … | jq` reports **jq's** status, so the failure arrives as a printed `null` and a zero exit — `gh api --jq` has no pipe, so its non-zero exit survives.
