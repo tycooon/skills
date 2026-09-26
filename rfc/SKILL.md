@@ -14,20 +14,20 @@ You are the author. The AI reviewer that covers the repo reviews the RFC with th
 `/rfc <topic>` starts from scratch. `/rfc <path>` publishes a spec that already exists — typically a `.plans/` doc from the design-brainstorming skill.
 
 - **A topic.** Ask the user before writing anything only when the request reads two ways that lead to different designs. Short of that, write your reading into the spec's Goal and let the review challenge it: a question asked now is one the review could have settled without them.
-- **An existing spec.** Treat it as your draft and take it through the steps below. The survey re-checks its claims against today's code, since it may predate recent changes. The choices the user made while it was written are theirs, so record them as the owner's decisions. The points it left open go through step 3 like any other.
+- **An existing spec.** Treat it as your draft and take it through the steps below, in the repo it designs for, which may not be the one its `.plans/` sits in. From then on the RFC doc is the spec; don't keep editing the old copy. The survey re-checks its claims against today's code, since the spec may predate recent changes. The questions the user answered while it was written are theirs: record each as the owner's decision, with an ID from the same sequence as the open questions. The rest of it is your draft, for the review to challenge. Where the survey contradicts one of the owner's decisions, don't change it quietly: reopen it as an open question, with the evidence. The points the spec left open go through step 3 like any other.
 
 ## 2. Survey
 
 The design stands on what the code and the data say today, so read them first:
 
 - the code at `origin/master`, fetched now, noting the sha you read;
-- the repo's earlier RFCs, specs, ADRs and TODO, which can hold an answer the owner already gave;
-- any open RFC PR on the same area — name it in Related, and say in the Goal how this one relates to it;
+- the repo's earlier RFCs, specs, ADRs and TODO, and the PRs that built them, which can hold an answer the owner already gave;
+- any open PR that changes the same area — name it in Related, and say in the Goal how this one relates to it;
 - production or stage data, read-only and under the repo's rules and the global ones, wherever the design depends on how things behave there.
 
-Cite as you go. Every claim about today's behaviour carries `path:line` at the sha you read, or the query and its time window, so the reviewer can check it rather than trust it.
+Cite as you go. Every claim about today's behaviour carries its repo-relative `path:line` at the sha you read, or the query and its time window, so the reviewer can check it rather than trust it.
 
-**Found on the way.** A survey this close to the code turns up bugs. List them in the spec's *Found on the way* section. One that is hurting production now doesn't wait for the RFC: fix it in its own PR, or record it where the repo tracks work (an issue, TODO), link that from the list, and tell the user in the session. The RFC PR itself stays docs-only.
+**Found on the way.** A survey this close to the code turns up bugs. List them in the spec's *Found on the way* section. One that is hurting production now doesn't wait for the RFC: fix it in its own PR, or record it where the repo tracks work (an issue, TODO) outside this PR, so it doesn't wait for the merge. Link that from the list, and tell the user in the session. The RFC PR itself stays docs-only.
 
 ## 3. Decide what the evidence settles
 
@@ -37,7 +37,7 @@ Number them `Q1`, `Q2`… across all of the RFC's docs, and never renumber. Thre
 
 ## 4. Write the docs
 
-Put them where the repo's design docs already live — where its newest ones are, if they're spread out — and follow that directory's file naming. With no such directory, use `docs/rfcs/YYYY-MM-DD-<topic>.md`. Write one doc per implementation PR, so a design too big for one PR splits along its delivery. Write in the language the repo's rules set for docs.
+Put them where the repo's design docs already live — where its newest ones are, if they're spread out — and follow that directory's file naming. With no such directory, use `docs/rfcs/YYYY-MM-DD-<topic>.md`, dated the day you open the PR. Write one doc per implementation PR, so a design too big for one PR splits along its delivery. Write in the language the repo's rules set for docs.
 
 Use this skeleton, scaled to the change, and drop any section that has nothing to say:
 
@@ -64,7 +64,7 @@ Use this skeleton, scaled to the change, and drop any section that has nothing t
 ## Decisions
 ```
 
-An open question and a settled one read like this:
+An open question reads like this:
 
 ```markdown
 **Q3.** <the question>
@@ -73,13 +73,21 @@ An open question and a settled one read like this:
 - Settles it: <the evidence or experiment that would decide it>
 ```
 
+One that is waiting on the owner stays in the open questions and gains a line with each side's position and what each option would change:
+
 ```markdown
-- **Q3 → (b).** <the answer>, because <the reason>. Settled with <the reviewer>.
+- Waiting on the owner. Author: (b), because …; <the reviewer>: (a), because …; (a) would …, and (b) would …
 ```
 
-A decision the owner made ends `Decided by the owner on <date>.` instead.
+A settled question moves to the decisions and states its answer in words, since its options leave with it:
 
-The Status moves from `RFC: open questions under review` to `RFC: questions settled on <date>`, then to `Implemented in <PRs>`. An RFC that opens with no questions starts at `RFC: questions settled on <date>`, so a merged doc never claims to be under review.
+```markdown
+- **Q3. <the question, in a few words>:** <the answer>, because <the reason>. Settled with <the reviewer> on <date>.
+```
+
+`<the reviewer>` is the name the reviewer signs its comments with. A decision the owner made ends `Decided by the owner on <date>.` instead.
+
+The Status moves from `RFC: open questions under review` to `RFC: questions settled on <date>`, then to `Implemented in <PRs>`. An RFC that opens with no questions starts at `RFC: questions settled on <date>`, so a merged doc never claims to be under review; a question added after that puts it back to `RFC: open questions under review`.
 
 **Superseding.** When the design replaces an accepted RFC — one already merged — the same PR sets the old doc's Status to `Superseded by <new doc>`, or to `Partly superseded by <new doc> (§n)` when it replaces only some sections, and the new doc names the old one in Related. Two docs that each read as current leave a later reader building the wrong one.
 
@@ -87,13 +95,13 @@ The Status moves from `RFC: open questions under review` to `RFC: questions sett
 
 Commit the docs, plus whatever pointers the repo keeps to its designs (TODO, an index), and nothing else: an RFC changes no code. Open it as a non-draft PR. Review sweeps skip drafts, so a draft RFC never gets its questions settled.
 
-Title it `[RFC] <imperative summary>`. Where the host's convention fixes how a title starts, with a Jira key for example, the tag goes right after it: `ABC-123 [RFC] Recalculate freshness per profile`.
+Title it `[RFC] <imperative summary>`. Where the host or the repo requires titles to start with something else, a Jira key for example, the tag goes right after it: `ABC-123 [RFC] Move rate limits into the gateway`.
 
 Write the description in this order:
 
 1. Two to four sentences: what it proposes and why.
 2. One bullet list per doc, headed by its path.
-3. **Open questions** — a table of ID, question, recommendation and state (`open` or `waiting on the owner`). The full text lives in the spec; the table is the view at a glance. Drop it once it's empty.
+3. **Open questions** — a table of ID, question, recommendation and state (`open` or `waiting on the owner`). The full text lives in the spec; the table is the view at a glance. Leave it out when there are none.
 4. **Decisions** — each settled question's ID and answer, and who settled it.
 5. **Found on the way**, when the survey found anything.
 6. The review block below, verbatim.
