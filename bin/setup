@@ -32,6 +32,7 @@ targets=(
   "$HOME/.claude/skills"
   "$HOME/.codex/skills"
   "$HOME/.zcode/skills"
+  "$HOME/.opencode/skills"
 )
 
 # Collect skill directories (those holding a SKILL.md).
