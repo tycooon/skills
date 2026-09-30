@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: Use when asked to review a specific GitHub pull request or GitLab merge request (given by number or URL) and post the code-review findings back on the PR, approving it only when the review comes back clean — as opposed to reviewing the local working diff.
+description: "Review a specific GitHub PR or GitLab MR and post findings or approval. Use for hosted reviews, not a local diff."
 ---
 
 # Review a Pull Request

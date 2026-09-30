@@ -1,6 +1,6 @@
 ---
 name: babysit-pr
-description: Use when asked to babysit, watch, or keep an eye on a pull request or merge request until it's approved — repeatedly runs the address-pr flow (conflicts, review comments, CI) round after round, waiting between rounds on a schedule that backs off as things stay quiet, and stops once the PR is done — an external AI reviewer's approval covers the current head (a person's approval doesn't count), every discussion is resolved, the pipeline is green and the base doesn't block the merge — or it's merged/closed. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The looping counterpart to address-pr, which runs a single pass.
+description: "Watch a GitHub PR or GitLab MR, address new feedback and CI failures, and stop when its external AI review and merge checks pass."
 ---
 
 # Babysit a Pull Request

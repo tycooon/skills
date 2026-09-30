@@ -1,6 +1,6 @@
 ---
 name: address-pr
-description: Use when asked to address a pull request or merge request — syncs with the base branch (rebasing a stacked PR onto the default branch once the PR underneath it has merged) and resolves merge conflicts, then reads and addresses the open/unresolved review comments (making code changes and replying on each thread, but leaving the threads open for the reviewer to resolve), and fixes or retries failing CI checks, then pushes. Works on the current branch's PR or one given by number/URL, on GitHub or GitLab. The counterpart to review-pr, which posts comments rather than addressing them.
+description: "Resolve conflicts, review feedback and failing CI for a GitHub PR or GitLab MR, then push the fixes."
 ---
 
 # Address a Pull Request

@@ -1,9 +1,11 @@
 ---
 name: design-brainstorming
-description: "You MUST use this before any creative work - creating features, building components, adding functionality, or modifying behavior. Explores user intent, requirements and design before implementation. Personal fork of superpowers:brainstorming - when both match, use this one."
+description: "Design new features or meaningful behavior changes before implementation. Use an already-approved concrete design directly; routine fixes, audits and mechanical edits need no new design cycle."
 ---
 
 # Brainstorming Ideas Into Designs
+
+Use this workflow when a design still needs to be agreed. If the conversation already contains a concrete design that the user approved, proceed with that design using `design-implementation`; do not repeat intake or approval.
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
 
