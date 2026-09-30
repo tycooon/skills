@@ -1,6 +1,6 @@
 ---
 name: review-open-prs
-description: Use when asked to review all open pull requests / merge requests at once — in one repository, or across several repositories and whole groups/orgs, optionally with a per-target filter like "only PRs touching X" — or to keep a hand-picked set of PRs under the same review watch, and post code-review findings back on each. Enumerates every open non-draft PR across the targets — a PR named outright is a target of its own — and reviews each the way review-pr handles a single one (skipping any unchanged since its last review), then keeps sweeping on a loop that backs off as things go quiet, until nothing has moved for hours.
+description: "Review and monitor all open PRs/MRs across requested repositories, or a specified set, and post findings."
 ---
 
 # Review All Open Pull Requests

@@ -1,6 +1,6 @@
 ---
 name: rfc
-description: Use when asked to write an RFC, or to put a design — or a spec already written — up for review as a pull request or merge request before building it. Surveys the code, writes the spec docs with their open questions and your recommendations, and opens a docs-only PR tagged [RFC] whose review settles every question before approval, so the user only hears about the questions you and the reviewer can't settle between you. Works on GitHub or GitLab.
+description: "Write a design/spec as a docs-only RFC PR or MR and settle review questions before implementation."
 ---
 
 # Write an RFC

@@ -1,6 +1,6 @@
 ---
 name: design-implementation
-description: "Use when you have a spec or requirements for a multi-step task, before touching code. Personal fork replacing superpowers:writing-plans and superpowers:executing-plans - when those also match, use this one."
+description: "Plan and implement an approved multi-step change inline. Replaces the upstream planning and execution skills."
 ---
 
 # Implementation: Plan, Then Execute

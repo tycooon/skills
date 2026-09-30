@@ -1,6 +1,6 @@
 ---
 name: check-after-deploy
-description: Use when a feature or bugfix has just been deployed to production and you need to confirm it is healthy — inspecting logs, metrics, error trackers, and the database for new errors, regressions, or anomalies introduced by the release, scoped to the change the current session shipped and sweeping production broadly only when nothing in the session says what went out.
+description: "Check production health after a deployment, scoped to the change shipped in this session."
 ---
 
 # Check After Deploy
