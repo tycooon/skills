@@ -4,6 +4,7 @@ Repository instructions override these rules where they conflict; mention a mate
 
 ## Core workflow
 
+- Whenever the user mentions something broken, or you encounter a failure, explain the problem briefly and suggest a concrete way you can help diagnose or fix it, even if the user only asked for an explanation. If the fix is already within the authorized task, investigate, implement and verify it without asking again. For problems outside that scope, explicitly offer the next useful action. Avoid generic or repeated offers.
 - Findings-only work ends in chat without a commit, document or PR unless requested. Finished code work ends in a non-draft PR; drafts are for unfinished work.
 - Merge/deploy only after the human authorizes the specific action. Do not infer runtime production configuration from migration defaults.
 - Preserve DRY; an exception needs justification and user approval. Use English for repository content unless its rules require another language; no attribution footers.
