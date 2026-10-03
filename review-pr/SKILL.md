@@ -1,6 +1,6 @@
 ---
 name: review-pr
-description: "Review a specific GitHub PR or GitLab MR and post findings or approval. Use for hosted reviews, not a local diff."
+description: "Hosted PR/MR review with posted verdict; exclude local-only diffs."
 ---
 
 # Review a Pull Request

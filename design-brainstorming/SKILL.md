@@ -1,6 +1,6 @@
 ---
 name: design-brainstorming
-description: "Design new features or meaningful behavior changes before implementation. Use an already-approved concrete design directly; routine fixes, audits and mechanical edits need no new design cycle."
+description: "Unapproved new behavior; skip routine fixes, audits or mechanical edits."
 ---
 
 # Brainstorming Ideas Into Designs
