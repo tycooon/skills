@@ -1,6 +1,6 @@
 ---
 name: design-implementation
-description: "Plan and implement an approved multi-step change inline. Replaces the upstream planning and execution skills."
+description: "Implement approved multi-step changes; no new design cycle."
 ---
 
 # Implementation: Plan, Then Execute
