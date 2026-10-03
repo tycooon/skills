@@ -9,6 +9,20 @@ Do a thorough code review of the provided pull request (GitHub) or merge request
 
 Review the code, not the pipeline. CI belongs to the address-pr skill — don't pull up the PR's check or pipeline status, and never turn a failing, pending, or missing check into a finding, a line in the review body, or a remark to the user: a red pipeline is not a defect in the diff. It doesn't gate the verdict either — a diff you found nothing wrong with is clean and gets approved, whatever the checks are doing.
 
+## Look past the diff
+
+The PR description lists what the author already checked. A review earns its keep on what they didn't, and that mostly sits outside the changed lines, in the code the change relies on. So derive your questions from what the change removes and what it now relies on, rather than verifying the description's claims one by one, and answer each in code before you settle on a verdict.
+
+- **A removed or loosened guard.** For a dropped or relaxed requirement, filter, validation, check, lock or limit, find the failure it prevented, for which callers and inputs, and what prevents that failure now for each of them. A claim that it was redundant ("the caller already validates this") is what to verify, not the answer. If nothing prevents the failure any more, that is the finding, even though the PR's own case now works.
+- **A label the change starts trusting.** For a tag, flag, status, role or column the change now relies on, read the code that sets it (the probe, writer or migration) and check that it establishes what the change needs for every input it now gets.
+- **Reach.** A fix motivated by one chain, tenant or customer that edits shared code changes it for every caller on that path. List the callers and the inputs each one feeds (ages, sizes, tenants), and check the change against each, not only against the case in its test.
+- **The failure path under the triggering condition.** A degraded state (a throttled provider, a full queue, a slow dependency) is when new paths run. Follow a failure there through the retries and their budget, the error's classification, and the breakers, bans or caches it shares with other paths.
+- **The same decision elsewhere.** Where the codebase already handles the same constraint on another path, the two should agree, or the PR should say why not.
+
+A finding names a concrete failure, these inputs or this state and then this wrong outcome, with the code that produces it. When its severity depends on how much live data or configuration it reaches, and the repo's rules allow read-only access, measure it.
+
+## What a review posts
+
 A review is **one inline comment per finding, and nothing else** — each anchored to the specific file and line it refers to, all submitted together as a single review (GitHub: a PR review whose per-line review comments each open a thread; GitLab: resolvable discussions positioned on the MR diff). The threads are the review, and nothing summarizes them. GitHub's API rejects a review submitted with a blank body, so give it a single line naming your identity (AI agent name) — that line is not a summary slot, so don't recap the findings in it. (The only other thing that ever belongs in the body is a finding with no line to anchor to, per the anchoring rule below.) GitLab needs no such body: post the discussions and no accompanying note.
 
 **There is no changes-requested verdict.** When a review has findings, the threads *are* the verdict, so never add a top-level note announcing CHANGES REQUESTED or recapping what you filed. Such a note carries nothing the threads don't already carry, and it ages badly in a way they don't: the recap still asserts the original set after the author has fixed half of it, so a later reader — or a later pass of your own — has to work out which of the two records is current. This holds on a re-review exactly as on a first pass. The only top-level verdict that exists is an approval.
