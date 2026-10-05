@@ -7,7 +7,7 @@ description: "Write a design/spec as a docs-only RFC PR or MR and settle review 
 
 Put a design up for review as a docs-only pull request (GitHub) or merge request (GitLab) before any of it is built. The PR is the RFC. Its spec docs say what today's code does, what should change and how it ships, and they list the questions the evidence could not settle, each with your recommendation. The review settles those questions — the reviewer takes a position on each, and the two of you agree or argue it out — and the PR is approved only once none is left. The user hears only about the questions you and the reviewer could not settle, or that only they can decide.
 
-You are the author. The AI reviewer that covers the repo reviews the RFC with the review-pr skill, and your babysit-pr watch settles its questions with that reviewer. The user is the owner: they make the calls neither of you can, and they merge.
+You are the author. The AI reviewer that covers the repo reviews the RFC with the review-pr skill, and your address-pr passes settle its questions with that reviewer. The user is the owner: they make the calls neither of you can, and they merge.
 
 ## 1. Read the request
 
@@ -122,8 +122,8 @@ Where the host has a description template of its own, fill that and carry these 
 - A question goes to the owner only when the author and the reviewers can't settle it between them, or when only the owner can make the call.
 ```
 
-## 6. Babysit it
+## 6. See it through
 
-Watch the PR with the babysit-pr skill. Its address-pr passes settle the questions with the reviewer; address-pr's step 2 says how, and when a question goes to the user. The watch ends once the reviewer approves the settled text. If it ends without any review, because no AI reviewer covers the repo, nothing will settle the questions: put them to the user in the final report, each with your recommendation.
+Watch the PR with the babysit-pr skill, unless the rules for your machine hand a PR's follow-up to something else. Either way address-pr passes settle the questions with the reviewer; address-pr's step 2 says how, and when a question goes to the user. A watch ends once the reviewer approves the settled text. If it ends without any review, because no AI reviewer covers the repo, nothing will settle the questions: put them to the user in the final report, each with your recommendation. Without a watch nothing tells you that no review came, so say when you report the opened PR that its questions wait on a reviewer.
 
 Merging is the user's call. Once the RFC has merged, the design-implementation skill builds it from the repo's copy of the doc.
