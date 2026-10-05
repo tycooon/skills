@@ -193,7 +193,7 @@ Never start implementation on main/master without explicit user consent.
 
 ## Completing the Work
 
-After all tasks are complete and verified, finish the branch per the global workflow rules — a non-draft PR, then babysit-pr — rather than offering a menu of ways to finish it.
+After all tasks are complete and verified, finish the branch per the global workflow rules — a non-draft PR, then babysit-pr unless the rules for your machine hand a PR's follow-up to something else — rather than offering a menu of ways to finish it.
 
 ## When to Stop and Ask for Help
 
