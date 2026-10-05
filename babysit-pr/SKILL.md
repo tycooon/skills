@@ -9,9 +9,11 @@ Watch one pull request (GitHub) or merge request (GitLab) — the one for the cu
 
 ## The loop
 
+**Delivery mode.** If the user invokes [md](../md/SKILL.md), reuse this watch and its schedule. Store `deliveryMode: merge-and-deploy` and the scoped authorization in the existing state file; read the mode at the start of every round and again before stopping on readiness. When enabled, the four ready conditions hand off to md's merge/deploy phases instead of ending the watch. Resume an in-progress delivery phase through md without running another address-pr pass. An ordinary babysit invocation remains a readiness-only watch; it does not authorize merge or deploy. A merged target in delivery mode also resumes through md so a restart or an external merge does not discard the pending deployment; a closed, unmerged target still stops.
+
 Resolve the target PR once, then keep watching that same one. Each round:
 
-1. **Check the stop conditions first** (see below). If the PR is done, or merged/closed, stop and give the final report — don't keep working a finished PR. An approval alone does not finish it: if a condition is still unmet, this round works that condition.
+1. **Check the stop conditions first** (see below). For a readiness-only watch, if the PR is done, or merged/closed, stop and give the final report — don't keep working a finished PR. In delivery mode, hand a ready or merged target to md instead; a closed, unmerged target still stops. An approval alone does not finish it: if a condition is still unmet, this round works that condition.
 2. **Otherwise run one address-pr pass** by invoking the address-pr skill: it resolves conflicts with the base, addresses the open/unresolved review comments, handles failing CI, and pushes once — but only if something actually changed. Just invoke it every round and let it no-op when nothing has changed; don't try to pre-detect new activity yourself. A round with nothing new is a no-op, and that's expected; most rounds while you wait on a reviewer will be quiet.
 
    **Merge the base only when you have to.** In a babysit round the pass merges `origin/<base>` only in three cases: the PR conflicts with the base, the host refuses to merge a branch that is behind (see *Detecting the stop signal*), or the round pushes other changes anyway. A base that merely moved ahead is not a reason to merge or push. A sync-only push reruns the whole pipeline on an unchanged branch and cancels the run in progress, and the base branch's own pipeline tests the merged result after the merge anyway. Unstacking a PR whose PR underneath has merged is not a sync; it still happens as address-pr describes.
@@ -19,7 +21,7 @@ Resolve the target PR once, then keep watching that same one. Each round:
 
 ## When to stop
 
-Stop the loop and report when the PR is **done** — which takes all four of these together, not any one of them:
+For a readiness-only watch, stop the loop and report when the PR is **done**. In delivery mode, these conditions trigger md's final recheck and delivery instead. Readiness takes all four together, not any one of them:
 
 1. **Approved by the external AI reviewer** — see *What counts as an approval* below.
 2. **Every discussion resolved.**
@@ -30,7 +32,7 @@ An approval on its own is not done. A PR can carry a current approval and still 
 
 Stop immediately, without waiting for the four, when any of these is true instead:
 
-- **Merged or closed.**
+- **Merged or closed.** In delivery mode, a merged target resumes through md; a closed, unmerged target stops.
 - **Gone quiet** — about 4 hours have passed with no update to the PR: a run of quiet rounds (roughly a dozen, as the wait backs off) where nothing changed — no new commits, comments, reviews, or CI results, and nothing for you to do. Stop, say so, and let the user re-run to keep watching. Any real update resets this clock, so an actively moving PR is never abandoned. The clock also never predates this watch, so it can't already be spent when you arrive: a PR nobody has touched in days still gets its first round and then its full four hours (see *Waiting between rounds*). This stop is for a PR that goes quiet **while you watch it**, never a reason to decline to start.
 - **Hard error** — the PR or branch is gone, auth fails, or a push is rejected in a way a retry won't fix. Stop and report rather than spinning on it.
 

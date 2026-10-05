@@ -1,0 +1,35 @@
+---
+name: md
+description: "Wait for a GitHub PR or GitLab MR to pass review and CI, then merge and deploy it, reusing an active babysit-pr loop."
+---
+
+# Merge and Deploy
+
+Carry one PR/MR through readiness, merge, deployment and release verification. For example, `/md 42` waits while PR #42 has an unresolved discussion, then merges and deploys it once all four babysit-pr conditions pass.
+
+## Bind the request
+
+Resolve the number/URL supplied by the user, or the PR/MR for the current branch. Pin its host, repository/project, number and base branch; never switch targets on a later wake-up. Ask only if the target is ambiguous. An explicit `/md` invocation authorizes merging and deploying this target when ready, including scoped address-pr fixes during the wait. Automatic skill selection alone does not authorize either action; obtain missing authorization before enabling delivery. Preserve any narrower environment or release limits the user gave.
+
+Read the project's merge and deployment instructions, identify its deployment command or automatic release workflow and destination, and record them with the request. Recover these from repository configuration and existing release procedures; ask if the destination or procedure cannot be determined. Do not invent a deploy command or broaden the release to unrelated work. A stacked PR targeting another feature branch must reach the intended release branch through address-pr before delivery; merging into a feature branch is not a production release.
+
+## Reuse the watch
+
+Use [babysit-pr](../babysit-pr/SKILL.md) for readiness checks, address-pr rounds, cadence, quiet limits and scheduled recovery. Keep its approval definition, including the external AI reviewer's sign-off and the base-sync equivalence test; also satisfy the host's required approvals and merge rules. Do not supply your own approval or resolve discussions to pass the gate.
+
+First find an active babysit-pr watch for this exact target in the current session's state and scheduler jobs. Adopt its state file and enable delivery there before the ready condition can end the watch. Keep its watch start, activity mark, quiet count, next due time, pending wake-up and backup heartbeat; do not reset or duplicate them. Existing wake-ups must read the delivery mode from the file. If a round is in flight, hand the mode change to its owner between rounds so only one owner acts.
+
+If the watch belongs to another session, use the runtime's supported handoff to let that owner enable delivery and acknowledge it. Never infer ownership from a job name or alter another session's authorization blindly. If you cannot hand off safely, ask the user to invoke `/md` in the owning session; do not start a competing loop. An unrelated watch is not reusable and must not be replaced or canceled.
+
+If no active watch exists, start one babysit-pr loop with delivery enabled, run its first round immediately, and schedule its normal wake-up and backup. A stopped watch is not active; a new run gets a new watch-start floor. If scheduled resumption is unavailable, report the limitation instead of claiming to wait.
+
+Persist the target, authorization source and scope, deployment destination/procedure, `deliveryMode: merge-and-deploy`, `deliveryPhase: waiting`, and later the verified merge commit, deployment/run identifier and outcome in the watch's state file. The phases are `waiting`, `merging`, `deploying`, `verifying`, and `complete`; errors or cancellation stop with the last confirmed outcome. Record each phase before its external action, so recovery reconciles host/release records before attempting anything again.
+
+## Deliver when ready
+
+1. **Recheck immediately before merging.** Read fresh host state for the current head: green CI, every discussion resolved, approval covering that head and all required approvals, no conflicts and no other host merge block. Pending, missing, failed or unknown checks are not green; a host with no CI needs an explicit project policy or user exception. Unknown mergeability is not permission to merge. Any authored change invalidates stale readiness; keep watching until all gates pass together again. Use the host's expected-head guard where supported, and its protected merge path without administrator bypass. If the head changes or the host rejects the gate, return to waiting and recheck; do not force the merge.
+2. **Confirm the merge.** Use the project's merge method and verify the target is merged, which branch received it, and its merge commit. A closed, unmerged PR stops without deploying. If someone else merged it, confirm the authorized change landed on the intended release branch before proceeding. After a timeout or uncertain response, query the host before retrying.
+3. **Deploy the confirmed change.** Follow the project's procedure with its required environment loaded. For automatic deployment on merge, observe the existing release run rather than launching another. Verify the selected artifact/revision includes the merge commit and fits the authorized scope; stop and ask if the deploy would ship additional unapproved changes. Persist the run/release identifier and reconcile it on recovery. Do not repeat a successful deployment or blindly retry an uncertain production action; inspect the release record first. A failed deploy stops with the merge outcome and the concrete failure; rollback or additional remediation needs its own authorization unless already covered.
+4. **Verify and finish.** Confirm rollout completion and the running revision, then use [check-after-deploy](../check-after-deploy/SKILL.md) for checks scoped to the change, compared with the pre-deploy baseline. Mark complete only after verification; report any unchecked behavior explicitly. Cancel this watch's wake-up and backup on completion, a hard error, cancellation or the inherited quiet cap. Use session-wide stop only when those jobs all belong to this watch; otherwise cancel only the owned jobs.
+
+Stay quiet on unchanged rounds. Report meaningful fixes and once when merging/deploying begins. The final report names the PR/MR, merged commit, deployed revision/destination and verification result, or the exact point where delivery stopped and what remains. Never describe a merged PR as deployed without release evidence.
