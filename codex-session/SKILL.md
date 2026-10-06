@@ -13,24 +13,31 @@ For an opinion only, with no code change and no follow-up, skip the steps and ru
 
 Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief carries only the task: the problem with its evidence, what done looks like, what is out of scope. It also tells Codex to:
 
-- work in the worktree it starts in, on a branch cut from the latest `origin/<default>`: that worktree starts detached at the main checkout's HEAD, which can be behind;
+- work in the worktree it starts in and on the branch it finds there, making no other worktree: step 2 cuts both from the latest `origin/<default>` for it;
 - stop once its non-draft PR is open, with no babysit-pr and no waiting for a review, because you are the reviewer and start only when its run exits;
 - not merge or deploy;
 - end its final message with a report block: PR URL, one-line summary, each command it ran with its result, anything the reviewer or the user must know or answer.
 
 ## 2. Launch
 
-Run it in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
+Make the session's worktree yourself, where your instructions put worktrees, on a new branch cut from the latest `origin/<default>`. Name the worktree `codex-<topic>` after the brief, and the branch the way your instructions name branches, `codex/<topic>` when they don't say.
 
 ```bash
-codex exec --worktree -C MAIN_CHECKOUT --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
+git -C MAIN_CHECKOUT fetch origin
+git -C MAIN_CHECKOUT worktree add --no-track -b BRANCH WORKTREE origin/DEFAULT
 ```
 
-- `--worktree` gives Codex a worktree of its own and leaves the main checkout untouched.
+Then start Codex in it, in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
+
+```bash
+codex exec -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
+```
+
+- Never pass `--worktree`. Codex would make a worktree of its own at `<its worktree root>/<4 hex digits>/<repo>`, detached at the main checkout's HEAD: outside the place your instructions and the project's tooling expect a worktree, and on a base that can be behind.
 - `--approve-for-me` keeps the `workspace-write` sandbox and sends approval requests to Codex's automatic reviewer, since nobody is there to answer a prompt. Never pass `--dangerously-bypass-approvals-and-sandbox`.
 - Never pass `--ephemeral`: it keeps no session to resume.
 
-The log opens with `stale rollout path` errors, which are noise, and within seconds a header with the `workdir:` and `session id:` lines a resume needs. Read them and tell the user the session id, the worktree and the brief.
+The log opens with `stale rollout path` errors, which are noise, and within seconds a header with the `session id:` line a resume needs. Read it and tell the user the session id, the worktree and the brief.
 
 **When auto mode refuses.** The first launch in a conversation is usually refused as `[Create Unsafe Agents]` when the user's request said no more than "run codex". Whenever a launch or a resume is refused, don't try variants: show the user the exact command, say what `--approve-for-me` does, and re-issue it unchanged on their go. If it is refused again, the command is theirs to run.
 
@@ -48,12 +55,11 @@ You are re-invoked when the run exits.
 Resume the session when anything is left for it to do: an open review thread, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
 
 ```bash
-codex exec -C CODEX_WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
+codex exec -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
 ```
 
-- Always pass `-C` with the `workdir:` from the first log. A resumed run works in the directory it is given (the current one by default), not where the session began.
+- Always pass `-C` with the session's worktree. A resumed run works in the directory it is given (the current one by default), not where the session began.
 - Keep the flags before the word `resume`, which takes neither `-C` nor `--approve-for-me` after it.
-- Leave `--worktree` out: it would start another worktree.
 
 The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed. Re-review that head when the run exits.
 
