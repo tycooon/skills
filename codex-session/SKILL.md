@@ -48,9 +48,10 @@ The log opens with `stale rollout path` errors, which are noise, and within seco
 You are re-invoked when the run exits.
 
 1. Read the `-o` file. A run that was cut off leaves none, so read the log's tail instead.
-2. Review the PR with [review-pr](../review-pr/SKILL.md), against the brief as well as the diff. You are this PR's external AI reviewer, so keep [babysit-pr](../babysit-pr/SKILL.md) and any Auto-fix watch off for it: both would have you fix what you review.
-3. Read the PR's checks and mergeability yourself afterwards: review-pr leaves CI out.
-4. Pass the user any question Codex left that the brief doesn't answer.
+2. Attach the PR it opened to your session, once, when your runtime can show a PR beside the conversation, as the Claude desktop app does: the user follows its checks and review state there. Attach it and nothing more: no watch goes on with it, as the next step says.
+3. Review the PR with [review-pr](../review-pr/SKILL.md), against the brief as well as the diff. You are this PR's external AI reviewer, so keep [babysit-pr](../babysit-pr/SKILL.md) and any Auto-fix watch off for it: both would have you fix what you review.
+4. Read the PR's checks and mergeability yourself afterwards: review-pr leaves CI out.
+5. Pass the user any question Codex left that the brief doesn't answer.
 
 ## 4. Resume
 
