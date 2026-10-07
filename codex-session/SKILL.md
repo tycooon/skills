@@ -27,6 +27,8 @@ git -C MAIN_CHECKOUT fetch origin
 git -C MAIN_CHECKOUT worktree add --no-track -b BRANCH WORKTREE origin/DEFAULT
 ```
 
+A repository's own command for making a worktree comes first: when its instructions give one, run it with the branch name in place of these two commands, and use the path it prints as the worktree.
+
 Then start Codex in it, in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
 
 ```bash
