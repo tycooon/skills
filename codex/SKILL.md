@@ -13,9 +13,19 @@ Every run sets its model and reasoning effort explicitly, so the user's own Code
 python3 -c 'import json,os,re;m=json.load(open(os.path.expanduser("~/.codex/models_cache.json")))["models"];v=[(tuple(map(int,x.group(1).split("."))),s) for s in (e["slug"] for e in m if e.get("visibility")=="list") if (x:=re.fullmatch(r"gpt-([\d.]+)-sol",s))];print(max(v)[1])'
 ```
 
-It prints a slug such as `gpt-6.1-sol`. If the file is missing or the command fails, say so and ask the user which model to use rather than guessing one. Reuse the same MODEL and EFFORT for every run and resume of a session, and name them when you report its launch.
+It prints a slug such as `gpt-6.1-sol`. If the file is missing or the command fails, say so and ask the user which model to use rather than guessing one.
 
-For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec -m MODEL -c model_reasoning_effort=EFFORT --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
+Every run also sets its speed, as SPEED, the id of one of the model's service tiers. Use `priority` unless the user asks for another: it is the tier Codex calls Fast, which the model list rates at 1.5x to 2x the standard speed for more usage. Codex has no `--fast` flag; the tier goes in as `-c service_tier=SPEED`. The same model list says which tiers the model offers and what each claims:
+
+```bash
+python3 -c 'import json,os,sys;m={e["slug"]:e for e in json.load(open(os.path.expanduser("~/.codex/models_cache.json")))["models"]};[print(t["id"],"-",t["name"],"-",t.get("description","")) for t in m[sys.argv[1]].get("service_tiers",[])]' MODEL
+```
+
+On 2026-10-10 `gpt-6.1-sol` listed `priority` ("Fast", "2x speed, increased usage") and `ultrafast`; `gpt-6-sol` and `gpt-5.6-sol` listed `priority` at 1.5x. Measured end to end on `gpt-6.1-sol`, eight alternating runs of one 600-word answer took 50.4 s (median) at `priority` against 67.7 s standard, 1.34x: Codex's startup is not sped up, and neither is time a session spends waiting on CI. When the model lists no `priority` tier, leave the flag out and use the standard speed rather than another tier. A tier the model does not offer is not an error: Codex prints `Configured service tier … is not advertised as supported … and will be omitted from requests` in the log and runs at the standard speed, so read the log's opening lines once after a launch. Use `ultrafast`, or the standard speed (no flag), only when the user asks.
+
+Reuse the same MODEL, EFFORT and SPEED for every run and resume of a session, and name them when you report its launch. A session that is already running keeps its speed: to change it, stop the run and resume the session with the new tier, telling it to pick up where it stopped.
+
+For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
 
 ## 1. Write the brief
 
@@ -40,7 +50,7 @@ A repository's own command for making a worktree comes first: when its instructi
 Then start Codex in it, in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
 
 ```bash
-codex exec -m MODEL -c model_reasoning_effort=EFFORT -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
+codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
 ```
 
 - Never pass `--worktree`. Codex would make a worktree of its own at `<its worktree root>/<4 hex digits>/<repo>`, detached at the main checkout's HEAD: outside the place your instructions and the project's tooling expect a worktree, and on a base that can be behind.
@@ -66,12 +76,12 @@ You are re-invoked when the run exits.
 Resume the session when anything is left for it to do: an open review thread, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
 
 ```bash
-codex exec -m MODEL -c model_reasoning_effort=EFFORT -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
+codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
 ```
 
 - Always pass `-C` with the session's worktree. A resumed run works in the directory it is given (the current one by default), not where the session began.
 - Keep the flags before the word `resume`, which takes neither `-C` nor `--approve-for-me` after it.
-- Pass the session's MODEL and EFFORT again, so a resume never falls back to the user's config.
+- Pass the session's MODEL, EFFORT and SPEED again, so a resume never falls back to the user's config.
 
 The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed. Re-review that head when the run exits.
 
