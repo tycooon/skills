@@ -1,5 +1,5 @@
 ---
-name: codex-session
+name: codex
 description: "Hand a task to a headless Codex session from Claude, review its PR and resume the session until it is ready."
 ---
 
