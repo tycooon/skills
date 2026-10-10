@@ -14,9 +14,11 @@ import fnmatch
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -166,19 +168,55 @@ def read_archive(data):
 # --- push (Mac) --------------------------------------------------------------
 
 
-def project_cwd(project):
-    sessions = sorted(project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not sessions:
+def project_path(name):
+    """The checkout a project folder is named after, found on disk.
+
+    Claude Code names the folder after the repo's path with every character but [A-Za-z0-9] turned into "-", so several paths give one name; only the one that exists counts.
+    """
+
+    def walk(directory, rest):
+        if not rest:
+            return Path(directory)
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return None
+        for entry in entries:
+            key = re.sub(r"[^A-Za-z0-9]", "-", entry)
+            width = key.count("-") + 1
+            if "-".join(rest[:width]) == key:
+                found = walk(os.path.join(directory, entry), rest[width:])
+                if found:
+                    return found
         return None
-    with open(sessions[0]) as f:
-        for line in f:
-            try:
-                cwd = json.loads(line).get("cwd")
-            except ValueError:
-                continue
-            if cwd:
-                return Path(cwd)
-    return None
+
+    return walk("/", name.split("-")[1:])
+
+
+def session_cwds(project):
+    # Worktrees share their repo's project folder, so these include worktrees removed since.
+    for session in sorted(project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+        with open(session) as f:
+            for line in f:
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    yield Path(cwd)
+                    break
+
+
+def project_repo(project):
+    """Returns (repo, None) or (None, why it has none)."""
+    found_checkout = False
+    for path in itertools.chain([project_path(project.name)], session_cwds(project)):
+        if path and path.is_dir():
+            found_checkout = True
+            repo = repo_of(path)
+            if repo:
+                return repo, None
+    return None, "no git remote" if found_checkout else "checkout is gone"
 
 
 def exclude_patterns():
@@ -196,10 +234,8 @@ def collect():
         notes = [p for p in memory.rglob("*.md") if p.is_file()]
         if not notes:
             continue
-        cwd = project_cwd(memory.parent)
-        repo = repo_of(cwd) if cwd and cwd.is_dir() else None
+        repo, reason = project_repo(memory.parent)
         if repo is None:
-            reason = "no git remote" if cwd and cwd.is_dir() else "checkout is gone"
             skipped.append(f"{memory.parent.name} ({reason})")
             continue
         if any(fnmatch.fnmatchcase(repo, pattern) for pattern in patterns):

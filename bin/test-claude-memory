@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -221,6 +222,28 @@ class Push(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(box.apply_calls(), [])
         self.assertIn("github.com/o/big", (box.root / "push.log").read_text())
+
+    def test_repo_comes_from_the_project_folder_name_when_sessions_ran_in_removed_worktrees(self):
+        box = self.box
+        repo = box.checkout("my-app.v2", "git@github.com:acme/app.git")
+        key = re.sub(r"[^A-Za-z0-9]", "-", str(repo))
+        box.project(key, box.root / "worktrees" / "w01", {"MEMORY.md": "notes\n"})
+
+        self.assertEqual(box.run("push").returncode, 0)
+        files, _ = self.pushed_tree()
+        self.assertEqual(sorted(files), ["github.com/acme/app/MEMORY.md"])
+
+    def test_falls_back_to_an_older_session_whose_checkout_still_exists(self):
+        box = self.box
+        live = box.checkout("app", "git@github.com:acme/app.git")
+        project = box.project("-renamed-elsewhere", live, {"MEMORY.md": "notes\n"})
+        newer = project / "newer.jsonl"
+        newer.write_text(json.dumps({"cwd": str(box.root / "worktrees" / "w02")}) + "\n")
+        os.utime(project / "session.jsonl", (time.time() - 60, time.time() - 60))
+
+        self.assertEqual(box.run("push").returncode, 0)
+        files, _ = self.pushed_tree()
+        self.assertEqual(sorted(files), ["github.com/acme/app/MEMORY.md"])
 
     def test_large_archive_spans_chunk_secrets_and_shrinking_drops_them(self):
         box = self.box
