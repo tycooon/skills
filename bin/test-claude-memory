@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -108,9 +109,9 @@ class Sandbox:
             (project / "memory" / name).write_text(text)
         return project
 
-    def run(self, *args, extra_env=None):
+    def run(self, *args, extra_env=None, script=SCRIPT):
         env = dict(self.env, **(extra_env or {}))
-        return subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True)
+        return subprocess.run([str(script), *args], env=env, capture_output=True, text=True)
 
     def apply_calls(self):
         if not self.calls.exists():
@@ -384,6 +385,52 @@ class Pull(unittest.TestCase):
 
     def test_unreachable_cluster(self):
         self.assert_unavailable(self.pull(extra_env={"STUB_FAIL": "1"}), "connection refused")
+
+
+class SelfUpdate(unittest.TestCase):
+    """The cloud environment keeps the script it was built with for days, so pull fetches the current one first."""
+
+    def setUp(self):
+        self.box = Sandbox()
+        box = self.box
+        app = box.checkout("app", "git@github.com:acme/app.git")
+        box.project("-app", app, {"MEMORY.md": "notes\n"})
+        self.assertEqual(box.run("push").returncode, 0)
+        self.installed = box.config / "bin" / "claude-memory"
+        self.installed.parent.mkdir()
+        shutil.copy(SCRIPT, self.installed)
+        self.source = box.root / "upstream-claude-memory"
+        self.cloud = box.checkout("cloud-app", "https://github.com/acme/app")
+
+    def tearDown(self):
+        self.box.close()
+
+    def pull(self, source):
+        env = {"CLAUDE_PROJECT_DIR": str(self.cloud), "CLAUDE_MEMORY_SOURCE": source}
+        return self.box.run("pull", extra_env=env, script=self.installed)
+
+    def test_installs_and_runs_the_current_script(self):
+        self.source.write_text(SCRIPT.read_text().replace("## Mac memory snapshot", "## Updated snapshot"))
+        result = self.pull(self.source.as_uri())
+        self.assertIn("## Updated snapshot", result.stdout)
+        self.assertEqual(self.installed.read_text(), self.source.read_text())
+
+    def test_keeps_its_copy_when_the_source_is_unreachable(self):
+        result = self.pull((self.box.root / "missing").as_uri())
+        self.assertIn("## Mac memory snapshot", result.stdout)
+        self.assertEqual(self.installed.read_text(), SCRIPT.read_text())
+
+    def test_ignores_a_source_that_does_not_compile(self):
+        self.source.write_text("def broken(:\n")
+        result = self.pull(self.source.as_uri())
+        self.assertIn("## Mac memory snapshot", result.stdout)
+        self.assertEqual(self.installed.read_text(), SCRIPT.read_text())
+
+    def test_a_checkout_never_overwrites_itself(self):
+        self.source.write_text(SCRIPT.read_text() + "\n# changed\n")
+        env = {"CLAUDE_PROJECT_DIR": str(self.cloud), "CLAUDE_MEMORY_SOURCE": self.source.as_uri()}
+        self.box.run("pull", extra_env=env)
+        self.assertNotIn("# changed", SCRIPT.read_text())
 
 
 class Hooks(unittest.TestCase):

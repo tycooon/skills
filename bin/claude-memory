@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -32,6 +33,9 @@ KUBECTL = os.environ.get("KUBECTL", "kubectl")
 SNAPSHOT = CONFIG / "memory-sync"
 EXCLUDE = CONFIG / "memory-sync.exclude"
 CLUSTER = CONFIG / "memory-sync.json"
+INSTALLED = CONFIG / "bin" / "claude-memory"
+# A cloud environment keeps the copy it was built with for about a week, so pull first replaces it with this one.
+SOURCE = os.environ.get("CLAUDE_MEMORY_SOURCE", "https://raw.githubusercontent.com/tycooon/skills/master/bin/claude-memory")
 
 SECRET = "claude-memory"
 DATA_KEY = "memory.tar.gz"
@@ -366,6 +370,26 @@ def context():
     return "\n".join(lines)
 
 
+def refresh():
+    """Replaces the installed copy with the one at SOURCE; True when it changed."""
+    me = Path(__file__).resolve()
+    if os.environ.get("CLAUDE_MEMORY_REFRESHED") or me != INSTALLED.resolve():
+        return False
+    try:
+        with urllib.request.urlopen(SOURCE, timeout=5) as response:
+            current = response.read()
+        compile(current, str(me), "exec")
+    except Exception:  # an unreachable or broken source leaves this copy in charge
+        return False
+    if current == me.read_bytes():
+        return False
+    staged = me.with_name(".claude-memory.new")
+    staged.write_bytes(current)
+    staged.chmod(0o755)
+    os.replace(staged, me)
+    return True
+
+
 def pull():
     problem = None
     try:
@@ -409,6 +433,8 @@ def main(argv):
             return 0
         return push()
     if command == "pull" and not options:
+        if refresh():
+            os.execve(sys.executable, [sys.executable, str(INSTALLED), "pull"], {**os.environ, "CLAUDE_MEMORY_REFRESHED": "1"})
         return pull()
     if command == "hooks" and len(options) == 1 and options[0] in HOOK_COMMANDS:
         return hooks(options[0])
