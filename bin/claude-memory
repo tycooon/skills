@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Share the Mac's Claude Code auto-memories with Claude cloud sessions, read-only.
+
+  claude-memory push [--background]  Mac: publish every project's memory to the Secret
+  claude-memory pull                 cloud: fetch the snapshot, print this repo's memory
+  claude-memory hooks --mac|--cloud  register the SessionEnd (Mac) or SessionStart (cloud) hook
+
+Memories are keyed by host/owner/repo from each project's git remote, because the Mac's and the cloud's checkout paths never match. The snapshot lives in the Kubernetes Secret claude-memory, which cloud sessions can reach through an agent proxy that injects the cluster credential, where a private git repo would be out of their reach. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ...}, with only namespace required. Projects matching a glob in ~/.claude/memory-sync.exclude never leave the Mac; push refuses to run until that file exists, even empty.
+"""
+
+import base64
+import datetime
+import fnmatch
+import gzip
+import hashlib
+import io
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
+
+CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+KUBECTL = os.environ.get("KUBECTL", "kubectl")
+SNAPSHOT = CONFIG / "memory-sync"
+EXCLUDE = CONFIG / "memory-sync.exclude"
+CLUSTER = CONFIG / "memory-sync.json"
+
+SECRET = "claude-memory"
+DATA_KEY = "memory.tar.gz"
+HASH_ANNOTATION = "memory-sync/sha256"
+PUSHED_AT_ANNOTATION = "memory-sync/pushed-at"
+# A Secret holds at most 1 MiB of data.
+MAX_ARCHIVE_BYTES = 900 * 1024
+CONTEXT_LINES = 200  # what Claude Code itself loads from MEMORY.md
+
+HOOK_COMMANDS = {
+    "--mac": ("SessionEnd", "~/.claude/bin/claude-memory push --background"),
+    "--cloud": ("SessionStart", "~/.claude/bin/claude-memory pull"),
+}
+
+
+class Failure(Exception):
+    pass
+
+
+def normalize_remote(url):
+    url = url.strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        host, path = parts.hostname, parts.path
+    elif "@" in url.split(":", 1)[0] and ":" in url:
+        host, path = url.split("@", 1)[1].split(":", 1)
+    else:
+        return None
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not host or path.count("/") < 1:
+        return None
+    return f"{host.lower()}/{path}"
+
+
+def repo_of(directory):
+    result = subprocess.run(["git", "-C", str(directory), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return normalize_remote(result.stdout) if result.returncode == 0 else None
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def kubectl(args, stdin=None):
+    try:
+        result = subprocess.run([KUBECTL, *args], input=stdin, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Failure(str(error))
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines() or [f"kubectl exited {result.returncode}"]
+        raise Failure(lines[-1])
+    return result.stdout
+
+
+def cluster(*extra):
+    """Returns (namespace, kubectl arguments) from ~/.claude/memory-sync.json."""
+    try:
+        config = json.loads(CLUSTER.read_text())
+        namespace = config["namespace"]
+    except FileNotFoundError:
+        raise Failure(f"{CLUSTER} is missing, so the cluster holding the snapshot is unknown")
+    except (ValueError, KeyError, TypeError) as error:
+        raise Failure(f"{CLUSTER} is invalid: {error!r}")
+    args = []
+    if config.get("kubeconfig"):
+        args += ["--kubeconfig", str(Path(config["kubeconfig"]).expanduser())]
+    if config.get("context"):
+        args += ["--context", config["context"]]
+    return namespace, [*args, "-n", namespace, *extra]
+
+
+def get_secret(kube_args):
+    try:
+        return json.loads(kubectl(["get", "secret", SECRET, "-o", "json", *kube_args]))
+    except Failure as error:
+        if "NotFound" in str(error):
+            return None
+        raise
+
+
+# --- archive -----------------------------------------------------------------
+
+
+def build_archive(files, manifest):
+    """Same files and manifest give the same bytes, so the hash tells whether anything changed."""
+    entries = dict(files)
+    entries["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            for name in sorted(entries):
+                info = tarfile.TarInfo(name)
+                info.size = len(entries[name])
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(entries[name]))
+    return buffer.getvalue()
+
+
+def read_archive(data):
+    files = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            for member in tar:
+                path = PurePosixPath(member.name)
+                if not member.isfile() or path.is_absolute() or ".." in path.parts:
+                    raise Failure(f"corrupt archive: unexpected entry {member.name!r}")
+                files[member.name] = tar.extractfile(member).read()
+        manifest = json.loads(files.pop("manifest.json"))
+    except (tarfile.TarError, OSError, KeyError, ValueError) as error:
+        raise Failure(f"corrupt archive: {error}")
+    return files, manifest
+
+
+# --- push (Mac) --------------------------------------------------------------
+
+
+def project_cwd(project):
+    sessions = sorted(project.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not sessions:
+        return None
+    with open(sessions[0]) as f:
+        for line in f:
+            try:
+                cwd = json.loads(line).get("cwd")
+            except ValueError:
+                continue
+            if cwd:
+                return Path(cwd)
+    return None
+
+
+def exclude_patterns():
+    lines = (line.strip() for line in EXCLUDE.read_text().splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def collect():
+    """Returns ({"host/owner/repo/name.md": bytes}, sorted repos, skipped project descriptions)."""
+    patterns = exclude_patterns()
+    newest = {}
+    repos = set()
+    skipped = []
+    for memory in sorted((CONFIG / "projects").glob("*/memory")):
+        notes = [p for p in memory.rglob("*.md") if p.is_file()]
+        if not notes:
+            continue
+        cwd = project_cwd(memory.parent)
+        repo = repo_of(cwd) if cwd and cwd.is_dir() else None
+        if repo is None:
+            reason = "no git remote" if cwd and cwd.is_dir() else "checkout is gone"
+            skipped.append(f"{memory.parent.name} ({reason})")
+            continue
+        if any(fnmatch.fnmatchcase(repo, pattern) for pattern in patterns):
+            continue
+        repos.add(repo)
+        # A checkout and its worktrees are one repo: the newest copy of each note wins.
+        for note in notes:
+            name = f"{repo}/{note.relative_to(memory).as_posix()}"
+            mtime = note.stat().st_mtime
+            if name not in newest or mtime > newest[name][0]:
+                newest[name] = (mtime, note.read_bytes())
+    return {name: data for name, (_, data) in newest.items()}, sorted(repos), skipped
+
+
+def log(line):
+    path = Path(os.environ.get("CLAUDE_MEMORY_LOG", "~/Library/Logs/claude-memory-push.log")).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(path, "a") as f:
+        f.write(f"{stamp} {line}\n")
+
+
+def push():
+    if not EXCLUDE.exists():
+        log(f"failed: create {EXCLUDE}, even empty, after deciding which repos' memories stay on this Mac")
+        return 1
+    try:
+        namespace, kube_args = cluster()
+    except Failure as error:
+        log(f"failed: {error}")
+        return 1
+    files, repos, skipped = collect()
+    skipped_note = f"; skipped: {', '.join(skipped)}" if skipped else ""
+    archive = build_archive(files, {"host": platform.node(), "repos": repos})
+    if len(archive) > MAX_ARCHIVE_BYTES:
+        sizes = {repo: sum(len(data) for name, data in files.items() if name.startswith(repo + "/")) for repo in repos}
+        largest = ", ".join(f"{repo} {size // 1024} KiB" for repo, size in sorted(sizes.items(), key=lambda kv: -kv[1])[:3])
+        log(f"failed: archive is {len(archive) // 1024} KiB, over the {MAX_ARCHIVE_BYTES // 1024} KiB limit; largest: {largest}")
+        return 1
+    digest = sha256(archive)
+    try:
+        current = get_secret(kube_args)
+        if current and current["metadata"].get("annotations", {}).get(HASH_ANNOTATION) == digest:
+            log(f"unchanged ({len(repos)} repo(s)){skipped_note}")
+            return 0
+        pushed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        secret = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {"name": SECRET, "namespace": namespace, "annotations": {HASH_ANNOTATION: digest, PUSHED_AT_ANNOTATION: pushed_at}},
+            "type": "Opaque",
+            "data": {DATA_KEY: base64.b64encode(archive).decode()},
+        }
+        # Server-side apply keeps no last-applied copy, which would double the object's size.
+        kubectl(["apply", "--server-side", "--force-conflicts", "--field-manager", "claude-memory", "-f", "-", *kube_args], stdin=json.dumps(secret))
+    except Failure as error:
+        log(f"failed: {error}")
+        return 1
+    log(f"pushed {len(repos)} repo(s), {len(archive) // 1024} KiB{skipped_note}")
+    return 0
+
+
+# --- pull (cloud) ------------------------------------------------------------
+
+
+def fetch():
+    secret = get_secret(cluster("--request-timeout=5s")[1])
+    if secret is None:
+        raise Failure(f'secret "{SECRET}" not found')
+    try:
+        data = base64.b64decode(secret["data"][DATA_KEY])
+        annotations = secret["metadata"]["annotations"]
+        expected, pushed_at = annotations[HASH_ANNOTATION], annotations[PUSHED_AT_ANNOTATION]
+    except (KeyError, ValueError) as error:
+        raise Failure(f"corrupt archive: {error}")
+    if sha256(data) != expected:
+        raise Failure("archive hash does not match its annotation")
+    files, manifest = read_archive(data)
+    manifest["pushed_at"] = pushed_at
+
+    staging = Path(tempfile.mkdtemp(prefix=".memory-sync-", dir=CONFIG))
+    for name, content in files.items():
+        (staging / name).parent.mkdir(parents=True, exist_ok=True)
+        (staging / name).write_bytes(content)
+    (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    # Swap whole directories so a session never reads a half-written tree.
+    retired = CONFIG / ".memory-sync-retired"
+    shutil.rmtree(retired, ignore_errors=True)
+    if SNAPSHOT.exists():
+        SNAPSHOT.rename(retired)
+    staging.rename(SNAPSHOT)
+    shutil.rmtree(retired, ignore_errors=True)
+
+
+def age(pushed_at):
+    pushed = datetime.datetime.strptime(pushed_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    minutes = int((datetime.datetime.now(datetime.timezone.utc) - pushed).total_seconds() // 60)
+    if minutes < 120:
+        return f"{minutes} min"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h"
+    return f"{minutes // (24 * 60)} days"
+
+
+def context():
+    manifest = json.loads((SNAPSHOT / "manifest.json").read_text())
+    pushed_at = manifest["pushed_at"]
+    lines = [
+        f"## Mac memory snapshot (read-only, pushed {pushed_at}, {age(pushed_at)} ago)",
+        f"Other projects: {SNAPSHOT}/<host>/<owner>/<repo>/ — search there when relevant.",
+        "This session cannot add memories; tell the user what is worth remembering.",
+    ]
+    repo = repo_of(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    memory = SNAPSHOT / repo / "MEMORY.md" if repo else None
+    if memory and memory.is_file():
+        notes = memory.read_text().splitlines(keepends=True)[:CONTEXT_LINES]
+        lines += ["", f"Memory for {repo} (topic files are next to it in {memory.parent}/):", "", "".join(notes).rstrip("\n")]
+    return "\n".join(lines)
+
+
+def pull():
+    problem = None
+    try:
+        fetch()
+    except Exception as error:  # a session must start whatever goes wrong here
+        problem = str(error) if isinstance(error, Failure) else f"{type(error).__name__}: {error}"
+    if problem:
+        print(f"Mac memory snapshot unavailable: {problem}; mention this to the user.")
+    if (SNAPSHOT / "manifest.json").exists():
+        if problem:
+            print("Using the earlier snapshot already in this container:\n")
+        print(context())
+    return 0
+
+
+# --- hooks -------------------------------------------------------------------
+
+
+def hooks(flag):
+    event, command = HOOK_COMMANDS[flag]
+    path = CONFIG / "settings.json"
+    settings = json.loads(path.read_text()) if path.exists() else {}
+    groups = settings.setdefault("hooks", {}).setdefault(event, [])
+    for group in groups:
+        group["hooks"] = [h for h in group.get("hooks", []) if "claude-memory " not in h.get("command", "")]
+    groups[:] = [group for group in groups if group["hooks"]]
+    hook = {"type": "command", "command": command}
+    if flag == "--cloud":
+        hook["timeout"] = 15
+    groups.append({"hooks": [hook]})
+    path.write_text(json.dumps(settings, indent=2) + "\n")
+    return 0
+
+
+def main(argv):
+    command, options = (argv[0], argv[1:]) if argv else (None, [])
+    if command == "push" and options in ([], ["--background"]):
+        if options:
+            # A SessionEnd hook must return at once; the push may wait on the cluster.
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "push"], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return 0
+        return push()
+    if command == "pull" and not options:
+        return pull()
+    if command == "hooks" and len(options) == 1 and options[0] in HOOK_COMMANDS:
+        return hooks(options[0])
+    sys.stderr.write(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
