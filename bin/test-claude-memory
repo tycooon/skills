@@ -16,24 +16,40 @@ from pathlib import Path
 sys.dont_write_bytecode = True  # loading bin/claude-memory as a module would litter bin/
 SCRIPT = Path(__file__).resolve().parent / "claude-memory"
 
-# Stands in for kubectl: keeps the one Secret in a JSON file and records every call.
+# Stands in for kubectl: keeps Secrets as JSON files in a directory and records every call.
 STUB_KUBECTL = r'''#!/usr/bin/env python3
 import json, os, sys
 state, calls = os.environ["STUB_STATE"], os.environ["STUB_CALLS"]
+args = sys.argv[1:]
 with open(calls, "a") as f:
-    f.write(json.dumps(sys.argv[1:]) + "\n")
+    f.write(json.dumps(args) + "\n")
 if os.environ.get("STUB_FAIL"):
     sys.stderr.write("dial tcp: connection refused\n")
     sys.exit(1)
-if "apply" in sys.argv:
-    with open(state, "w") as f:
-        f.write(sys.stdin.read())
-    print("secret/claude-memory serverside-applied")
-elif "get" in sys.argv:
-    if not os.path.exists(state):
-        sys.stderr.write('Error from server (NotFound): secrets "claude-memory" not found\n')
+os.makedirs(state, exist_ok=True)
+path = lambda name: os.path.join(state, name + ".json")
+names = []
+for arg in args[2:]:
+    if arg.startswith("-"):
+        break
+    names.append(arg)
+if args[0] == "apply":
+    body = json.loads(sys.stdin.read())
+    for item in body.get("items", [body]):
+        with open(path(item["metadata"]["name"]), "w") as f:
+            json.dump(item, f)
+    print("applied")
+elif args[0] == "get":
+    missing = [n for n in names if not os.path.exists(path(n))]
+    if missing:
+        sys.stderr.write(f'Error from server (NotFound): secrets "{missing[0]}" not found\n')
         sys.exit(1)
-    print(open(state).read())
+    items = [json.load(open(path(n))) for n in names]
+    print(json.dumps(items[0] if len(items) == 1 else {"kind": "List", "items": items}))
+elif args[0] == "delete":
+    for n in names:
+        if os.path.exists(path(n)):
+            os.remove(path(n))
 '''
 
 
@@ -52,7 +68,7 @@ class Sandbox:
         self.home = self.root / "home"
         self.config = self.home / ".claude"
         self.config.mkdir(parents=True)
-        self.state = self.root / "secret.json"
+        self.state = self.root / "secrets"
         self.calls = self.root / "calls.jsonl"
         stub = self.root / "kubectl"
         stub.write_text(STUB_KUBECTL)
@@ -100,8 +116,20 @@ class Sandbox:
             return []
         return [c for c in map(json.loads, self.calls.read_text().splitlines()) if "apply" in c]
 
-    def secret(self):
-        return json.loads(self.state.read_text())
+    def secret(self, name="claude-memory"):
+        return json.loads((self.state / f"{name}.json").read_text())
+
+    def write_secret(self, secret):
+        (self.state / f"{secret['metadata']['name']}.json").write_text(json.dumps(secret))
+
+    def secret_names(self):
+        return sorted(p.stem for p in self.state.glob("*.json"))
+
+    def archive(self):
+        index = self.secret()
+        count = int(index["metadata"]["annotations"]["memory-sync/chunks"])
+        names = ["claude-memory"] + [f"claude-memory-{i}" for i in range(1, count)]
+        return b"".join(base64.b64decode(self.secret(n)["data"]["memory.tar.gz"]) for n in names)
 
 
 class NormalizeRemote(unittest.TestCase):
@@ -127,9 +155,7 @@ class Push(unittest.TestCase):
         self.box.close()
 
     def pushed_tree(self):
-        mod = load_module()
-        secret = self.box.secret()
-        return mod.read_archive(base64.b64decode(secret["data"]["memory.tar.gz"]))
+        return load_module().read_archive(self.box.archive())
 
     def test_collects_filters_and_publishes(self):
         box = self.box
@@ -187,7 +213,7 @@ class Push(unittest.TestCase):
     def test_oversized_archive_is_refused(self):
         box = self.box
         repo = box.checkout("big", "git@github.com:o/big.git")
-        noise = base64.b64encode(os.urandom(1_500_000)).decode()
+        noise = base64.b64encode(os.urandom(8_000_000)).decode()
         box.project("-big", repo, {"MEMORY.md": noise})
 
         result = box.run("push")
@@ -195,6 +221,33 @@ class Push(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(box.apply_calls(), [])
         self.assertIn("github.com/o/big", (box.root / "push.log").read_text())
+
+    def test_large_archive_spans_chunk_secrets_and_shrinking_drops_them(self):
+        box = self.box
+        repo = box.checkout("big", "git@github.com:o/big.git")
+        project = box.project("-big", repo, {"MEMORY.md": base64.b64encode(os.urandom(1_500_000)).decode()})
+
+        self.assertEqual(box.run("push").returncode, 0)
+        self.assertEqual(box.secret_names(), ["claude-memory", "claude-memory-1"])
+        self.assertEqual(box.secret()["metadata"]["annotations"]["memory-sync/chunks"], "2")
+        files, _ = self.pushed_tree()
+        self.assertEqual(files["github.com/o/big/MEMORY.md"], (project / "memory" / "MEMORY.md").read_bytes())
+
+        (project / "memory" / "MEMORY.md").write_text("small now\n")
+        self.assertEqual(box.run("push").returncode, 0)
+        self.assertEqual(box.secret_names(), ["claude-memory"])
+        self.assertIn("in 1 Secret(s)", (box.root / "push.log").read_text())
+
+    def test_note_globs_keep_single_notes_on_the_mac(self):
+        box = self.box
+        repo = box.checkout("home", "git@github.com:acme/home.git")
+        box.project("-home", repo, {"MEMORY.md": "index\n", "client-a.md": "private\n", "tools.md": "shared\n"})
+        (box.config / "memory-sync.exclude").write_text("github.com/acme/home/client-*\n")
+
+        self.assertEqual(box.run("push").returncode, 0)
+        files, manifest = self.pushed_tree()
+        self.assertEqual(sorted(files), ["github.com/acme/home/MEMORY.md", "github.com/acme/home/tools.md"])
+        self.assertEqual(manifest["repos"], ["github.com/acme/home"])
 
     def test_refuses_without_an_exclude_file(self):
         box = self.box
@@ -244,6 +297,29 @@ class Pull(unittest.TestCase):
         self.assertIn("--request-timeout=5s", get)
         self.assertEqual(get[get.index("-n") + 1], "memory")
 
+    def test_reassembles_chunks(self):
+        noise = base64.b64encode(os.urandom(1_500_000)).decode()
+        (self.box.config / "projects" / "-app" / "memory" / "big.md").write_text(noise)
+        self.assertEqual(self.box.run("push").returncode, 0)
+        self.assertIn("claude-memory-1", self.box.secret_names())
+
+        self.assertIn("line 0\n", self.pull().stdout)
+        self.assertEqual((self.snapshot / "github.com/acme/app/big.md").read_text(), noise)
+
+    def test_missing_chunk(self):
+        (self.box.config / "projects" / "-app" / "memory" / "big.md").write_text(base64.b64encode(os.urandom(1_500_000)).decode())
+        self.box.run("push")
+        (self.box.state / "claude-memory-1.json").unlink()
+        self.assert_unavailable(self.pull(), "claude-memory-1")
+
+    def test_context_stops_at_25_kib(self):
+        memory = self.box.config / "projects" / "-app" / "memory" / "MEMORY.md"
+        memory.write_text("".join(f"row {i:03d} " + "x" * 1000 + "\n" for i in range(100)))
+        self.box.run("push")
+        output = self.pull().stdout
+        self.assertIn("row 023 ", output)
+        self.assertNotIn("row 026 ", output)
+
     def test_repo_without_memory_prints_header_only(self):
         stranger = self.box.checkout("stranger", "git@github.com:o/stranger.git")
         result = self.pull(project=stranger)
@@ -257,7 +333,7 @@ class Pull(unittest.TestCase):
         self.assertIn("mention this to the user", result.stdout)
 
     def test_missing_secret(self):
-        self.box.state.unlink()
+        (self.box.state / "claude-memory.json").unlink()
         self.assert_unavailable(self.pull(), "not found")
         self.assertFalse(self.snapshot.exists())
 
@@ -265,7 +341,7 @@ class Pull(unittest.TestCase):
         self.pull()
         secret = self.box.secret()
         secret["metadata"]["annotations"]["memory-sync/sha256"] = "0" * 64
-        self.box.state.write_text(json.dumps(secret))
+        self.box.write_secret(secret)
         result = self.pull()
         self.assert_unavailable(result, "hash")
         self.assertIn("line 0\n", result.stdout)
@@ -276,7 +352,7 @@ class Pull(unittest.TestCase):
         payload = base64.b64encode(b"not a tarball").decode()
         secret["data"]["memory.tar.gz"] = payload
         secret["metadata"]["annotations"]["memory-sync/sha256"] = load_module().sha256(b"not a tarball")
-        self.box.state.write_text(json.dumps(secret))
+        self.box.write_secret(secret)
         self.assert_unavailable(self.pull(), "archive")
 
     def test_missing_cluster_config(self):
