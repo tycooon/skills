@@ -7,7 +7,15 @@ description: "Hand a task to a headless Codex session from Claude, review its PR
 
 The user asked for a Codex session or agent on a task. Codex writes the code and you review it: launch it headless with `codex exec`, review what it delivers, and resume the same session whenever something is left to change, until its PR is ready. Don't make those changes yourself. A running Codex session counts as a subagent toward any limit your instructions put on running them in parallel.
 
-For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
+Every run sets its model and reasoning effort explicitly, so the user's own Codex config never decides them. Unless the user names others, use `medium` effort and the newest listed Sol model, read once per conversation from the model list Codex keeps locally (no network call):
+
+```bash
+python3 -c 'import json,os,re;m=json.load(open(os.path.expanduser("~/.codex/models_cache.json")))["models"];v=[(tuple(map(int,x.group(1).split("."))),s) for s in (e["slug"] for e in m if e.get("visibility")=="list") if (x:=re.fullmatch(r"gpt-([\d.]+)-sol",s))];print(max(v)[1])'
+```
+
+It prints a slug such as `gpt-6.1-sol`. If the file is missing or the command fails, say so and ask the user which model to use rather than guessing one. Reuse the same MODEL and EFFORT for every run and resume of a session, and name them when you report its launch.
+
+For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec -m MODEL -c model_reasoning_effort=EFFORT --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
 
 ## 1. Write the brief
 
@@ -32,7 +40,7 @@ A repository's own command for making a worktree comes first: when its instructi
 Then start Codex in it, in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
 
 ```bash
-codex exec -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
+codex exec -m MODEL -c model_reasoning_effort=EFFORT -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
 ```
 
 - Never pass `--worktree`. Codex would make a worktree of its own at `<its worktree root>/<4 hex digits>/<repo>`, detached at the main checkout's HEAD: outside the place your instructions and the project's tooling expect a worktree, and on a base that can be behind.
@@ -58,11 +66,12 @@ You are re-invoked when the run exits.
 Resume the session when anything is left for it to do: an open review thread, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
 
 ```bash
-codex exec -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
+codex exec -m MODEL -c model_reasoning_effort=EFFORT -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
 ```
 
 - Always pass `-C` with the session's worktree. A resumed run works in the directory it is given (the current one by default), not where the session began.
 - Keep the flags before the word `resume`, which takes neither `-C` nor `--approve-for-me` after it.
+- Pass the session's MODEL and EFFORT again, so a resume never falls back to the user's config.
 
 The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed. Re-review that head when the run exits.
 
