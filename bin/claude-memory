@@ -5,7 +5,7 @@
   claude-memory pull                 cloud: fetch the snapshot, print this repo's memory
   claude-memory hooks --mac|--cloud  register the SessionEnd (Mac) or SessionStart (cloud) hook
 
-Memories are keyed by host/owner/repo from each project's git remote, because the Mac's and the cloud's checkout paths never match. The snapshot lives in the Kubernetes Secret claude-memory, which cloud sessions can reach through an agent proxy that injects the cluster credential, where a private git repo would be out of their reach. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ...}, with only namespace required. Projects matching a glob in ~/.claude/memory-sync.exclude never leave the Mac; push refuses to run until that file exists, even empty.
+Memories are keyed by host/owner/repo from each project's git remote, because the Mac's and the cloud's checkout paths never match. The snapshot lives in Kubernetes Secrets, which cloud sessions can reach through an agent proxy that injects the cluster credential, where a private git repo would be out of their reach. A Secret holds at most 1 MiB, so the archive is split over claude-memory (the index, written last) and claude-memory-1 to claude-memory-7, which is the fixed set of names the cluster grants read on. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ...}, with only namespace required. A glob in ~/.claude/memory-sync.exclude matching host/owner/repo keeps that repo on the Mac, and one matching host/owner/repo/note.md keeps that note; push refuses to run until that file exists, even empty.
 """
 
 import base64
@@ -35,9 +35,14 @@ SECRET = "claude-memory"
 DATA_KEY = "memory.tar.gz"
 HASH_ANNOTATION = "memory-sync/sha256"
 PUSHED_AT_ANNOTATION = "memory-sync/pushed-at"
+CHUNKS_ANNOTATION = "memory-sync/chunks"
+SECRETS = [SECRET] + [f"{SECRET}-{i}" for i in range(1, 8)]
 # A Secret holds at most 1 MiB of data.
-MAX_ARCHIVE_BYTES = 900 * 1024
-CONTEXT_LINES = 200  # what Claude Code itself loads from MEMORY.md
+CHUNK_BYTES = 900 * 1024
+MAX_ARCHIVE_BYTES = CHUNK_BYTES * len(SECRETS)
+# What Claude Code itself loads from MEMORY.md.
+CONTEXT_LINES = 200
+CONTEXT_BYTES = 25 * 1024
 
 HOOK_COMMANDS = {
     "--mac": ("SessionEnd", "~/.claude/bin/claude-memory push --background"),
@@ -110,6 +115,19 @@ def get_secret(kube_args):
         if "NotFound" in str(error):
             return None
         raise
+
+
+def secret_manifest(name, namespace, chunk, annotations=None):
+    metadata = {"name": name, "namespace": namespace}
+    if annotations:
+        metadata["annotations"] = annotations
+    return {"apiVersion": "v1", "kind": "Secret", "metadata": metadata, "type": "Opaque", "data": {DATA_KEY: base64.b64encode(chunk).decode()}}
+
+
+def apply(manifests, kube_args):
+    # Server-side apply keeps no last-applied copy, which would double each object's size.
+    body = {"apiVersion": "v1", "kind": "List", "items": manifests}
+    kubectl(["apply", "--server-side", "--force-conflicts", "--field-manager", "claude-memory", "-f", "-", *kube_args], stdin=json.dumps(body))
 
 
 # --- archive -----------------------------------------------------------------
@@ -190,6 +208,8 @@ def collect():
         # A checkout and its worktrees are one repo: the newest copy of each note wins.
         for note in notes:
             name = f"{repo}/{note.relative_to(memory).as_posix()}"
+            if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns):
+                continue
             mtime = note.stat().st_mtime
             if name not in newest or mtime > newest[name][0]:
                 newest[name] = (mtime, note.read_bytes())
@@ -228,19 +248,19 @@ def push():
             log(f"unchanged ({len(repos)} repo(s)){skipped_note}")
             return 0
         pushed_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        secret = {
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {"name": SECRET, "namespace": namespace, "annotations": {HASH_ANNOTATION: digest, PUSHED_AT_ANNOTATION: pushed_at}},
-            "type": "Opaque",
-            "data": {DATA_KEY: base64.b64encode(archive).decode()},
-        }
-        # Server-side apply keeps no last-applied copy, which would double the object's size.
-        kubectl(["apply", "--server-side", "--force-conflicts", "--field-manager", "claude-memory", "-f", "-", *kube_args], stdin=json.dumps(secret))
+        chunks = [archive[i : i + CHUNK_BYTES] for i in range(0, len(archive), CHUNK_BYTES)] or [b""]
+        if len(chunks) > 1:
+            apply([secret_manifest(name, namespace, chunk) for name, chunk in zip(SECRETS[1:], chunks[1:])], kube_args)
+        # The index goes last, so a pull never pairs a new index with old chunks; the hash catches the reverse.
+        annotations = {HASH_ANNOTATION: digest, PUSHED_AT_ANNOTATION: pushed_at, CHUNKS_ANNOTATION: str(len(chunks))}
+        apply([secret_manifest(SECRET, namespace, chunks[0], annotations)], kube_args)
+        stale = SECRETS[len(chunks) :]
+        if stale:
+            kubectl(["delete", "secret", *stale, "--ignore-not-found", *kube_args])
     except Failure as error:
         log(f"failed: {error}")
         return 1
-    log(f"pushed {len(repos)} repo(s), {len(archive) // 1024} KiB{skipped_note}")
+    log(f"pushed {len(repos)} repo(s), {len(archive) // 1024} KiB in {len(chunks)} Secret(s){skipped_note}")
     return 0
 
 
@@ -248,15 +268,22 @@ def push():
 
 
 def fetch():
-    secret = get_secret(cluster("--request-timeout=5s")[1])
+    kube_args = cluster("--request-timeout=5s")[1]
+    secret = get_secret(kube_args)
     if secret is None:
         raise Failure(f'secret "{SECRET}" not found')
     try:
-        data = base64.b64decode(secret["data"][DATA_KEY])
         annotations = secret["metadata"]["annotations"]
         expected, pushed_at = annotations[HASH_ANNOTATION], annotations[PUSHED_AT_ANNOTATION]
+        names = SECRETS[1 : int(annotations.get(CHUNKS_ANNOTATION, "1"))]
+        chunks = [secret]
+        if names:
+            listed = json.loads(kubectl(["get", "secret", *names, "-o", "json", *kube_args]))
+            by_name = {item["metadata"]["name"]: item for item in listed.get("items", [listed])}
+            chunks += [by_name[name] for name in names]
+        data = b"".join(base64.b64decode(chunk["data"][DATA_KEY]) for chunk in chunks)
     except (KeyError, ValueError) as error:
-        raise Failure(f"corrupt archive: {error}")
+        raise Failure(f"corrupt archive: {error!r}")
     if sha256(data) != expected:
         raise Failure("archive hash does not match its annotation")
     files, manifest = read_archive(data)
@@ -297,7 +324,8 @@ def context():
     repo = repo_of(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
     memory = SNAPSHOT / repo / "MEMORY.md" if repo else None
     if memory and memory.is_file():
-        notes = memory.read_text().splitlines(keepends=True)[:CONTEXT_LINES]
+        text = memory.read_bytes()[:CONTEXT_BYTES].decode(errors="ignore")
+        notes = text.splitlines(keepends=True)[:CONTEXT_LINES]
         lines += ["", f"Memory for {repo} (topic files are next to it in {memory.parent}/):", "", "".join(notes).rstrip("\n")]
     return "\n".join(lines)
 
