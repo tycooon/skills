@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Tests for bin/claude-memory. Run: bin/test-claude-memory"""
+
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # loading bin/claude-memory as a module would litter bin/
+SCRIPT = Path(__file__).resolve().parent / "claude-memory"
+
+# Stands in for kubectl: keeps the one Secret in a JSON file and records every call.
+STUB_KUBECTL = r'''#!/usr/bin/env python3
+import json, os, sys
+state, calls = os.environ["STUB_STATE"], os.environ["STUB_CALLS"]
+with open(calls, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+if os.environ.get("STUB_FAIL"):
+    sys.stderr.write("dial tcp: connection refused\n")
+    sys.exit(1)
+if "apply" in sys.argv:
+    with open(state, "w") as f:
+        f.write(sys.stdin.read())
+    print("secret/claude-memory serverside-applied")
+elif "get" in sys.argv:
+    if not os.path.exists(state):
+        sys.stderr.write('Error from server (NotFound): secrets "claude-memory" not found\n')
+        sys.exit(1)
+    print(open(state).read())
+'''
+
+
+def load_module():
+    loader = importlib.machinery.SourceFileLoader("claude_memory", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("claude_memory", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+class Sandbox:
+    def __init__(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.home = self.root / "home"
+        self.config = self.home / ".claude"
+        self.config.mkdir(parents=True)
+        self.state = self.root / "secret.json"
+        self.calls = self.root / "calls.jsonl"
+        stub = self.root / "kubectl"
+        stub.write_text(STUB_KUBECTL)
+        stub.chmod(0o755)
+        self.env = dict(
+            os.environ,
+            HOME=str(self.home),
+            CLAUDE_CONFIG_DIR=str(self.config),
+            CLAUDE_MEMORY_LOG=str(self.root / "push.log"),
+            KUBECTL=str(stub),
+            STUB_STATE=str(self.state),
+            STUB_CALLS=str(self.calls),
+        )
+        self.env.pop("CLAUDE_PROJECT_DIR", None)
+        (self.config / "memory-sync.json").write_text(json.dumps({"namespace": "memory", "context": "prod", "kubeconfig": "~/.kube/cluster"}))
+        (self.config / "memory-sync.exclude").write_text("")
+
+    def close(self):
+        self._tmp.cleanup()
+
+    def checkout(self, name, remote):
+        path = self.root / "code" / name
+        path.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        if remote:
+            subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+        return path
+
+    def project(self, key, cwd, memories):
+        project = self.config / "projects" / key
+        (project / "memory").mkdir(parents=True)
+        with open(project / "session.jsonl", "w") as f:
+            f.write(json.dumps({"type": "summary"}) + "\n")
+            f.write(json.dumps({"type": "user", "cwd": str(cwd)}) + "\n")
+        for name, text in memories.items():
+            (project / "memory" / name).write_text(text)
+        return project
+
+    def run(self, *args, extra_env=None):
+        env = dict(self.env, **(extra_env or {}))
+        return subprocess.run([str(SCRIPT), *args], env=env, capture_output=True, text=True)
+
+    def apply_calls(self):
+        if not self.calls.exists():
+            return []
+        return [c for c in map(json.loads, self.calls.read_text().splitlines()) if "apply" in c]
+
+    def secret(self):
+        return json.loads(self.state.read_text())
+
+
+class NormalizeRemote(unittest.TestCase):
+    def test_forms(self):
+        normalize = load_module().normalize_remote
+        cases = {
+            "git@github.com:acme/app.git": "github.com/acme/app",
+            "https://github.com/acme/app": "github.com/acme/app",
+            "https://github.com/acme/app.git/": "github.com/acme/app",
+            "ssh://git@gitlab.example.com:2222/group/sub/app.git": "gitlab.example.com/group/sub/app",
+            "https://user:token@gitlab.example.com/group/app.git": "gitlab.example.com/group/app",
+            "/local/path/repo": None,
+        }
+        for url, expected in cases.items():
+            self.assertEqual(normalize(url), expected, url)
+
+
+class Push(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox()
+
+    def tearDown(self):
+        self.box.close()
+
+    def pushed_tree(self):
+        mod = load_module()
+        secret = self.box.secret()
+        return mod.read_archive(base64.b64decode(secret["data"]["memory.tar.gz"]))
+
+    def test_collects_filters_and_publishes(self):
+        box = self.box
+        app = box.checkout("app", "git@github.com:acme/app.git")
+        client = box.checkout("client", "git@gitlab.example.com:client/app.git")
+        local = box.checkout("local", None)
+        box.project("-app", app, {"MEMORY.md": "app notes\n", "topic.md": "detail\n"})
+        box.project("-client", client, {"MEMORY.md": "secret client notes\n"})
+        box.project("-local", local, {"MEMORY.md": "no remote\n"})
+        box.project("-gone", box.root / "deleted", {"MEMORY.md": "cwd is gone\n"})
+        (box.config / "memory-sync.exclude").write_text("# comment\ngitlab.example.com/*\n")
+
+        result = box.run("push")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        files, manifest = self.pushed_tree()
+        self.assertEqual(sorted(files), ["github.com/acme/app/MEMORY.md", "github.com/acme/app/topic.md"])
+        self.assertEqual(manifest["repos"], ["github.com/acme/app"])
+        apply = box.apply_calls()[0]
+        for arg in ["--server-side", "--context", "prod", "-n", "memory"]:
+            self.assertIn(arg, apply)
+        self.assertIn(str(box.home / ".kube" / "cluster"), apply)
+        self.assertEqual(box.secret()["metadata"]["namespace"], "memory")
+        log = (box.root / "push.log").read_text()
+        self.assertIn("pushed 1 repo", log)
+        self.assertIn("skipped", log)
+
+    def test_worktrees_merge_newest_file_wins(self):
+        box = self.box
+        main = box.checkout("app", "https://github.com/acme/app")
+        worktree = box.checkout("app-wt", "git@github.com:acme/app.git")
+        old = box.project("-main", main, {"MEMORY.md": "old\n", "only-main.md": "main\n"})
+        box.project("-wt", worktree, {"MEMORY.md": "new\n"})
+        past = time.time() - 3600
+        os.utime(old / "memory" / "MEMORY.md", (past, past))
+
+        self.assertEqual(box.run("push").returncode, 0)
+        files, _ = self.pushed_tree()
+        self.assertEqual(files["github.com/acme/app/MEMORY.md"], b"new\n")
+        self.assertEqual(files["github.com/acme/app/only-main.md"], b"main\n")
+
+    def test_unchanged_content_skips_apply(self):
+        box = self.box
+        repo = box.checkout("app", "git@github.com:acme/app.git")
+        project = box.project("-app", repo, {"MEMORY.md": "notes\n"})
+        self.assertEqual(box.run("push").returncode, 0)
+        first = box.secret()["metadata"]["annotations"]["memory-sync/sha256"]
+        os.utime(project / "memory" / "MEMORY.md", None)
+
+        self.assertEqual(box.run("push").returncode, 0)
+        self.assertEqual(len(box.apply_calls()), 1)
+        self.assertEqual(box.secret()["metadata"]["annotations"]["memory-sync/sha256"], first)
+        self.assertIn("unchanged", (box.root / "push.log").read_text())
+
+    def test_oversized_archive_is_refused(self):
+        box = self.box
+        repo = box.checkout("big", "git@github.com:o/big.git")
+        noise = base64.b64encode(os.urandom(1_500_000)).decode()
+        box.project("-big", repo, {"MEMORY.md": noise})
+
+        result = box.run("push")
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(box.apply_calls(), [])
+        self.assertIn("github.com/o/big", (box.root / "push.log").read_text())
+
+    def test_refuses_without_an_exclude_file(self):
+        box = self.box
+        repo = box.checkout("app", "git@github.com:acme/app.git")
+        box.project("-app", repo, {"MEMORY.md": "notes\n"})
+        (box.config / "memory-sync.exclude").unlink()
+        self.assertEqual(box.run("push").returncode, 1)
+        self.assertEqual(box.apply_calls(), [])
+        self.assertIn("memory-sync.exclude", (box.root / "push.log").read_text())
+
+    def test_cluster_failure_is_logged(self):
+        box = self.box
+        repo = box.checkout("app", "git@github.com:acme/app.git")
+        box.project("-app", repo, {"MEMORY.md": "notes\n"})
+        result = box.run("push", extra_env={"STUB_FAIL": "1"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("connection refused", (box.root / "push.log").read_text())
+
+
+class Pull(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox()
+        box = self.box
+        app = box.checkout("app", "git@github.com:acme/app.git")
+        other = box.checkout("other", "git@github.com:acme/other.git")
+        box.project("-app", app, {"MEMORY.md": "".join(f"line {i}\n" for i in range(300))})
+        box.project("-other", other, {"MEMORY.md": "other notes\n"})
+        self.assertEqual(box.run("push").returncode, 0)
+        self.cloud = box.checkout("cloud-app", "https://github.com/acme/app")
+        self.snapshot = box.config / "memory-sync"
+
+    def tearDown(self):
+        self.box.close()
+
+    def pull(self, *args, project=None, extra_env=None):
+        env = {"CLAUDE_PROJECT_DIR": str(project or self.cloud), **(extra_env or {})}
+        return self.box.run("pull", *args, extra_env=env)
+
+    def test_prints_current_repo_memory_and_unpacks_the_rest(self):
+        result = self.pull()
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("## Mac memory snapshot (read-only, pushed ", result.stdout)
+        self.assertIn("line 199\n", result.stdout)
+        self.assertNotIn("line 200\n", result.stdout)
+        self.assertEqual((self.snapshot / "github.com/acme/other/MEMORY.md").read_text(), "other notes\n")
+        get = [c for c in map(json.loads, self.box.calls.read_text().splitlines()) if "get" in c][-1]
+        self.assertIn("--request-timeout=5s", get)
+        self.assertEqual(get[get.index("-n") + 1], "memory")
+
+    def test_repo_without_memory_prints_header_only(self):
+        stranger = self.box.checkout("stranger", "git@github.com:o/stranger.git")
+        result = self.pull(project=stranger)
+        self.assertIn("## Mac memory snapshot", result.stdout)
+        self.assertNotIn("line 0", result.stdout)
+
+    def assert_unavailable(self, result, reason):
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Mac memory snapshot unavailable: ", result.stdout)
+        self.assertIn(reason, result.stdout)
+        self.assertIn("mention this to the user", result.stdout)
+
+    def test_missing_secret(self):
+        self.box.state.unlink()
+        self.assert_unavailable(self.pull(), "not found")
+        self.assertFalse(self.snapshot.exists())
+
+    def test_hash_mismatch_keeps_earlier_snapshot(self):
+        self.pull()
+        secret = self.box.secret()
+        secret["metadata"]["annotations"]["memory-sync/sha256"] = "0" * 64
+        self.box.state.write_text(json.dumps(secret))
+        result = self.pull()
+        self.assert_unavailable(result, "hash")
+        self.assertIn("line 0\n", result.stdout)
+        self.assertTrue((self.snapshot / "github.com/acme/other/MEMORY.md").exists())
+
+    def test_corrupt_archive(self):
+        secret = self.box.secret()
+        payload = base64.b64encode(b"not a tarball").decode()
+        secret["data"]["memory.tar.gz"] = payload
+        secret["metadata"]["annotations"]["memory-sync/sha256"] = load_module().sha256(b"not a tarball")
+        self.box.state.write_text(json.dumps(secret))
+        self.assert_unavailable(self.pull(), "archive")
+
+    def test_missing_cluster_config(self):
+        (self.box.config / "memory-sync.json").unlink()
+        self.assert_unavailable(self.pull(), "memory-sync.json is missing")
+
+    def test_unreachable_cluster(self):
+        self.assert_unavailable(self.pull(extra_env={"STUB_FAIL": "1"}), "connection refused")
+
+
+class Hooks(unittest.TestCase):
+    def setUp(self):
+        self.box = Sandbox()
+        self.settings = self.box.config / "settings.json"
+
+    def tearDown(self):
+        self.box.close()
+
+    def commands(self, event):
+        hooks = json.loads(self.settings.read_text())["hooks"].get(event, [])
+        return [h["command"] for group in hooks for h in group["hooks"]]
+
+    def test_cloud_registers_pull_once_and_keeps_other_settings(self):
+        self.settings.write_text(json.dumps({"model": "x", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo other"}]}]}}))
+        for _ in range(2):
+            self.assertEqual(self.box.run("hooks", "--cloud").returncode, 0)
+        settings = json.loads(self.settings.read_text())
+        self.assertEqual(settings["model"], "x")
+        self.assertEqual(self.commands("SessionStart"), ["echo other", "~/.claude/bin/claude-memory pull"])
+        self.assertNotIn("SessionEnd", settings["hooks"])
+
+    def test_mac_registers_push_once(self):
+        for _ in range(2):
+            self.assertEqual(self.box.run("hooks", "--mac").returncode, 0)
+        self.assertEqual(self.commands("SessionEnd"), ["~/.claude/bin/claude-memory push --background"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

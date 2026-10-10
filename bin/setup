@@ -9,9 +9,20 @@
 # pre-existing symlink (e.g. from an earlier version of this script) is replaced
 # with a real copy, and unrelated skills already in the target dirs are left
 # untouched. Re-run after editing a skill to propagate the changes.
+#
+# It also installs bin/claude-memory into ~/.claude/bin and registers its hook:
+# on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
+# setup script) the SessionStart pull.
 
 set -euo pipefail
 shopt -s nullglob
+
+cloud=false
+case "${1:-}" in
+  "") ;;
+  --cloud) cloud=true ;;
+  *) echo "usage: bin/setup [--cloud]" >&2; exit 2 ;;
+esac
 
 command -v rsync >/dev/null 2>&1 || {
   echo "rsync is required but was not found in PATH." >&2
@@ -66,3 +77,15 @@ done
 
 echo
 echo "Synced ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
+
+# A copy rather than a link: the cloud's setup script deletes this checkout.
+memory="$HOME/.claude/bin/claude-memory"
+mkdir -p "$(dirname "$memory")"
+install -m 0755 "$repo_root/bin/claude-memory" "$memory"
+if $cloud; then
+  "$memory" hooks --cloud
+  echo "Registered the memory pull hook."
+elif [ "$(uname -s)" = Darwin ]; then
+  "$memory" hooks --mac
+  echo "Registered the memory push hook."
+fi
