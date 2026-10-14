@@ -66,7 +66,7 @@ The log opens with `stale rollout path` errors, which are noise, and within seco
 You are re-invoked when the run exits.
 
 1. Read the `-o` file. A run that was cut off leaves none, so read the log's tail instead.
-2. Attach the PR it opened to your session, once, when your runtime can show a PR beside the conversation, as the Claude desktop app does: the user follows its checks and review state there. Attach it and nothing more: no watch goes on with it, as the next step says.
+2. Bind the PR it opened to your session, as the global rules require: the user follows its checks and review state there. Bind it and nothing more: no watch goes on with it, as the next step says.
 3. Review the PR with [review-pr](../review-pr/SKILL.md), against the brief as well as the diff. You are this PR's external AI reviewer, so keep [babysit-pr](../babysit-pr/SKILL.md) and any Auto-fix watch off for it: both would have you fix what you review.
 4. Read the PR's checks and mergeability yourself afterwards: review-pr leaves CI out.
 5. Read every unresolved thread on the PR, whoever opened it. The repo may have an AI reviewer of its own (a review bot that covers every PR), and it reviews on its own schedule, often after you: its threads are Codex's to address exactly as yours are, and the PR can't merge while they are open.
