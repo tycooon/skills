@@ -69,11 +69,12 @@ You are re-invoked when the run exits.
 2. Attach the PR it opened to your session, once, when your runtime can show a PR beside the conversation, as the Claude desktop app does: the user follows its checks and review state there. Attach it and nothing more: no watch goes on with it, as the next step says.
 3. Review the PR with [review-pr](../review-pr/SKILL.md), against the brief as well as the diff. You are this PR's external AI reviewer, so keep [babysit-pr](../babysit-pr/SKILL.md) and any Auto-fix watch off for it: both would have you fix what you review.
 4. Read the PR's checks and mergeability yourself afterwards: review-pr leaves CI out.
-5. Pass the user any question Codex left that the brief doesn't answer.
+5. Read every unresolved thread on the PR, whoever opened it. The repo may have an AI reviewer of its own (a review bot that covers every PR), and it reviews on its own schedule, often after you: its threads are Codex's to address exactly as yours are, and the PR can't merge while they are open.
+6. Pass the user any question Codex left that the brief doesn't answer.
 
 ## 4. Resume
 
-Resume the session when anything is left for it to do: an open review thread, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
+Resume the session when anything is left for it to do: an open review thread, yours or another reviewer's, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
 
 ```bash
 codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
@@ -87,4 +88,6 @@ The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pa
 
 ## 5. Finish
 
-Done is the four conditions from babysit-pr's *When to stop*, with your review as the approval. Tell the user then; merging and deploying stay their call. When a resume leaves an item as it was (a thread you still hold open, a check still red, a run cut off or blocked again), bring that item to the user rather than resuming for it again.
+Done is the four conditions from babysit-pr's *When to stop*, with your review as the approval. Where the repo has an AI reviewer of its own, its approval of the current head counts too (or of an earlier head the current one differs from only by a base-sync, per babysit-pr), since its threads and its verdict gate the merge as much as yours. Tell the user then; merging and deploying stay their call.
+
+Nothing re-invokes you when that reviewer posts: Codex's run has exited, and no babysit or Auto-fix watch is on. So once you have approved, and while its verdict on the current head is missing, watch the PR yourself with a background poll every few minutes. It exits when the head moves, when a new review or thread lands, or when that reviewer approves the current head. On threads, take them to Codex through step 4; on a new head, re-review it; on its approval, check the four conditions again. A poll that can't read the PR (a timeout, an empty answer) waits and reads again: it never takes a failed read for a state. Give it the same quiet limit as babysit-pr's polling fallback, and tell the user when it runs out with the reviewer still silent. When a resume leaves an item as it was (a thread you still hold open, a check still red, a run cut off or blocked again), bring that item to the user rather than resuming for it again.
