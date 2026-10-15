@@ -5,19 +5,19 @@ description: "Watch a GitHub PR or GitLab MR, address new feedback and CI failur
 
 # Babysit a Pull Request
 
-Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — an external AI reviewer's approval covering the current head, every discussion resolved, pipeline green, mergeable with the base — or it's merged/closed. Prefer native PR events when `WatchPullRequest` is available; otherwise poll every few minutes at first and back off as it stays quiet.
+Watch one pull request (GitHub) or merge request (GitLab) — the one for the current branch, or the one given by number/URL — and keep it moving by running the address-pr flow round after round, until it is done — an external AI reviewer's approval covering the current head, every discussion resolved, pipeline green, mergeable with the base — or it's merged/closed. Prefer native PR events when `WatchPullRequest` is available; in a desktop-app session where Auto-fix already fixes the PR, wait on the background waiter; otherwise poll every few minutes at first and back off as it stays quiet.
 
 ## The loop
 
 **Delivery mode.** If the user invokes [release](../release/SKILL.md), reuse this watch and its waiting transport. Store `deliveryMode: merge-and-deploy` and the scoped authorization in the existing state file; read the mode at the start of every round and again before stopping on readiness. When enabled, the four ready conditions hand off to release's merge/deploy phases instead of ending the watch. Resume an in-progress delivery phase through release without running another address-pr pass. An ordinary babysit invocation remains a readiness-only watch; it does not authorize merge or deploy. A merged target in delivery mode also resumes through release so a restart or an external merge does not discard the pending deployment; a closed, unmerged target still stops.
 
-Resolve the target PR and its canonical URL once, then keep watching that same one. Discover `WatchPullRequest` by name and description, including namespaced variants exposed in restored chats, before selecting the waiting transport below. Keep the target, transport and delivery mode in the watch's state file so later events and restored chats reuse them. Each round:
+Resolve the target PR and its canonical URL once, then keep watching that same one. Discover `WatchPullRequest` by name and description, including namespaced variants exposed in restored chats, before selecting the waiting transport below, and check whether Auto-fix is on for this PR (the desktop app's PR status reports it). Keep the target, transport and delivery mode in the watch's state file so later events and restored chats reuse them. Each round:
 
 1. **Check the stop conditions first** (see below). For a readiness-only watch, if the PR is done, or merged/closed, stop and give the final report — don't keep working a finished PR. In delivery mode, hand a ready or merged target to release instead; a closed, unmerged target still stops. An approval alone does not finish it: if a condition is still unmet, this round works that condition.
 2. **Otherwise run one address-pr pass** by invoking the address-pr skill: it resolves conflicts with the base, addresses the open/unresolved review comments, handles failing CI, and pushes once — but only if something actually changed. Just invoke it every round and let it no-op when nothing has changed; don't try to pre-detect new activity yourself. A round with nothing new is a no-op, and that's expected; most rounds while you wait on a reviewer will be quiet.
 
    **Merge the base only when you have to.** In a babysit round the pass merges `origin/<base>` only in three cases: the PR conflicts with the base, the host refuses to merge a branch that is behind (see *Detecting the stop signal*), or the round pushes other changes anyway. A base that merely moved ahead is not a reason to merge or push. A sync-only push reruns the whole pipeline on an unchanged branch and cancels the run in progress, and the base branch's own pipeline tests the merged result after the merge anyway. Unstacking a PR whose PR underneath has merged is not a sync; it still happens as address-pr describes.
-3. **Wait** — with the native watch, yield until a PR event; with the polling fallback, schedule the next round using *Waiting between rounds* below. Each native PR event re-enters this skill at step 1: fetch current host state, check the stop conditions, otherwise run one address-pr pass. The event's “ready” label does not replace the four conditions or authorize merging. Run the first round immediately after arming the watch, without waiting for an event or timer.
+3. **Wait** — with the native watch, yield until a PR event; with the background waiter, arm it and yield; with the polling fallback, schedule the next round using *Waiting between rounds* below. Each native PR event re-enters this skill at step 1: fetch current host state, check the stop conditions, otherwise run one address-pr pass. The event's “ready” label does not replace the four conditions or authorize merging. Run the first round immediately after arming the watch, without waiting for an event or timer.
 
 ## When to stop
 
@@ -58,9 +58,33 @@ Before the final report, or before handing a ready/merged target to release's de
 
 The host app must be running and the machine awake. Native watches persist through restart and pause after 20 event deliveries; do not automatically re-arm a paused watch to reset that limit. Its pause and refresh-failure notices ask the user to resume or repair access. Do not add a timer to enforce the polling fallback's quiet cap.
 
+### Background waiter (Auto-fix sessions)
+
+Use this transport when `WatchPullRequest` is unavailable and Auto-fix is on for the PR in the Claude desktop app. Auto-fix wakes the session with a `<ci-monitor-event>` for a CI failure, a merge conflict or review comments, and each such event runs one address-pr pass as a round. Green CI and an approval produce no event, so nothing would resume the session once the last fix lands. The waiter covers that gap. Keep `transport: waiter` in the state file.
+
+The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed by this repo's `bin/setup`. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff, from 3 minutes up to a 30-minute cap, and exits with a one-line reason:
+
+| Exit | Reason | Next |
+|---|---|---|
+| 0 | the four conditions of *When to stop* hold on the head, the approval matched as *What counts as an approval* describes, base-sync included | run a round: it rechecks fresh host state and stops, or hands to release |
+| 10 / 11 | merged / closed | the merged-or-closed stop |
+| 12 | the head moved | arm a waiter for the new head unless one already watches it |
+| 13 | about 4 hours with no activity on the PR | the quiet stop |
+| 2 | bad usage, or the PR could not be read six times in a row | the hard-error stop |
+
+Pass `--no-ci` only for a project with no CI at all, as release's step 1 defines it; pass `--reviewer <login>` when the AI reviewer's verdicts carry no identity line.
+
+It doesn't compete with Auto-fix: it never changes the PR, never fixes CI and never answers a comment. It only detects readiness, the one transition Auto-fix doesn't report. The two never act on the same thing, so its read-only polling is not the CI polling the app advises against.
+
+Arm it after the first round, and again after every round that pushes, with `--head` set to the commit just pushed. Stop the previous waiter first (`TaskStop` on its task id, kept in the state file); an old one left running only exits 12 on the new head. Schedule no `ScheduleWakeup`, `CronCreate` or backup heartbeat for this transport. The waiter is GitHub-only: it exits 2 on a GitLab MR, and since the desktop app's Auto-fix never monitors a GitLab MR, a GitLab watch uses the polling fallback.
+
+### Never claim a wait you haven't armed
+
+Tell the user you are waiting for CI, a review or an approval only while a native watch, a background waiter or a polling wake-up is armed for this PR. If none is, say the watch has ended and what is still unmet, so they know to re-run it.
+
 ### Polling fallback
 
-Use the following loop only when the native PR-watch tool is unavailable. Keep `transport: polling` in the state file. Existing polling cadence, quiet cap and backup recovery remain unchanged.
+Use the following loop only when the native PR-watch tool is unavailable and no Auto-fix watch covers the PR. Keep `transport: polling` in the state file. Existing polling cadence, quiet cap and backup recovery remain unchanged.
 
 You run as one continuous, self-paced task — not a fresh invocation per round — so between rounds wait *without blocking*: hand control back and schedule yourself to resume, rather than a foreground `sleep` (which is typically blocked). In Claude Code that's `ScheduleWakeup`, the mechanism `/loop`'s dynamic mode uses; end the loop with its `stop` once a stop condition is met.
 

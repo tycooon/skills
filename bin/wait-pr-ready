@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Wait until a GitHub PR is ready to merge, then exit with the reason.
+
+  wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]...
+
+Run it as one background shell command: the agent's session resumes when it
+exits. It only detects readiness and never changes the PR. Ready means all four
+of babysit-pr's conditions hold on the same head: the external AI reviewer's
+newest verdict approves the head (or a head it differs from only by a
+base-sync), every check on the head is green, no review thread is unresolved,
+and the base allows the merge.
+
+Exit codes:
+  0  ready
+  10 merged
+  11 closed without merging
+  12 the head moved away from the one being watched
+  13 about 4 hours passed with no activity on the PR
+  2  usage error, an unsupported host, or the PR could not be read for too long
+
+Options:
+  --head SHA        the head to watch, e.g. the commit just pushed. Without it,
+                    the head the first read sees.
+  --no-ci           the repository has no CI at all, so skip the checks gate.
+  --reviewer LOGIN  an account whose reviews count as the AI reviewer's even
+                    without an identity line. Repeatable.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+# Waits after a read that saw no new activity: 3, 5, 10, 20, then 30 minutes.
+BACKOFF = [180, 300, 600, 1200, 1800]
+QUIET_LIMIT = 4 * 3600
+# A pushed head can take a moment to show up on the PR.
+HEAD_SETTLE = 600
+MAX_FAILED_READS = 6
+
+QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state
+      headRefOid
+      baseRefName
+      updatedAt
+      mergeable
+      mergeStateStatus
+      reviewThreads(first: 100) { nodes { isResolved } }
+      reviews(last: 50) {
+        nodes { author { login } state body submittedAt commit { oid } }
+      }
+      comments(last: 50) {
+        nodes { author { login } body createdAt }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            committedDate
+            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun { name status conclusion completedAt }
+                  ... on StatusContext { context state createdAt }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+# review-pr's verdicts carry the reviewer's identity; a teammate's Approve does not.
+IDENTITY = re.compile(r"\bAI reviewer\b|\b(claude|codex|gpt|gemini|copilot)\b", re.I)
+GO_SIGNAL = re.compile(r"^\W*(approved|lgtm|ship it)\b|\bAPPROVED\b|\bLGTM\b", re.I)
+NO_GO = re.compile(r"\bnot (yet )?(approv|lgtm)|\bunapprov|\bwithout approv", re.I)
+SHA = re.compile(r"\b[0-9a-f]{40}\b")
+GREEN_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def parse_url(url):
+    m = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?", url.strip())
+    if not m:
+        return None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def ts(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() if value else 0.0
+
+
+def gh(args, stdin=None):
+    return subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, timeout=120)
+
+
+def read_pr(owner, name, number):
+    r = gh(["api", "graphql", "-f", f"query={QUERY}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={number}"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api graphql failed")
+    pr = json.loads(r.stdout)["data"]["repository"]["pullRequest"]
+    if pr is None:
+        raise RuntimeError("no such pull request")
+    return pr
+
+
+def authored_lines(owner, name, base, sha):
+    """The PR's own added and removed lines at sha, as review-pr's base-sync test reads them."""
+    r = gh(["api", "-H", "Accept: application/vnd.github.diff", f"repos/{owner}/{name}/compare/{base}...{sha}"])
+    if r.returncode != 0:
+        return None
+    lines, path, header = [], None, False
+    for line in r.stdout.splitlines():
+        if line.startswith("diff --git "):
+            path, header = line.split(" ")[2], True
+        elif line.startswith("@@"):
+            header = False
+        elif not header and line[:1] in "+-":
+            lines.append(f"{path} {line}")
+    return lines
+
+
+def checks_state(pr, no_ci):
+    if no_ci:
+        return True, "no CI"
+    rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
+    contexts = rollup["contexts"]["nodes"] if rollup else []
+    if not contexts:
+        return False, "no checks reported yet"
+    waiting = []
+    for c in contexts:
+        if c["__typename"] == "CheckRun":
+            if c["status"] != "COMPLETED" or c["conclusion"] not in GREEN_CONCLUSIONS:
+                waiting.append(f"{c['name']}={c['conclusion'] or c['status']}")
+        elif c["state"] != "SUCCESS":
+            waiting.append(f"{c['context']}={c['state']}")
+    if waiting:
+        return False, "checks not green: " + ", ".join(waiting[:5])
+    return True, f"{len(contexts)} checks green"
+
+
+def verdicts(pr, reviewers):
+    """Each AI reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
+    posts = []
+    for r in pr["reviews"]["nodes"]:
+        posts.append((r["author"], r["body"] or "", r["submittedAt"], r["state"], (r["commit"] or {}).get("oid")))
+    for c in pr["comments"]["nodes"]:
+        posts.append((c["author"], c["body"] or "", c["createdAt"], None, None))
+    newest = {}
+    for author, body, at, state, commit in posts:
+        if not author:
+            continue
+        login = author["login"]
+        is_reviewer = login in reviewers or bool(IDENTITY.search(body))
+        # A thread reply shows up as a bodiless COMMENTED review; it is no verdict.
+        if not is_reviewer or (not body.strip() and state != "APPROVED"):
+            continue
+        go = state == "APPROVED" or (state != "CHANGES_REQUESTED" and bool(GO_SIGNAL.search(body)) and not NO_GO.search(body))
+        named = SHA.findall(body)
+        sha = named[-1] if named else commit
+        if login not in newest or ts(at) >= ts(newest[login][3]):
+            newest[login] = (login, go, sha, at)
+    return list(newest.values())
+
+
+def approval_state(pr, reviewers, same_authored_lines):
+    head = pr["headRefOid"]
+    head_date = ts(pr["commits"]["nodes"][0]["commit"]["committedDate"]) if pr["commits"]["nodes"] else 0
+    found = verdicts(pr, reviewers)
+    for login, go, sha, at in found:
+        if not go:
+            continue
+        if sha == head or (sha is None and ts(at) >= head_date):
+            return True, f"approved by {login} on {head[:12]}"
+        if sha and same_authored_lines(sha, head):
+            return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
+    if not found:
+        return False, "no AI reviewer verdict yet"
+    return False, "no AI reviewer approval covering " + head[:12]
+
+
+def evaluate(pr, *, no_ci, reviewers, same_authored_lines):
+    """Returns (ready, reasons) for one read of the PR."""
+    gates = [
+        approval_state(pr, reviewers, same_authored_lines),
+        checks_state(pr, no_ci),
+    ]
+    unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
+    gates.append((unresolved == 0, f"{unresolved} unresolved threads"))
+    mergeable, status = pr["mergeable"], pr["mergeStateStatus"]
+    gates.append((mergeable == "MERGEABLE" and status not in ("BEHIND", "DIRTY"), f"mergeable={mergeable}/{status}"))
+    return all(ok for ok, _ in gates), [why for _, why in gates]
+
+
+def activity_mark(pr):
+    marks = [ts(pr["updatedAt"])]
+    for node in pr["commits"]["nodes"]:
+        rollup = node["commit"]["statusCheckRollup"]
+        for c in (rollup["contexts"]["nodes"] if rollup else []):
+            marks.append(ts(c.get("completedAt") or c.get("createdAt")))
+    return max(marks)
+
+
+def main(argv=None, now=time.time, sleep=time.sleep):
+    parser = argparse.ArgumentParser(add_help=True, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("url")
+    parser.add_argument("--head")
+    parser.add_argument("--no-ci", action="store_true")
+    parser.add_argument("--reviewer", action="append", default=[])
+    args = parser.parse_args(argv)
+
+    target = parse_url(args.url)
+    if not target:
+        print(f"unsupported: {args.url} is not a GitHub PR URL; GitLab MRs are watched by babysit-pr's polling", file=sys.stderr)
+        return 2
+    owner, name, number = target
+    started = now()
+    expected, head_seen = args.head, args.head is None
+    mark, step, failures, lines_cache = 0.0, 0, 0, {}
+
+    while True:
+        try:
+            pr = read_pr(owner, name, number)
+            failures = 0
+        except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as e:
+            failures += 1
+            if failures >= MAX_FAILED_READS:
+                print(f"error: could not read {args.url} {failures} times in a row: {e}")
+                return 2
+            print(f"read failed ({e}); retrying", file=sys.stderr)
+            sleep(BACKOFF[0])
+            continue
+
+        head = pr["headRefOid"]
+        if pr["state"] == "MERGED":
+            print(f"merged: {args.url}")
+            return 10
+        if pr["state"] == "CLOSED":
+            print(f"closed without merging: {args.url}")
+            return 11
+        if expected is None:
+            expected = head
+        if head == expected:
+            head_seen = True
+        elif head_seen:
+            print(f"head changed: {args.url} moved from {expected} to {head}")
+            return 12
+        elif now() - started > HEAD_SETTLE:
+            print(f"head changed: {args.url} is at {head}, not the expected {expected}")
+            return 12
+
+        def same_authored_lines(old, new):
+            for sha in (old, new):
+                if sha not in lines_cache:
+                    lines_cache[sha] = authored_lines(owner, name, pr["baseRefName"], sha)
+            return lines_cache[old] is not None and lines_cache[old] == lines_cache[new]
+
+        if head_seen:
+            ready, reasons = evaluate(pr, no_ci=args.no_ci, reviewers=set(args.reviewer), same_authored_lines=same_authored_lines)
+            if ready:
+                print(f"ready: {args.url} at {head}: " + "; ".join(reasons))
+                return 0
+            print(f"{datetime.now(timezone.utc):%H:%M:%SZ} waiting: " + "; ".join(reasons), file=sys.stderr)
+
+        latest = max(activity_mark(pr), started)
+        if latest > mark:
+            mark, step = latest, 0
+        if now() - mark > QUIET_LIMIT:
+            print(f"quiet: no activity on {args.url} for {int((now() - mark) / 3600)}h; not ready: " + "; ".join(reasons if head_seen else ["head not seen yet"]))
+            return 13
+        sleep(BACKOFF[min(step, len(BACKOFF) - 1)])
+        step += 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
