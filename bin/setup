@@ -12,8 +12,8 @@
 #
 # It also installs bin/claude-memory into ~/.claude/bin and registers its hook:
 # on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
-# setup script) the SessionStart pull. bin/wait-pr-ready, which babysit-pr and
-# release run as a background waiter, goes into ~/.claude/bin as well.
+# setup script) the SessionStart pull. bin/wait-pr-ready, which babysit-pr,
+# release and codex run as a background waiter, goes into ~/.claude/bin as well.
 
 set -euo pipefail
 shopt -s nullglob

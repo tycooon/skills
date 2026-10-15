@@ -66,17 +66,17 @@ The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`
 
 | Exit | Reason | Next |
 |---|---|---|
-| 0 | the four conditions of *When to stop* hold on the head, the approval matched as *What counts as an approval* describes, base-sync included | run a round: it rechecks fresh host state and stops, or hands to release |
+| 0 | the four conditions of *When to stop* hold on the head, the approval matched as *What counts as an approval* describes, base-sync included; the line ends with the PR's activity mark | run a round: it rechecks fresh host state and stops, or hands to release. If the recheck disagrees (a keyword the waiter read as a go-signal, a host merge block), re-arm with `--after <that mark>`, so the waiter reports ready again only after something on the PR moves |
 | 10 / 11 | merged / closed | the merged-or-closed stop |
 | 12 | the head moved | arm a waiter for the new head unless one already watches it |
 | 13 | about 4 hours with no activity on the PR | the quiet stop |
-| 2 | bad usage, or the PR could not be read six times in a row | the hard-error stop |
+| 2, or any other | bad usage, the PR could not be read six times in a row, or the script failed | the hard-error stop |
 
 Pass `--no-ci` only for a project with no CI at all, as release's step 1 defines it; pass `--reviewer <login>` when the AI reviewer's verdicts carry no identity line.
 
 It doesn't compete with Auto-fix: it never changes the PR, never fixes CI and never answers a comment. It only detects readiness, the one transition Auto-fix doesn't report. The two never act on the same thing, so its read-only polling is not the CI polling the app advises against.
 
-Arm it after the first round, and again after every round that pushes, with `--head` set to the commit just pushed. Stop the previous waiter first (`TaskStop` on its task id, kept in the state file); an old one left running only exits 12 on the new head. Schedule no `ScheduleWakeup`, `CronCreate` or backup heartbeat for this transport. The waiter is GitHub-only: it exits 2 on a GitLab MR, and since the desktop app's Auto-fix never monitors a GitLab MR, a GitLab watch uses the polling fallback.
+End every round by making sure a waiter is armed for the current head: arm one, with `--head` set to that head, unless the waiter task recorded in the state file is still running for it. Checking the task, not the state file's word, matters because the waiter is a child of the session: an app quit, a restart or a sleep kills it without an exit, unlike the native watch, and a round that only replies pushes nothing to prompt a re-arm. Before arming a new one, stop the previous waiter (`TaskStop` on its task id); an old one left running only exits 12 on the new head. Schedule no `ScheduleWakeup`, `CronCreate` or backup heartbeat for this transport. The waiter is GitHub-only: it exits 2 on a GitLab MR, and since the desktop app's Auto-fix never monitors a GitLab MR, a GitLab watch uses the polling fallback.
 
 ### Never claim a wait you haven't armed
 

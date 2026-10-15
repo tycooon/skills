@@ -48,9 +48,9 @@ def ready_pr(**overrides):
         "updatedAt": "2026-10-15T10:00:00Z",
         "mergeable": "MERGEABLE",
         "mergeStateStatus": "CLEAN",
-        "reviewThreads": {"nodes": [{"isResolved": True}]},
-        "reviews": {"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]},
-        "comments": {"nodes": []},
+        "reviewThreads": {"totalCount": 1, "nodes": [{"isResolved": True}]},
+        "reviews": {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]},
+        "comments": {"totalCount": 0, "nodes": []},
         "commits": {"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-15T09:00:00Z", "statusCheckRollup": {"contexts": {"nodes": [check("test")]}}}}]},
     }
     pr.update(overrides)
@@ -101,6 +101,10 @@ class Approval(unittest.TestCase):
         pr = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "AI reviewer: Codex. Not approving until the test is fixed.")]})
         self.assertFalse(evaluate(pr)[0])
 
+    def test_person_naming_an_agent_is_not_a_verdict(self):
+        pr = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "Claude's findings are addressed, Codex approved the earlier design", at="2026-10-15T09:10:00Z")]})
+        self.assertFalse(evaluate(pr)[0])
+
     def test_shaless_comment_must_follow_the_head_commit(self):
         late = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "LGTM — AI reviewer: Codex", at="2026-10-15T09:10:00Z")]})
         early = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "LGTM — AI reviewer: Codex", at="2026-10-15T08:50:00Z")]})
@@ -130,7 +134,7 @@ class OtherGates(unittest.TestCase):
         self.assertFalse(evaluate(ready_pr(reviewThreads={"nodes": [{"isResolved": False}]}))[0])
 
     def test_merge_blocks(self):
-        for mergeable, status in (("CONFLICTING", "DIRTY"), ("MERGEABLE", "BEHIND"), ("UNKNOWN", "UNKNOWN")):
+        for mergeable, status in (("CONFLICTING", "DIRTY"), ("MERGEABLE", "BEHIND"), ("MERGEABLE", "BLOCKED"), ("MERGEABLE", "DRAFT"), ("UNKNOWN", "UNKNOWN")):
             self.assertFalse(evaluate(ready_pr(mergeable=mergeable, mergeStateStatus=status))[0], status)
 
 
@@ -208,6 +212,45 @@ class Loop(unittest.TestCase):
         code, out, _ = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
         self.assertEqual(code, 2)
         self.assertTrue(out.startswith("error:"))
+
+    def test_failure_while_evaluating_is_retried(self):
+        original = w.authored_lines
+        calls = []
+
+        def slow(*_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise w.subprocess.TimeoutExpired("gh", 120)
+            return ["x +line"]
+
+        w.authored_lines = slow
+        try:
+            pr = ready_pr(reviews={"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]})
+            code, out, waits = self.run_main([pr, pr])
+        finally:
+            w.authored_lines = original
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [180])
+
+    def test_after_needs_newer_activity(self):
+        code, out, _ = self.run_main([ready_pr()])
+        mark = out.rsplit("activity ", 1)[1].strip()
+        self.assertEqual(mark, "2026-10-15T10:00:00Z")
+        newer = ready_pr(updatedAt="2026-10-15T10:30:00Z")
+        code, _, waits = self.run_main([ready_pr(), ready_pr(), newer], args=["--after", mark])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_exits_on_new_review_activity(self):
+        pr = ready_pr()
+        more = ready_pr(reviewThreads={"totalCount": 2, "nodes": [{"isResolved": True}, {"isResolved": False}]})
+        code, out, waits = self.run_main([pr, pr, more], args=["--until-review"])
+        self.assertEqual(code, 14, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_still_exits_on_head_change(self):
+        moved = ready_pr(headRefOid="c" * 40)
+        self.assertEqual(self.run_main([ready_pr(), moved], args=["--until-review"])[0], 12)
 
     def test_gitlab_url_is_unsupported(self):
         with contextlib.redirect_stderr(io.StringIO()):
