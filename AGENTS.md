@@ -11,6 +11,7 @@ Repository instructions override these rules where they conflict; mention a mate
 - Bind every PR/MR to the session as soon as it is opened, by you or by an agent you dispatched (a Codex session, a subagent), or as soon as you are asked to fix or address an existing one, wherever the runtime supports it (for example `bind_pr` in the Claude desktop app). A PR/MR you only review stays unbound. Don't ask first. If the runtime already bound it, leave it as is.
 - Merge/deploy only after the human authorizes the specific action. Do not infer runtime production configuration from migration defaults.
 - Preserve DRY; an exception needs justification and user approval. Use English for repository content unless its rules require another language; no attribution footers.
+- Never name a private project in a public repository: no private repository, organization, product or host names, and no links or references to their PRs, issues or data, in code, docs, commits, PR and issue text, comments or reviews. Check the target's visibility before you write there (`gh repo view --json visibility`), and describe the case generically instead ("a private Rust service", "a PR in another repo").
 - Load only the task's applicable instructions. Do not repeat injected instructions or read whole histories, manuals and transcripts; search first and extract relevant sections with bounded output.
 
 ## Required references
