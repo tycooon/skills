@@ -84,7 +84,7 @@ codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WO
 - Keep the flags before the word `resume`, which takes neither `-C` nor `--approve-for-me` after it.
 - Pass the session's MODEL, EFFORT and SPEED again, so a resume never falls back to the user's config.
 
-The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed. Re-review that head when the run exits.
+The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed, and, while it waits, to check the PR for review threads opened since its pass and give each the same address-pr treatment before it reports. A run spends most of its time waiting on CI, and Codex can't be messaged mid-run, so a finding the repo's reviewer posts then is handled in that run rather than after it exits and you resume it. Re-review that head when the run exits.
 
 ## 5. Finish
 
