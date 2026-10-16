@@ -175,7 +175,7 @@ class Loop(unittest.TestCase):
         waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
         code, _, waits = self.run_main([waiting, waiting, waiting, ready_pr()])
         self.assertEqual(code, 0)
-        self.assertEqual(waits, [180, 300, 600])
+        self.assertEqual(waits, [60, 60, 120])
 
     def test_merged_and_closed(self):
         self.assertEqual(self.run_main([ready_pr(state="MERGED")])[0], 10)
@@ -195,7 +195,7 @@ class Loop(unittest.TestCase):
 
     def test_quiet_limit(self):
         waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
-        code, out, waits = self.run_main([waiting] * 30)
+        code, out, waits = self.run_main([waiting] * 60)
         self.assertEqual(code, 13)
         self.assertTrue(out.startswith("quiet:"))
         self.assertGreaterEqual(sum(waits), w.QUIET_LIMIT)
@@ -204,14 +204,15 @@ class Loop(unittest.TestCase):
         waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
         later = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]}, updatedAt="2026-10-15T10:20:00Z")
         _, _, waits = self.run_main([waiting, waiting, waiting, later, ready_pr()])
-        self.assertEqual(waits, [180, 300, 600, 180])
+        self.assertEqual(waits, [60, 60, 120, 60])
 
     def test_transient_read_failures_retry_then_give_up(self):
         code, _, _ = self.run_main([RuntimeError("timeout"), ready_pr()])
         self.assertEqual(code, 0)
-        code, out, _ = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
+        code, out, waits = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
         self.assertEqual(code, 2)
         self.assertTrue(out.startswith("error:"))
+        self.assertGreaterEqual(sum(waits), 15 * 60)
 
     def test_failure_while_evaluating_is_retried(self):
         original = w.authored_lines
@@ -230,7 +231,7 @@ class Loop(unittest.TestCase):
         finally:
             w.authored_lines = original
         self.assertEqual(code, 0, out)
-        self.assertEqual(waits, [180])
+        self.assertEqual(waits, [w.RETRY_WAIT])
 
     def test_after_needs_newer_activity(self):
         code, out, _ = self.run_main([ready_pr()])

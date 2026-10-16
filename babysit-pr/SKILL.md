@@ -62,7 +62,7 @@ The host app must be running and the machine awake. Native watches persist throu
 
 Use this transport when `WatchPullRequest` is unavailable and Auto-fix is on for the PR in the Claude desktop app. Auto-fix wakes the session with a `<ci-monitor-event>` for a CI failure, a merge conflict or review comments, and each such event runs one address-pr pass as a round. Green CI and an approval produce no event, so nothing would resume the session once the last fix lands. The waiter covers that gap. Keep `transport: waiter` in the state file.
 
-The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed by this repo's `bin/setup`. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff, from 3 minutes up to a 30-minute cap, and exits with a one-line reason:
+The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed by this repo's `bin/setup`. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff, from 1 minute up to a 5-minute cap, and exits with a one-line reason:
 
 | Exit | Reason | Next |
 |---|---|---|
