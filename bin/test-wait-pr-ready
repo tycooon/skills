@@ -263,6 +263,26 @@ class Loop(unittest.TestCase):
         moved = ready_pr(headRefOid="c" * 40)
         self.assertEqual(self.run_main([ready_pr(), moved], args=["--until-review"])[0], 12)
 
+    def test_conflict_on_the_watched_head_exits(self):
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        conflict = ready_pr(mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        code, out, waits = self.run_main([waiting, conflict])
+        self.assertEqual(code, 15, out)
+        self.assertTrue(out.startswith("conflict:"))
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.run_main([conflict], args=["--until-review"])[0], 15)
+
+    def test_unknown_mergeability_keeps_waiting(self):
+        unknown = ready_pr(mergeable="UNKNOWN", mergeStateStatus="UNKNOWN")
+        code, _, waits = self.run_main([unknown, unknown, ready_pr()])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 2)
+
+    def test_conflict_on_a_stale_head_waits_for_the_expected_one(self):
+        stale = ready_pr(headRefOid=OLD, mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        code, out, _ = self.run_main([stale, ready_pr()], args=["--head", HEAD])
+        self.assertEqual(code, 0, out)
+
     def test_gitlab_url_is_unsupported(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(w.main(["https://gitlab.com/acme/app/-/merge_requests/7"]), 2)

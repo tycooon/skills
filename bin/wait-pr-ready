@@ -18,6 +18,8 @@ Exit codes:
   12 the head moved away from the one being watched
   13 about 4 hours passed with no activity on the PR
   14 with --until-review: a review, comment or review thread landed
+  15 the watched head conflicts with the base: nothing else resolves it, so the
+     session runs its fix round (address-pr, or the Codex resume that owns the PR)
   2  usage error, an unsupported host, or the PR could not be read for too long
 
 Options:
@@ -277,6 +279,11 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         elif now() - started > HEAD_SETTLE:
             return (12, f"head changed: {args.url} is at {head}, not the expected {state['expected']}"), 0
         mark = activity_mark(pr)
+        # GitHub reports UNKNOWN while it recomputes and CONFLICTING only once
+        # it has tried the merge, so one CONFLICTING read on the watched head
+        # is final for that head.
+        if state["head_seen"] and pr["mergeable"] == "CONFLICTING":
+            return (15, f"conflict: {args.url} at {head} conflicts with {pr['baseRefName']}"), mark
         if args.until_review:
             if state["reviews"] is None:
                 state["reviews"] = review_count(pr)
