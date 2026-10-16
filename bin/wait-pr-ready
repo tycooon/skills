@@ -50,8 +50,10 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Waits after a read that saw no new activity: 3, 5, 10, 20, then 30 minutes.
-BACKOFF = [180, 300, 600, 1200, 1800]
+# Waits after a read that saw no new activity: 1, 1, 2, 2, then 5 minutes. A
+# reviewer or CI run usually lands within minutes; one GraphQL read per wait
+# keeps even the 1-minute rungs far inside the API's hourly budget.
+BACKOFF = [60, 60, 120, 120, 300]
 QUIET_LIMIT = 4 * 3600
 # A pushed head can take a moment to show up on the PR.
 HEAD_SETTLE = 600
