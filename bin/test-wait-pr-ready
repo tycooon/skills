@@ -209,9 +209,10 @@ class Loop(unittest.TestCase):
     def test_transient_read_failures_retry_then_give_up(self):
         code, _, _ = self.run_main([RuntimeError("timeout"), ready_pr()])
         self.assertEqual(code, 0)
-        code, out, _ = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
+        code, out, waits = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
         self.assertEqual(code, 2)
         self.assertTrue(out.startswith("error:"))
+        self.assertGreaterEqual(sum(waits), 15 * 60)
 
     def test_failure_while_evaluating_is_retried(self):
         original = w.authored_lines
@@ -230,7 +231,7 @@ class Loop(unittest.TestCase):
         finally:
             w.authored_lines = original
         self.assertEqual(code, 0, out)
-        self.assertEqual(waits, [60])
+        self.assertEqual(waits, [w.RETRY_WAIT])
 
     def test_after_needs_newer_activity(self):
         code, out, _ = self.run_main([ready_pr()])

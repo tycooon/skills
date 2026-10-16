@@ -55,6 +55,9 @@ from datetime import datetime, timezone
 # keeps even the 1-minute rungs far inside the API's hourly budget.
 BACKOFF = [60, 60, 120, 120, 300]
 QUIET_LIMIT = 4 * 3600
+# Wait after a failed read. Kept apart from BACKOFF so MAX_FAILED_READS still
+# tolerates about 15 minutes of fast failures (a GitHub blip, a laptop waking).
+RETRY_WAIT = 180
 # A pushed head can take a moment to show up on the PR.
 HEAD_SETTLE = 600
 MAX_FAILED_READS = 6
@@ -341,7 +344,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         if now() - mark > QUIET_LIMIT:
             print(f"quiet: no activity on {args.url} for {int((now() - mark) / 3600)}h; still waiting: {waiting}")
             return 13
-        sleep(BACKOFF[0] if failures else BACKOFF[min(step, len(BACKOFF) - 1)])
+        sleep(RETRY_WAIT if failures else BACKOFF[min(step, len(BACKOFF) - 1)])
         if not failures:
             step += 1
 
