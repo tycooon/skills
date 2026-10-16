@@ -283,6 +283,12 @@ class Loop(unittest.TestCase):
         code, out, _ = self.run_main([stale, ready_pr()], args=["--head", HEAD])
         self.assertEqual(code, 0, out)
 
+    def test_abbreviated_head_matches_the_full_sha(self):
+        code, out, _ = self.run_main([ready_pr()], args=["--head", HEAD[:7]])
+        self.assertEqual(code, 0, out)
+        moved = ready_pr(headRefOid="c" * 40)
+        self.assertEqual(self.run_main([ready_pr(), moved], args=["--head", HEAD[:7]])[0], 12)
+
     def test_gitlab_url_is_unsupported(self):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(w.main(["https://gitlab.com/acme/app/-/merge_requests/7"]), 2)

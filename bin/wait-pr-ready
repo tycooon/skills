@@ -272,6 +272,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (11, f"closed without merging: {args.url}"), 0
         if state["expected"] is None:
             state["expected"] = head
+        # An abbreviated --head names the PR's head once that head starts with it.
+        if len(state["expected"]) < 40 and head.startswith(state["expected"].lower()):
+            state["expected"] = head
         if head == state["expected"]:
             state["head_seen"] = True
         elif state["head_seen"]:
