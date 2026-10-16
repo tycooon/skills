@@ -32,11 +32,13 @@ For an opinion only, with no code change and no follow-up, skip the steps and ru
 Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief carries only the task: the problem with its evidence, what done looks like, what is out of scope. It also tells Codex to:
 
 - work in the worktree it starts in and on the branch it finds there, making no other worktree: step 2 cuts both from the latest `origin/<default>` for it;
-- stop once its non-draft PR is open, with no babysit-pr and no waiting for a review, because you are the reviewer and start only when its run exits;
+- stop once its non-draft PR is open, with no babysit-pr and no waiting for a review, because you are the reviewer and review each push as it lands (step 3);
 - not merge or deploy;
 - end its final message with a report block: PR URL, one-line summary, each command it ran with its result, anything the reviewer or the user must know or answer.
 
 ## 2. Launch
+
+**Check for overlapping work first.** List the open PRs that change the files or module this task will touch (GitHub: `gh pr list --json number,title,headRefName,files`). Parallel PRs on the same files cost a Codex round per merge, since each one that lands leaves the other with a conflict to resolve and its checks to rerun. When one is in flight, pick one of these and say which when you report the launch: wait for it to merge, cut the branch from that PR's branch (stacked, which address-pr unstacks once it merges), or go ahead in parallel because the overlap is small. Ask the user only when the overlapping PR is not part of their current work.
 
 Make the session's worktree yourself, where your instructions put worktrees, on a new branch cut from the latest `origin/<default>`. Name the worktree `codex-<topic>` after the brief, and the branch the way your instructions name branches, `codex/<topic>` when they don't say.
 
@@ -63,7 +65,9 @@ The log opens with `stale rollout path` errors, which are noise, and within seco
 
 ## 3. Review
 
-You are re-invoked when the run exits.
+Don't wait for the run to exit before reviewing. Codex spends most of a run waiting on CI after its push, and a review that starts at the push lands while it still waits, where step 4's follow-up has it answer new threads in the same run. So alongside each launch or resume, arm a background waiter that fires on the push: on a resume, `~/.claude/bin/wait-pr-ready <PR URL> --head <head sha before the resume>`, which exits 12 when the head moves; on the first launch, a loop that polls every minute until a PR exists for the branch (`gh pr view <branch> --json url`). When it fires, review that head as below while the run goes on. If the run pushes again, review the new head the same way; if the run exits first, start from here.
+
+You are re-invoked when the run exits as well.
 
 1. Read the `-o` file. A run that was cut off leaves none, so read the log's tail instead.
 2. Bind the PR it opened to your session, as the global rules require: the user follows its checks and review state there. Bind it and nothing more: no watch goes on with it, as the next step says.
