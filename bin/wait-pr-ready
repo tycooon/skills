@@ -20,8 +20,9 @@ Exit codes:
   14 a review, comment or review thread landed. With --until-review, any; while
      waiting for readiness, one that leaves the PR not ready (findings), so a
      session wakes for them even where nothing else relays them. An AI
-     reviewer's approval while CI or the base still holds the PR back, with no
-     thread open, is no finding: the wait goes on
+     reviewer's approval covering the head, with no thread open, is no finding
+     while checks are still running or GitHub still computes mergeability: the
+     wait goes on
   15 the watched head conflicts with the base: nothing else resolves it, so the
      session runs its fix round (address-pr, or the Codex resume that owns the PR).
      Not with --known-conflict
@@ -214,6 +215,18 @@ def checks_state(pr, no_ci):
     return True, f"{len(contexts)} checks green"
 
 
+def checks_still_running(pr):
+    """Whether the checks gate is unmet only because checks are still to report: none has failed."""
+    rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
+    for c in (rollup["contexts"]["nodes"] if rollup else []):
+        if c["__typename"] == "CheckRun":
+            if c["status"] == "COMPLETED" and c["conclusion"] not in GREEN_CONCLUSIONS:
+                return False
+        elif c["state"] not in ("SUCCESS", "PENDING", "EXPECTED"):
+            return False
+    return True
+
+
 def posts(pr):
     """Reviews and comments: (key, author, body, posted_at, review_state, commit)."""
     out = []
@@ -253,15 +266,21 @@ def verdicts(pr, reviewers):
     return list(newest.values())
 
 
-def only_approvals(pr, seen, reviewers):
-    """Whether every post not in `seen` is an AI reviewer's go verdict or a thread reply.
+def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
+    """Whether the posts not in `seen` leave the session nothing to do.
 
-    Such posts leave nothing to answer once no thread is open: the PR waits on
-    CI or the base, which an approval does not change, so they don't wake the
-    session as findings.
+    That holds when each is an AI reviewer's go verdict or a thread reply, the
+    approval covers the head, no thread is open, and what still holds the PR
+    back clears on its own: checks still running, or mergeability GitHub is
+    still computing. A failed check, a BEHIND or BLOCKED base, or a verdict the
+    approval gate doesn't count still wakes the session, as nothing else may.
     """
     unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
-    if unresolved:
+    if unresolved or not approval_state(pr, reviewers, same_authored_lines)[0]:
+        return False
+    if not (checks_state(pr, no_ci)[0] or checks_still_running(pr)):
+        return False
+    if not (pr["mergeStateStatus"] in MERGEABLE_STATES and pr["mergeable"] == "MERGEABLE") and pr["mergeable"] != "UNKNOWN":
         return False
     for key, author, body, _, state, _ in posts(pr):
         if key in seen or is_thread_reply(body, state):
@@ -394,13 +413,14 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
-        ready, reasons = evaluate(pr, no_ci=args.no_ci, reviewers=set(args.reviewer), same_authored_lines=lambda o, n, at: same_authored_lines(pr, o, n, at))
+        gates = {"no_ci": args.no_ci, "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
+        ready, reasons = evaluate(pr, **gates)
         if ready and mark <= args.after:
             ready = False
             reasons.append(f"no activity since {iso(args.after)}")
         if ready:
             return (0, f"ready: {args.url} at {head}: " + "; ".join(reasons) + f"; activity {iso(mark)}"), mark
-        if new_reviews and not only_approvals(pr, state["seen"], set(args.reviewer)):
+        if new_reviews and not only_approvals(pr, state["seen"], **gates):
             return (14, f"review activity: a review, comment or thread landed on {args.url} at {head}, not ready: " + "; ".join(reasons)), mark
         return (None, "; ".join(reasons)), mark
 
