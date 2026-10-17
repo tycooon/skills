@@ -8,7 +8,7 @@ Run it as one background shell command: the agent's session resumes when it
 exits. It only detects readiness and never changes the PR. Ready means all four
 of babysit-pr's conditions hold on the same head: the external AI reviewer's
 newest verdict approves the head (or a head it differs from only by a
-base-sync), every check on the head is green, no review thread is unresolved,
+base-sync, read against the base the PR had when the verdict was posted), every check on the head is green, no review thread is unresolved,
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
 
 Exit codes:
@@ -19,7 +19,10 @@ Exit codes:
   13 about 4 hours passed with no activity on the PR
   14 a review, comment or review thread landed. With --until-review, any; while
      waiting for readiness, one that leaves the PR not ready (findings), so a
-     session wakes for them even where nothing else relays them
+     session wakes for them even where nothing else relays them. An AI
+     reviewer's approval covering the head, with no thread open, is no finding
+     while checks are still running or GitHub still computes mergeability: the
+     wait goes on
   15 the watched head conflicts with the base: nothing else resolves it, so the
      session runs its fix round (address-pr, or the Codex resume that owns the PR).
      Not with --known-conflict
@@ -72,6 +75,12 @@ query($owner: String!, $name: String!, $number: Int!) {
       updatedAt
       mergeable
       mergeStateStatus
+      timelineItems(itemTypes: [BASE_REF_CHANGED_EVENT, AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT], last: 20) {
+        nodes {
+          ... on BaseRefChangedEvent { createdAt previousRefName }
+          ... on AutomaticBaseChangeSucceededEvent { createdAt oldBase }
+        }
+      }
       reviewThreads(first: 100) { totalCount nodes { isResolved } }
       reviews(last: 50) {
         totalCount
@@ -154,6 +163,39 @@ def authored_lines(owner, name, base, sha):
     return lines
 
 
+def base_at(pr, at):
+    """The base branch the PR had at time `at`.
+
+    A stacked PR retargeted after its base merged (by hand, or by GitHub when
+    the base branch goes) has a new base, and its old head's diff against that
+    base also carries the merged base PR, so a verdict on the old head is read
+    against the base it was posted under.
+    """
+    events = [e for e in (pr.get("timelineItems") or {}).get("nodes") or [] if e and ts(e["createdAt"]) > ts(at)]
+    if events:
+        first = min(events, key=lambda e: ts(e["createdAt"]))
+        return first.get("previousRefName") or first["oldBase"]
+    return pr["baseRefName"]
+
+
+MERGED_HEAD_QUERY = """
+query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(headRefName: $branch, states: MERGED, last: 1) { nodes { headRefOid } }
+  }
+}
+"""
+
+
+def merged_branch_tip(owner, name, branch):
+    """The last head of the merged PR from `branch`: what a base branch deleted on merge pointed at."""
+    r = gh(["api", "graphql", "-f", f"query={MERGED_HEAD_QUERY}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"branch={branch}"])
+    if r.returncode != 0:
+        return None
+    nodes = json.loads(r.stdout)["data"]["repository"]["pullRequests"]["nodes"]
+    return nodes[0]["headRefOid"] if nodes else None
+
+
 def checks_state(pr, no_ci):
     if no_ci:
         return True, "no CI"
@@ -173,28 +215,79 @@ def checks_state(pr, no_ci):
     return True, f"{len(contexts)} checks green"
 
 
+def checks_still_running(pr):
+    """Whether the checks gate is unmet only because checks are still to report: none has failed."""
+    rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
+    for c in (rollup["contexts"]["nodes"] if rollup else []):
+        if c["__typename"] == "CheckRun":
+            if c["status"] == "COMPLETED" and c["conclusion"] not in GREEN_CONCLUSIONS:
+                return False
+        elif c["state"] not in ("SUCCESS", "PENDING", "EXPECTED"):
+            return False
+    return True
+
+
+def posts(pr):
+    """Reviews and comments: (key, author, body, posted_at, review_state, commit)."""
+    out = []
+    for r in pr["reviews"]["nodes"]:
+        login = (r["author"] or {}).get("login")
+        out.append((("review", login, r["submittedAt"]), r["author"], r["body"] or "", r["submittedAt"], r["state"], (r["commit"] or {}).get("oid")))
+    for c in pr["comments"]["nodes"]:
+        login = (c["author"] or {}).get("login")
+        out.append((("comment", login, c["createdAt"]), c["author"], c["body"] or "", c["createdAt"], None, None))
+    return out
+
+
+def is_thread_reply(body, state):
+    # A thread reply shows up as a bodiless COMMENTED review; it is no verdict.
+    return not body.strip() and state != "APPROVED"
+
+
+def is_go(body, state):
+    return state == "APPROVED" or (state != "CHANGES_REQUESTED" and bool(GO_SIGNAL.search(body)) and not NO_GO.search(body))
+
+
+def is_reviewer(author, body, reviewers):
+    return bool(author) and (author["login"] in reviewers or bool(IDENTITY.search(body)))
+
+
 def verdicts(pr, reviewers):
     """Each AI reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
-    posts = []
-    for r in pr["reviews"]["nodes"]:
-        posts.append((r["author"], r["body"] or "", r["submittedAt"], r["state"], (r["commit"] or {}).get("oid")))
-    for c in pr["comments"]["nodes"]:
-        posts.append((c["author"], c["body"] or "", c["createdAt"], None, None))
     newest = {}
-    for author, body, at, state, commit in posts:
-        if not author:
+    for _, author, body, at, state, commit in posts(pr):
+        if not is_reviewer(author, body, reviewers) or is_thread_reply(body, state):
             continue
         login = author["login"]
-        is_reviewer = login in reviewers or bool(IDENTITY.search(body))
-        # A thread reply shows up as a bodiless COMMENTED review; it is no verdict.
-        if not is_reviewer or (not body.strip() and state != "APPROVED"):
-            continue
-        go = state == "APPROVED" or (state != "CHANGES_REQUESTED" and bool(GO_SIGNAL.search(body)) and not NO_GO.search(body))
         named = SHA.findall(body)
         sha = named[-1] if named else commit
         if login not in newest or ts(at) >= ts(newest[login][3]):
-            newest[login] = (login, go, sha, at)
+            newest[login] = (login, is_go(body, state), sha, at)
     return list(newest.values())
+
+
+def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
+    """Whether the posts not in `seen` leave the session nothing to do.
+
+    That holds when each is an AI reviewer's go verdict or a thread reply, the
+    approval covers the head, no thread is open, and what still holds the PR
+    back clears on its own: checks still running, or mergeability GitHub is
+    still computing. A failed check, a BEHIND or BLOCKED base, or a verdict the
+    approval gate doesn't count still wakes the session, as nothing else may.
+    """
+    unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
+    if unresolved or not approval_state(pr, reviewers, same_authored_lines)[0]:
+        return False
+    if not (checks_state(pr, no_ci)[0] or checks_still_running(pr)):
+        return False
+    if not (pr["mergeStateStatus"] in MERGEABLE_STATES and pr["mergeable"] == "MERGEABLE") and pr["mergeable"] != "UNKNOWN":
+        return False
+    for key, author, body, _, state, _ in posts(pr):
+        if key in seen or is_thread_reply(body, state):
+            continue
+        if not (is_reviewer(author, body, reviewers) and is_go(body, state)):
+            return False
+    return True
 
 
 def approval_state(pr, reviewers, same_authored_lines):
@@ -206,7 +299,7 @@ def approval_state(pr, reviewers, same_authored_lines):
             continue
         if sha == head or (sha is None and ts(at) >= head_date):
             return True, f"approved by {login} on {head[:12]}"
-        if sha and same_authored_lines(sha, head):
+        if sha and same_authored_lines(sha, head, at):
             return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
     if not found:
         return False, "no AI reviewer verdict yet"
@@ -268,11 +361,21 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     state = {"expected": args.head, "head_seen": args.head is None, "reviews": None}
     lines_cache = {}
 
-    def same_authored_lines(pr, old, new):
-        for sha in (old, new):
-            if sha not in lines_cache:
-                lines_cache[sha] = authored_lines(owner, name, pr["baseRefName"], sha)
-        return lines_cache[old] is not None and lines_cache[old] == lines_cache[new]
+    def lines(base, sha, current_base):
+        if (base, sha) not in lines_cache:
+            found = authored_lines(owner, name, base, sha)
+            if found is None and base != current_base:
+                # A base branch deleted when its PR merged: read against that PR's last head.
+                tip = merged_branch_tip(owner, name, base)
+                found = authored_lines(owner, name, tip, sha) if tip else None
+            lines_cache[base, sha] = found
+        return lines_cache[base, sha]
+
+    def same_authored_lines(pr, old, new, at):
+        """old's lines against the base its verdict was posted under, new's against today's."""
+        current = pr["baseRefName"]
+        before = lines(base_at(pr, at), old, current)
+        return before is not None and before == lines(current, new, current)
 
     def read_once():
         """One read: (exit code, line) to stop, or (None, waiting reason) and the activity mark."""
@@ -301,6 +404,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (15, f"conflict: {args.url} at {head} conflicts with {pr['baseRefName']}"), mark
         if state["reviews"] is None:
             state["reviews"] = review_count(pr)
+            state["seen"] = {key for key, *_ in posts(pr)}
         new_reviews = review_count(pr) > state["reviews"]
         if args.until_review:
             # A thread opens with a review, so the time test covers threads too.
@@ -309,13 +413,14 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
-        ready, reasons = evaluate(pr, no_ci=args.no_ci, reviewers=set(args.reviewer), same_authored_lines=lambda o, n: same_authored_lines(pr, o, n))
+        gates = {"no_ci": args.no_ci, "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
+        ready, reasons = evaluate(pr, **gates)
         if ready and mark <= args.after:
             ready = False
             reasons.append(f"no activity since {iso(args.after)}")
         if ready:
             return (0, f"ready: {args.url} at {head}: " + "; ".join(reasons) + f"; activity {iso(mark)}"), mark
-        if new_reviews:
+        if new_reviews and not only_approvals(pr, state["seen"], **gates):
             return (14, f"review activity: a review, comment or thread landed on {args.url} at {head}, not ready: " + "; ".join(reasons)), mark
         return (None, "; ".join(reasons)), mark
 
