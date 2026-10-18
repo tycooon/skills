@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Post a reviewer's two routine writes on GitHub, as the reviewer bot.
+
+  review-post resolve <thread-node-id>
+  review-post approve <owner/repo> <number> <head-sha>
+
+resolve runs the resolveReviewThread mutation and prints the thread id and
+isResolved. approve re-reads the PR's head, refuses unless it equals the given
+40-hex sha, approves with the one-line verdict body review-pr asks for, and
+prints the state of the review it left.
+
+It can do nothing else, so a permission rule can allow it on its own: an
+auto-mode classifier that reads a raw `gh api graphql` or `gh pr review` as an
+external write can stall a review sweep's subagents mid-pass.
+
+The posting calls run with GH_TOKEN set from PR_REVIEW_GH_TOKEN, as review-pr's
+Posting identity section does in the shell. With that variable empty, gh falls
+back to its configured account. The token is never printed or tested.
+
+Exit codes: 0 posted, 1 refused or a gh call failed, 2 usage error.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+USAGE = """usage: review-post resolve <thread-node-id>
+       review-post approve <owner/repo> <number> <40-char head sha>"""
+
+THREAD_ID = re.compile(r"PRRT_[A-Za-z0-9_-]{1,100}")
+REPO = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}")
+NUMBER = re.compile(r"[1-9][0-9]{0,9}")
+SHA = re.compile(r"[0-9a-f]{40}")
+
+RESOLVE = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id isResolved } } }"
+NEWEST_REVIEW = """query($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    reviews(last: 50) { nodes { author { login } state commit { oid } } }
+  } }
+}"""
+
+
+class Refused(Exception):
+    pass
+
+
+def usage():
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+
+
+def gh(*args, as_bot):
+    env = os.environ.copy()
+    if as_bot:
+        env["GH_TOKEN"] = os.environ.get("PR_REVIEW_GH_TOKEN", "")
+    result = subprocess.run(["gh", *args], env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Refused(f"gh {args[0]} {args[1]} failed: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout.strip()
+
+
+def resolve(thread_id):
+    out = gh("api", "graphql", "-f", f"query={RESOLVE}", "-f", f"id={thread_id}",
+             "--jq", '.data.resolveReviewThread.thread | "\\(.id) isResolved=\\(.isResolved)"', as_bot=True)
+    print(out)
+    if not out.endswith("isResolved=true"):
+        raise Refused(f"thread {thread_id} is not resolved")
+
+
+def approve(repo, number, sha):
+    head = gh("pr", "view", number, "-R", repo, "--json", "headRefOid", "--jq", ".headRefOid", as_bot=False)
+    if head != sha:
+        raise Refused(f"head moved: {repo}#{number} is at {head or '(unreadable)'}, not {sha}; nothing posted")
+    gh("pr", "review", number, "-R", repo, "--approve", "--body", f"AI reviewer: Claude. Reviewed {sha}.", as_bot=True)
+    owner, name = repo.split("/", 1)
+    state = gh("api", "graphql", "-f", f"query={NEWEST_REVIEW}", "-f", f"owner={owner}", "-f", f"name={name}",
+               "-F", f"number={number}", "--jq",
+               '.data.viewer.login as $me | [.data.repository.pullRequest.reviews.nodes[] | select(.author.login == $me)]'
+               ' | last | "\\(.state) \\(.commit.oid)"', as_bot=True)
+    print(f"{repo}#{number} {state}")
+    if state != f"APPROVED {sha}":
+        raise Refused(f"the newest review on {repo}#{number} is {state}, not an approval of {sha}")
+
+
+def main(argv):
+    match argv:
+        case ["resolve", thread_id] if THREAD_ID.fullmatch(thread_id):
+            resolve(thread_id)
+        case ["approve", repo, number, sha] if REPO.fullmatch(repo) and NUMBER.fullmatch(number) and SHA.fullmatch(sha):
+            approve(repo, number, sha)
+        case _:
+            usage()
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except Refused as e:
+        print(f"review-post: {e}", file=sys.stderr)
+        sys.exit(1)

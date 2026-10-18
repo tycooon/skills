@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Tests for bin/review-post. Run: bin/test-review-post"""
+
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parent / "review-post"
+HEAD = "a" * 40
+OLD = "b" * 40
+THREAD = "PRRT_kwDOABCdef4Abc-_1"
+BOT_TOKEN = "stub-bot-token"
+
+# Stands in for gh: records each call and whether it ran with the bot token, and answers like GitHub would.
+STUB_GH = r'''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_CALLS"], "a") as f:
+    f.write(json.dumps({"args": args, "as_bot": os.environ.get("GH_TOKEN") == os.environ.get("PR_REVIEW_GH_TOKEN")}) + "\n")
+if args[:2] == ["pr", "view"]:
+    print(os.environ["STUB_HEAD"])
+elif args[:2] == ["pr", "review"]:
+    print("Approved pull request")
+elif args[:2] == ["api", "graphql"]:
+    query = next(a for a in args if a.startswith("query="))
+    if "resolveReviewThread" in query:
+        thread = next(a for a in args if a.startswith("id="))[3:]
+        print(f"{thread} isResolved=true")
+    else:
+        print(os.environ.get("STUB_REVIEW", "APPROVED " + os.environ["STUB_HEAD"]))
+else:
+    sys.exit(f"unexpected gh call: {args}")
+'''
+
+
+class ReviewPost(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        bin_dir = Path(self.tmp.name, "bin")
+        bin_dir.mkdir()
+        stub = bin_dir / "gh"
+        stub.write_text(STUB_GH)
+        stub.chmod(0o755)
+        self.calls = Path(self.tmp.name, "calls.jsonl")
+        self.env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "STUB_CALLS": str(self.calls),
+                    "STUB_HEAD": HEAD, "PR_REVIEW_GH_TOKEN": BOT_TOKEN, "GH_TOKEN": "own-account-token"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_script(self, *args, **env):
+        return subprocess.run([str(SCRIPT), *args], env={**self.env, **env}, capture_output=True, text=True)
+
+    def gh_calls(self):
+        if not self.calls.exists():
+            return []
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def assert_usage(self, *args):
+        result = self.run_script(*args)
+        self.assertEqual(result.returncode, 2, args)
+        self.assertIn("usage: review-post", result.stderr)
+        self.assertEqual(self.gh_calls(), [], args)
+
+    def test_rejects_malformed_arguments_without_calling_gh(self):
+        cases = [
+            (),
+            ("merge", "acme/app", "7", HEAD),
+            ("resolve",),
+            ("resolve", "PRR_kwDOABC"),
+            ("resolve", "PRRT_abc; rm -rf ~"),
+            ("resolve", THREAD, "extra"),
+            ("approve", "acme/app", "7"),
+            ("approve", "acme", "7", HEAD),
+            ("approve", "acme/app/extra", "7", HEAD),
+            ("approve", "-R/app", "7", HEAD),
+            ("approve", "acme/app", "07", HEAD),
+            ("approve", "acme/app", "7a", HEAD),
+            ("approve", "acme/app", "-1", HEAD),
+            ("approve", "acme/app", "7", HEAD[:39]),
+            ("approve", "acme/app", "7", HEAD + "a"),
+            ("approve", "acme/app", "7", "g" * 40),
+            ("approve", "acme/app", "7", "A" * 40),
+            ("approve", "acme/app", "7", HEAD, "extra"),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                self.assert_usage(*args)
+
+    def test_resolve_posts_as_the_bot(self):
+        result = self.run_script("resolve", THREAD)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"{THREAD} isResolved=true")
+        [call] = self.gh_calls()
+        self.assertEqual(call["args"][:2], ["api", "graphql"])
+        self.assertIn(f"id={THREAD}", call["args"])
+        self.assertTrue(call["as_bot"])
+
+    def test_approve_refuses_when_the_head_moved(self):
+        result = self.run_script("approve", "acme/app", "7", OLD)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("head moved", result.stderr)
+        self.assertEqual([c["args"][:2] for c in self.gh_calls()], [["pr", "view"]])
+
+    def test_approve_posts_the_verdict_line_as_the_bot(self):
+        result = self.run_script("approve", "acme/app", "7", HEAD)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"acme/app#7 APPROVED {HEAD}")
+        view, review, state = self.gh_calls()
+        self.assertEqual(view["args"], ["pr", "view", "7", "-R", "acme/app", "--json", "headRefOid", "--jq", ".headRefOid"])
+        self.assertFalse(view["as_bot"])
+        self.assertEqual(review["args"], ["pr", "review", "7", "-R", "acme/app", "--approve", "--body", f"AI reviewer: Claude. Reviewed {HEAD}."])
+        self.assertTrue(review["as_bot"])
+        self.assertTrue(state["as_bot"])
+
+    def test_approve_fails_when_no_approval_landed(self):
+        result = self.run_script("approve", "acme/app", "7", HEAD, STUB_REVIEW=f"COMMENTED {HEAD}")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not an approval", result.stderr)
+
+    def test_never_prints_the_token(self):
+        for args in (("resolve", THREAD), ("approve", "acme/app", "7", HEAD), ("approve", "acme/app", "7", OLD), ("resolve", "bad")):
+            result = self.run_script(*args)
+            self.assertNotIn(BOT_TOKEN, result.stdout + result.stderr, args)
+
+
+if __name__ == "__main__":
+    unittest.main()
