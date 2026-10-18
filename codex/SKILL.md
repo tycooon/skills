@@ -36,6 +36,18 @@ Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of
 - not merge or deploy;
 - end its final message with a report block: PR URL, one-line summary, each command it ran with its result, anything the reviewer or the user must know or answer.
 
+**Mockups.** When the task changes a user interface, Codex gets the mockups as files. It can't open an artifact, a canvas or anything else behind your sign-in, and a layout described only in words loses its structure. If no mockup exists yet and your instructions call for one, make it before the brief.
+
+Once step 2 has made the worktree, copy each mockup's source into `<worktree>/.plans/mockups/`: its HTML, or an exported image when there is no source. Check that the path is ignored there (`git check-ignore`); where it isn't, add it to the worktree's `.git/info/exclude`.
+
+The brief then:
+- names each file and the part of the task it shows;
+- tells Codex to match their structure, wording and hierarchy while using the project's own styles and components;
+- says the brief's text wins where it and a mockup differ;
+- says the mockups are never committed.
+
+A follow-up that adds UI work does the same before the resume.
+
 ## 2. Launch
 
 **Check for overlapping work first.** List the open PRs that change the files or module this task will touch (GitHub: `gh pr list -L 200 --json number,title,headRefName,changedFiles,files`; `files` stops at 100 per PR, so for a PR with more `changedFiles` read `gh pr diff <n> --name-only`). Parallel PRs on the same files cost a Codex round per merge, since each one that lands leaves the other with a conflict to resolve and its checks to rerun. When one is in flight, pick one of these and say which when you report the launch: wait for it to merge, stack on it, or go ahead in parallel because the overlap is small. To stack, cut the worktree below from `origin/<that PR's branch>` instead of `origin/<default>`, open the PR against that branch, and say both in the brief (address-pr unstacks it once the PR underneath merges); where the repository's own worktree command takes no base, don't stack. Ask the user only when the overlapping PR is not part of their current work.
