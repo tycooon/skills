@@ -2,6 +2,7 @@
 """Tests for bin/review-post. Run: bin/test-review-post"""
 
 import json
+import ast
 import os
 import subprocess
 import tempfile
@@ -17,20 +18,26 @@ BOT_TOKEN = "stub-bot-token"
 # Stands in for gh: records each call and whether it ran with the bot token, and answers like GitHub would.
 STUB_GH = r'''#!/usr/bin/env python3
 import json, os, sys
+from pathlib import Path
 args = sys.argv[1:]
 with open(os.environ["STUB_CALLS"], "a") as f:
     f.write(json.dumps({"args": args, "as_bot": os.environ.get("GH_TOKEN") == os.environ.get("PR_REVIEW_GH_TOKEN")}) + "\n")
 if args[:2] == ["pr", "view"]:
     print(os.environ["STUB_HEAD"])
 elif args[:2] == ["pr", "review"]:
-    print("Approved pull request")
+    os.environ["STUB_REVIEW"] = "APPROVED " + os.environ.get("STUB_PUSH_HEAD", os.environ["STUB_HEAD"])
+    Path(os.environ["STUB_CALLS"] + ".review").write_text(os.environ["STUB_REVIEW"])
+elif args[:2] == ["api", "--method"]:
+    commit = next(a for a in args if a.startswith("commit_id=")).split("=", 1)[1]
+    Path(os.environ["STUB_CALLS"] + ".review").write_text("APPROVED " + commit)
 elif args[:2] == ["api", "graphql"]:
     query = next(a for a in args if a.startswith("query="))
     if "resolveReviewThread" in query:
         thread = next(a for a in args if a.startswith("id="))[3:]
         print(f"{thread} isResolved=true")
     else:
-        print(os.environ.get("STUB_REVIEW", "APPROVED " + os.environ["STUB_HEAD"]))
+        review = Path(os.environ["STUB_CALLS"] + ".review")
+        print(os.environ.get("STUB_REVIEW", review.read_text() if review.exists() else "COMMENTED " + os.environ["STUB_HEAD"]))
 else:
     sys.exit(f"unexpected gh call: {args}")
 '''
@@ -112,7 +119,7 @@ class ReviewPost(unittest.TestCase):
         view, review, state = self.gh_calls()
         self.assertEqual(view["args"], ["pr", "view", "7", "-R", "acme/app", "--json", "headRefOid", "--jq", ".headRefOid"])
         self.assertFalse(view["as_bot"])
-        self.assertEqual(review["args"], ["pr", "review", "7", "-R", "acme/app", "--approve", "--body", f"AI reviewer: Claude. Reviewed {HEAD}."])
+        self.assertEqual(review["args"], ["api", "--method", "POST", "repos/acme/app/pulls/7/reviews", "-f", "event=APPROVE", "-f", f"commit_id={HEAD}", "-f", f"body=AI reviewer: Claude. Reviewed {HEAD}."])
         self.assertTrue(review["as_bot"])
         self.assertTrue(state["as_bot"])
 
@@ -120,6 +127,14 @@ class ReviewPost(unittest.TestCase):
         result = self.run_script("approve", "acme/app", "7", HEAD, STUB_REVIEW=f"COMMENTED {HEAD}")
         self.assertEqual(result.returncode, 1)
         self.assertIn("not an approval", result.stderr)
+
+    def test_approve_pins_review_when_head_moves_during_post(self):
+        result = self.run_script("approve", "acme/app", "7", HEAD, STUB_PUSH_HEAD=OLD)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"acme/app#7 APPROVED {HEAD}")
+
+    def test_python39_syntax(self):
+        ast.parse(SCRIPT.read_text(), feature_version=(3, 9))
 
     def test_never_prints_the_token(self):
         for args in (("resolve", THREAD), ("approve", "acme/app", "7", HEAD), ("approve", "acme/app", "7", OLD), ("resolve", "bad")):
