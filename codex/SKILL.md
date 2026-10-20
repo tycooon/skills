@@ -27,6 +27,16 @@ Reuse the same MODEL, EFFORT and SPEED for every run and resume of a session, an
 
 For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
 
+## On a remote host
+
+When the user asks for the session on another machine, or your machine rules send the repository's coding work to a dev host, Codex runs there over SSH and you stay where you are. HOST is that machine's SSH name. What touches the worktree or Codex runs on HOST; the review and everything else on GitHub stays with you, since it needs only `gh`.
+
+- **Paths are HOST's.** Its own rules (its `~/.claude/CLAUDE.md` and what that loads) say where its main checkouts and worktrees live, and which command makes a worktree. Read them once per conversation: `ssh HOST cat '~/.claude/CLAUDE.md'`, then the file it names for the machine.
+- **Every command in this skill that reads `~/.codex`, touches the worktree or starts Codex** runs as `ssh HOST '<command>'`, with MODEL, EFFORT, SPEED and the paths filled in before it is sent. The brief and follow-ups stay local and go in on stdin, as `- <` already passes them; mockups go across with `scp FILE HOST:WORKTREE/.plans/mockups/`.
+- **The `-o` file is on HOST.** Point it inside the worktree's ignored `.plans/` and read it with `ssh HOST cat`. The log stays local: SSH carries Codex's output to it.
+- **Keep the connection up:** `ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST …`. A dropped connection ends the run as if it had been cut off; resume it through step 4.
+- **Pass the rules on.** Tell Codex in the brief that it runs on HOST, so it follows HOST's rules on worktrees and builds rather than yours.
+
 ## 1. Write the brief
 
 Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief carries only the task: the problem with its evidence, what done looks like, what is out of scope. It also tells Codex to:
