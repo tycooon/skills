@@ -27,6 +27,22 @@ Reuse the same MODEL, EFFORT and SPEED for every run and resume of a session, an
 
 For an opinion only, with no code change and no follow-up, skip the steps and run `codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED --ephemeral -s read-only -C DIR -o ANSWER - < PROMPT > LOG 2>&1`.
 
+## On a remote host
+
+When the user asks for the session on another machine, or your machine rules send the repository's coding work to a dev host, Codex runs there over SSH and you stay where you are. HOST is that machine's SSH name. What touches the worktree or Codex runs on HOST; the review and everything else on GitHub stays with you, since it needs only `gh`.
+
+- **Paths are HOST's.** Its own rules (its `~/.claude/CLAUDE.md` and what that loads) say where its main checkouts and worktrees live, and which command makes a worktree. Read them once per conversation: `ssh HOST cat '~/.claude/CLAUDE.md'`, then the file it names for the machine.
+- **Every command in this skill that reads `~/.codex`, touches the worktree or starts Codex** runs on HOST, with MODEL, EFFORT, SPEED and the paths filled in before it is sent. A command with single quotes of its own, such as the `models_cache.json` lookups above, can't sit inside `ssh HOST '…'`: send its script on stdin instead, `ssh HOST python3 - MODEL <<'PY'` with the script's body and a closing `PY` line. Mockups go across with `scp FILE HOST:WORKTREE/.plans/mockups/`.
+- **Launch and resume.** The brief and follow-ups stay local and go in on stdin, so `< BRIEF` stays outside the quotes. The run's output stays on HOST, in the worktree's ignored `.plans/`, so a dropped connection can't cut it off, and the shell records its pid first:
+
+  ```bash
+  ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST 'cd WORKTREE && mkdir -p .plans && echo $$ > .plans/NAME.pid && exec codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o .plans/NAME-last.md - > .plans/NAME.log 2>&1' < BRIEF
+  ```
+
+  A resume is the same command with step 4's `resume SESSION_ID`, its follow-up on stdin, and the next numbered `-o` file and log. Read both files with `ssh HOST cat` (or `tail` for the log) wherever this skill reads the `-o` file or the log.
+- **A dropped connection or the timeout doesn't stop the run.** It ends only the local `ssh`, and Codex carries on in the worktree. Before reading the run as cut off, and before every resume, check it: `ssh HOST 'kill -0 $(cat WORKTREE/.plans/NAME.pid) 2>/dev/null && echo running'`. While it runs, it is still working: wait for it rather than starting a second run on the same session and worktree. Check again every few minutes from a background command, and stop it with `kill` only when the user asks to stop. Once it has exited, its `-o` file holds the final message as usual. Keep the connection up with the `ServerAlive` options above all the same, so the local side sees the end of a run.
+- **Pass the rules on.** Tell Codex in the brief that it runs on HOST, so it follows HOST's rules on worktrees and builds rather than yours.
+
 ## 1. Write the brief
 
 Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief carries only the task: the problem with its evidence, what done looks like, what is out of scope. It also tells Codex to:
