@@ -38,8 +38,10 @@ Options:
                     repository has no Actions workflow, or when none of its
                     workflows ran for the head (path filters that matched
                     nothing, as far as the timeout can tell).
-  --reviewer LOGIN  an account whose reviews count as the AI reviewer's even
-                    without an identity line. Repeatable.
+  --reviewer LOGIN  the AI reviewer's account; its reviews count even
+                    without an identity line. Repeatable. Given, only listed
+                    accounts' verdicts count toward the approval: another
+                    account's identity-line go post neither approves nor wakes.
   --after TIME      report ready only once the PR has activity newer than TIME
                     (ISO 8601), e.g. the mark of a ready that a recheck refused.
                     With --until-review: a review or comment posted after TIME
@@ -292,11 +294,20 @@ def is_reviewer(author, body, reviewers):
     return bool(author) and (author["login"] in reviewers or bool(IDENTITY.search(body)))
 
 
+def counts_as_verdict(author, body, reviewers):
+    """Whose verdict the approval gate reads. Listed reviewers, when any are given,
+    are the only ones: another account's identity line (a session reviewer posting
+    from the author's account, say) must not stand in for the repo's AI reviewer."""
+    if reviewers:
+        return bool(author) and author["login"] in reviewers
+    return is_reviewer(author, body, reviewers)
+
+
 def verdicts(pr, reviewers):
     """Each AI reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
     newest = {}
     for _, author, body, at, state, commit in posts(pr):
-        if not is_reviewer(author, body, reviewers) or is_thread_reply(body, state):
+        if not counts_as_verdict(author, body, reviewers) or is_thread_reply(body, state):
             continue
         login = author["login"]
         named = SHA.findall(body)
@@ -316,6 +327,14 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     approval gate doesn't count still wakes the session, as nothing else may.
     """
     unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
+    fresh = [p for p in posts(pr) if p[0] not in seen and not is_thread_reply(p[2], p[4])]
+    # Another account's go verdict, with listed reviewers, is not the gate's: it neither
+    # satisfies the approval nor counts as a finding, so it alone wakes nobody.
+    if not unresolved and fresh and all(
+        reviewers and not counts_as_verdict(a, b, reviewers) and is_reviewer(a, b, reviewers) and is_go(b, st)
+        for _, a, b, _, st, _ in fresh
+    ):
+        return True
     if unresolved or not approval_state(pr, reviewers, same_authored_lines)[0]:
         return False
     if not (checks_state(pr, no_ci)[0] or checks_still_running(pr)):
