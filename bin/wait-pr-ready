@@ -32,6 +32,10 @@ Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
                     the head the first read sees.
   --no-ci           the repository has no CI at all, so skip the checks gate.
+                    Without it, a head with no checks counts as having none to
+                    pass when the repository has no Actions workflow, or when
+                    none of its workflows ran for the head CI_SETTLE after the
+                    waiter first saw it (path filters that matched nothing).
   --reviewer LOGIN  an account whose reviews count as the AI reviewer's even
                     without an identity line. Repeatable.
   --after TIME      report ready only once the PR has activity newer than TIME
@@ -63,6 +67,10 @@ QUIET_LIMIT = 4 * 3600
 RETRY_WAIT = 180
 # A pushed head can take a moment to show up on the PR.
 HEAD_SETTLE = 600
+# Actions creates a push's workflow runs within seconds. A head with no run this
+# long after the waiter first saw it triggered none: its paths matched no
+# workflow's filters, and no check will ever report on it.
+CI_SETTLE = 600
 MAX_FAILED_READS = 6
 
 QUERY = """
@@ -196,9 +204,29 @@ def merged_branch_tip(owner, name, branch):
     return nodes[0]["headRefOid"] if nodes else None
 
 
+def workflow_count(owner, name):
+    r = gh(["api", f"repos/{owner}/{name}/actions/workflows", "--jq", ".total_count"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api actions/workflows failed")
+    return int(r.stdout)
+
+
+def workflow_runs(owner, name, sha):
+    r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=1", "--jq", ".total_count"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
+    return int(r.stdout)
+
+
+def has_checks(pr):
+    rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
+    return bool(rollup and rollup["contexts"]["nodes"])
+
+
 def checks_state(pr, no_ci):
+    """no_ci is False, True (--no-ci) or the reason a head has no checks to wait for."""
     if no_ci:
-        return True, "no CI"
+        return True, no_ci if isinstance(no_ci, str) else "no CI"
     rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
     contexts = rollup["contexts"]["nodes"] if rollup else []
     if not contexts:
@@ -358,7 +386,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         return 2
     owner, name, number = target
     started = now()
-    state = {"expected": args.head, "head_seen": args.head is None, "reviews": None}
+    state = {"expected": args.head, "head_seen": args.head is None, "reviews": None, "seen_at": {}, "workflows": None}
     lines_cache = {}
 
     def lines(base, sha, current_base):
@@ -376,6 +404,22 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         current = pr["baseRefName"]
         before = lines(base_at(pr, at), old, current)
         return before is not None and before == lines(current, new, current)
+
+    def without_checks(pr, head):
+        """Why the head has no checks to wait for, or False while some may still come."""
+        if args.no_ci:
+            return True
+        if has_checks(pr):
+            return False
+        if state["workflows"] is None:
+            state["workflows"] = workflow_count(owner, name)
+        if state["workflows"] == 0:
+            return "no CI: the repository has no Actions workflow"
+        if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
+            return False
+        if workflow_runs(owner, name, head) == 0:
+            return f"no CI for this head: no workflow ran in {CI_SETTLE // 60} min (path filters)"
+        return False
 
     def read_once():
         """One read: (exit code, line) to stop, or (None, waiting reason) and the activity mark."""
@@ -413,7 +457,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
-        gates = {"no_ci": args.no_ci, "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
+        gates = {"no_ci": without_checks(pr, head), "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
         ready, reasons = evaluate(pr, **gates)
         if ready and mark <= args.after:
             ready = False
