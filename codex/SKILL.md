@@ -40,7 +40,14 @@ When the user asks for the session on another machine, or your machine rules sen
   ```
 
   A resume is the same command with step 4's `resume SESSION_ID`, its follow-up on stdin, and the next numbered `-o` file and log. Read both files with `ssh HOST cat` (or `tail` for the log) wherever this skill reads the `-o` file or the log.
-- **A dropped connection or the timeout doesn't stop the run.** It ends only the local `ssh`, and Codex carries on in the worktree. Before reading the run as cut off, and before every resume, check it: `ssh HOST 'kill -0 $(cat WORKTREE/.plans/NAME.pid) 2>/dev/null && echo running'`. While it runs, it is still working: wait for it rather than starting a second run on the same session and worktree. Check again every few minutes from a background command, and stop it with `kill` only when the user asks to stop. Once it has exited, its `-o` file holds the final message as usual. Keep the connection up with the `ServerAlive` options above all the same, so the local side sees the end of a run.
+- **A dropped connection or the timeout doesn't stop the run.** It ends only the local `ssh`, and Codex carries on in the worktree. Before reading the run as cut off, and before every resume, check it: `ssh HOST 'kill -0 $(cat WORKTREE/.plans/NAME.pid) 2>/dev/null && echo running'`. While it runs, it is still working: wait for it rather than starting a second run on the same session and worktree. Stop it with `kill` only when the user asks to stop.
+- **Watch the process, not the connection.** The local `ssh` ending is not the run ending, so on a remote host it is not what re-invokes you. Right after every launch and resume, arm one background command that exits only when the pidfile's process has exited, tolerating failed reads:
+
+  ```bash
+  while :; do r=$(ssh -o ConnectTimeout=15 -o BatchMode=yes HOST 'kill -0 $(cat WORKTREE/.plans/NAME.pid) 2>/dev/null && echo running || echo exited' 2>/dev/null); [ "$r" = exited ] && break; sleep 60; done
+  ```
+
+  Its exit is the run's end: read the `-o` file then. When the `ssh` command exits first, the watch is still armed, so nothing more is needed. Never tell the user a run is still working from a check you made earlier: check the pid again first, or say when you last checked. Once it has exited, its `-o` file holds the final message as usual. Keep the connection up with the `ServerAlive` options above all the same, so the local side sees the end of a run.
 - **Pass the rules on.** Tell Codex in the brief that it runs on HOST, so it follows HOST's rules on worktrees and builds rather than yours.
 
 ## 1. Write the brief
@@ -101,7 +108,7 @@ OLD=HEAD_SHA; while :; do H=$(gh pr view PR_URL --json headRefOid --jq .headRefO
 
 A failed read prints nothing and the poll reads again. When it prints a new head, review that head as below (items 3 to 5) while the run goes on, note it as the last head you reviewed, and arm the poll again with it. Stop the poll when the run exits. Use this poll rather than `wait-pr-ready`, whose readiness mode also exits on a conflict, on review activity (Codex's own replies included) and on readiness, all with the old head. The first launch gets no poll: its brief has Codex stop once its PR is open, so the run exits about when the PR appears.
 
-You are re-invoked when the run exits as well. Run item 3 then only when the head differs from the last one you reviewed mid-run; otherwise go from item 2 straight to item 4.
+You are re-invoked when the run exits as well (on a remote host, by the process watch, not by the `ssh` command). Run item 3 then only when the head differs from the last one you reviewed mid-run; otherwise go from item 2 straight to item 4.
 
 1. Read the `-o` file. A run that was cut off leaves none, so read the log's tail instead.
 2. Bind the PR it opened to your session, as the global rules require: the user follows its checks and review state there. Bind it and nothing more: no watch goes on with it, as the next step says.
