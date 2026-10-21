@@ -32,10 +32,11 @@ Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
                     the head the first read sees.
   --no-ci           the repository has no CI at all, so skip the checks gate.
-                    Without it, a head with no checks counts as having none to
-                    pass when the repository has no Actions workflow, or when
-                    none of its workflows ran for the head CI_SETTLE after the
-                    waiter first saw it (path filters that matched nothing).
+                    Without it, a head still without checks CI_SETTLE after the
+                    waiter first saw it counts as having none to pass when the
+                    repository has no Actions workflow, or when none of its
+                    workflows ran for the head (path filters that matched
+                    nothing, as far as the timeout can tell).
   --reviewer LOGIN  an account whose reviews count as the AI reviewer's even
                     without an identity line. Repeatable.
   --after TIME      report ready only once the PR has activity newer than TIME
@@ -411,12 +412,14 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return True
         if has_checks(pr):
             return False
+        # External CI (a GitHub App or commit status) posts its first check some time
+        # after a push, so even a repository without workflows waits before it counts.
+        if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
+            return False
         if state["workflows"] is None:
             state["workflows"] = workflow_count(owner, name)
         if state["workflows"] == 0:
-            return "no CI: the repository has no Actions workflow"
-        if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
-            return False
+            return f"no CI: the repository has no Actions workflow and no check came in {CI_SETTLE // 60} min"
         if workflow_runs(owner, name, head) == 0:
             return f"no CI for this head: no workflow ran in {CI_SETTLE // 60} min (path filters)"
         return False

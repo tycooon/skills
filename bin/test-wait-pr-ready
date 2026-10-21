@@ -197,11 +197,18 @@ class Loop(unittest.TestCase):
     def unchecked(self):
         return ready_pr(commits={"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-15T09:00:00Z", "statusCheckRollup": None}}]})
 
-    def test_a_repository_without_workflows_needs_no_checks(self):
-        code, out, waits = self.run_main([self.unchecked()], workflows=0, runs=0)
+    def test_a_repository_without_workflows_needs_no_checks_once_none_came(self):
+        code, out, waits = self.run_main([self.unchecked()] * 20, workflows=0, runs=0)
         self.assertEqual(code, 0)
         self.assertIn("no Actions workflow", out)
-        self.assertEqual(waits, [])
+        self.assertGreaterEqual(sum(waits), w.CI_SETTLE)
+
+    def test_an_external_check_that_arrives_late_is_waited_for(self):
+        pending = self.unchecked()
+        pending["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("ci", status="IN_PROGRESS", conclusion=None)]}}
+        code, out, _ = self.run_main([self.unchecked(), pending, ready_pr()], workflows=0, runs=0)
+        self.assertEqual(code, 0)
+        self.assertNotIn("no Actions workflow", out)
 
     def test_a_head_no_workflow_ran_for_is_ready_once_ci_had_time_to_start(self):
         code, out, waits = self.run_main([self.unchecked()] * 20, runs=0)
