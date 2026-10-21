@@ -225,40 +225,37 @@ def workflow_runs(owner, name, sha):
     return int(r.stdout)
 
 
-def active_runs(owner, name, sha):
-    """Actions runs for sha still queued or running. A rerun resets its run to queued
-    while the check rollup can list only what already finished, so a short green
-    rollup alone does not prove the head's CI is done."""
-    r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100", "--jq", ".workflow_runs[] | select(.status != \"completed\") | .name"])
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
-    return [line for line in r.stdout.splitlines() if line]
-
-
 GREEN_RUN_CONCLUSIONS = {"success", "skipped", "neutral"}
 
 
-def finished_runs(owner, name, sha):
-    """(failed, oldest) over the Actions runs for sha. failed names each workflow
-    whose newest run did not pass: GitHub drops a cancelled run's checks from the
-    rollup, so a rollup left with one green check can hide a CI run that never
-    passed. oldest is the earliest run's creation time (epoch seconds), or None
-    without runs: Actions can create a push run minutes after a quicker
-    pull_request run, so a head whose runs are all young may still get one."""
+def head_runs(owner, name, sha):
+    """(active, failed, oldest) over the Actions runs for sha, from one request.
+
+    active names the runs still queued or running: a rerun resets its run to
+    queued while the check rollup can list only what already finished, so a
+    short green rollup alone does not prove the head's CI is done. failed names
+    each workflow whose newest run ended unsuccessfully: GitHub drops a
+    cancelled run's checks from the rollup, so a rollup left with one green
+    check can hide a CI run that never passed. Each run carries its latest
+    attempt, so a rerun that passed reads as passed. oldest is the earliest
+    run's creation time (epoch seconds), or None without runs: Actions can
+    create a push run minutes after a quicker pull_request run, so a head whose
+    runs are all young may still get one."""
     r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100", "--jq",
-            ".workflow_runs[] | [.workflow_id, .run_number, .run_attempt, .name, .status, (.conclusion // \"\"), .created_at] | @tsv"])
+            ".workflow_runs[] | [.workflow_id, .run_number, .name, .status, (.conclusion // \"\"), .created_at] | @tsv"])
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
-    newest, oldest = {}, None
+    active, newest, oldest = [], {}, None
     for line in r.stdout.splitlines():
-        workflow, number, attempt, run_name, status, conclusion, created = line.split("\t")
-        key = (int(number), int(attempt))
-        if workflow not in newest or key > newest[workflow][0]:
-            newest[workflow] = (key, run_name, status, conclusion)
+        workflow, number, run_name, status, conclusion, created = line.split("\t")
+        if status != "completed":
+            active.append(run_name)
+        if workflow not in newest or int(number) > newest[workflow][0]:
+            newest[workflow] = (int(number), run_name, status, conclusion)
         oldest = ts(created) if oldest is None else min(oldest, ts(created))
     failed = [f"{run_name}={conclusion}" for _, run_name, status, conclusion in newest.values()
               if status == "completed" and conclusion not in GREEN_RUN_CONCLUSIONS]
-    return failed, oldest
+    return active, failed, oldest
 
 
 def has_checks(pr):
@@ -537,25 +534,25 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
         gates = {"no_ci": without_checks(pr, head), "reviewers": {login_key(r) for r in args.reviewer}, "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
         ready, reasons = evaluate(pr, **gates)
+        runs_failed = []
         if ready and not args.no_ci:
-            running = active_runs(owner, name, head)
+            running, runs_failed, oldest = head_runs(owner, name, head)
             if running:
                 ready = False
                 reasons.append("workflow runs still active: " + ", ".join(sorted(set(running))[:5]))
-            else:
-                failed, oldest = finished_runs(owner, name, head)
-                if failed:
-                    ready = False
-                    reasons.append("workflow runs not green: " + ", ".join(sorted(failed)[:5]))
-                elif oldest is not None and now() - oldest < CI_SETTLE:
-                    ready = False
-                    reasons.append(f"runs for this head are under {CI_SETTLE // 60} min old; another workflow may still start")
+            elif runs_failed:
+                ready = False
+                reasons.append("workflow runs not green: " + ", ".join(sorted(runs_failed)[:5]))
+            elif oldest is not None and now() - oldest < CI_SETTLE:
+                ready = False
+                reasons.append(f"runs for this head are under {CI_SETTLE // 60} min old; another workflow may still start")
         if ready and mark <= args.after:
             ready = False
             reasons.append(f"no activity since {iso(args.after)}")
         if ready:
             return (0, f"ready: {args.url} at {head}: " + "; ".join(reasons) + f"; activity {iso(mark)}"), mark
-        if new_reviews and not only_approvals(pr, state["seen"], **gates):
+        # A run that ended unsuccessfully clears by no one's hand, as a failed check doesn't.
+        if new_reviews and (runs_failed or not only_approvals(pr, state["seen"], **gates)):
             return (14, f"review activity: a review, comment or thread landed on {args.url} at {head}, not ready: " + "; ".join(reasons)), mark
         return (None, "; ".join(reasons)), mark
 
