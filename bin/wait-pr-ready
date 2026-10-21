@@ -8,7 +8,8 @@ Run it as one background shell command: the agent's session resumes when it
 exits. It only detects readiness and never changes the PR. Ready means all four
 of babysit-pr's conditions hold on the same head: the external AI reviewer's
 newest verdict approves the head (or a head it differs from only by a
-base-sync, read against the base the PR had when the verdict was posted), every check on the head is green, no review thread is unresolved,
+base-sync, read against the base the PR had when the verdict was posted), every check on the head is green and no
+Actions run for it is still queued or running (a rerun shortens the rollup to what already finished), no review thread is unresolved,
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
 
 Exit codes:
@@ -217,6 +218,19 @@ def workflow_runs(owner, name, sha):
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
     return int(r.stdout)
+
+
+ACTIVE_RUN_STATES = ("queued", "in_progress", "waiting", "requested", "pending")
+
+
+def active_runs(owner, name, sha):
+    """Actions runs for sha still queued or running. A rerun resets its run to queued
+    while the check rollup can list only what already finished, so a short green
+    rollup alone does not prove the head's CI is done."""
+    r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100", "--jq", ".workflow_runs[] | select(.status != \"completed\") | .name"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
+    return [line for line in r.stdout.splitlines() if line]
 
 
 def has_checks(pr):
@@ -462,6 +476,11 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
         gates = {"no_ci": without_checks(pr, head), "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
         ready, reasons = evaluate(pr, **gates)
+        if ready and not args.no_ci:
+            running = active_runs(owner, name, head)
+            if running:
+                ready = False
+                reasons.append("workflow runs still active: " + ", ".join(sorted(set(running))[:5]))
         if ready and mark <= args.after:
             ready = False
             reasons.append(f"no activity since {iso(args.after)}")
