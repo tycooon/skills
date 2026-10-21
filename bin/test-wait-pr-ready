@@ -165,7 +165,7 @@ class OtherGates(unittest.TestCase):
 
 
 class Loop(unittest.TestCase):
-    def run_main(self, reads, args=(), clock_step=0, workflows=1, runs=1):
+    def run_main(self, reads, args=(), clock_step=0, workflows=1, runs=1, active=()):
         """Feeds main() one PR per read; each sleep advances the fake clock by its wait plus clock_step.
         workflows and runs are what the Actions API reports for the repository and the head."""
         reads = iter(reads)
@@ -182,16 +182,18 @@ class Loop(unittest.TestCase):
             waits.append(seconds)
             clock[0] += seconds + clock_step
 
-        originals = w.read_pr, w.workflow_count, w.workflow_runs
+        active = iter(active)
+        originals = w.read_pr, w.workflow_count, w.workflow_runs, w.active_runs
         w.read_pr = read_pr
         w.workflow_count = lambda *_: workflows
         w.workflow_runs = lambda *_: runs
+        w.active_runs = lambda *_: next(active, [])
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
                 code = w.main([URL, *args], now=lambda: clock[0], sleep=sleep)
         finally:
-            w.read_pr, w.workflow_count, w.workflow_runs = originals
+            w.read_pr, w.workflow_count, w.workflow_runs, w.active_runs = originals
         return code, out.getvalue(), waits
 
     def unchecked(self):
@@ -226,6 +228,16 @@ class Loop(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.startswith("ready:"))
         self.assertEqual(waits, [])
+
+    def test_a_rerun_still_running_is_not_ready(self):
+        # A rerun leaves only the finished checks in the rollup, so it reads green.
+        code, out, waits = self.run_main([ready_pr(), ready_pr()], active=[["CI", "CI"]])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 1)
+
+    def test_no_ci_does_not_ask_for_runs(self):
+        code, _, _ = self.run_main([ready_pr()], args=["--no-ci"], active=[["CI"]])
+        self.assertEqual(code, 0)
 
     def test_waits_with_backoff_until_ready(self):
         waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
