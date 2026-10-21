@@ -125,7 +125,7 @@ Across several repos your reviews will not all sit on one account: a dedicated b
 
 The first pass adopts every thread of yours already on the PRs, whichever run posted it, so a new watch picks up where the earlier ones stopped instead of treating their threads as someone else's.
 
-Decide ownership on every scan, from those two conditions applied to the thread itself. Never carry a skip-list of thread ids or signatures from one pass to the next: a thread filtered out once as someone else's is never weighed again, so when its author fixes the finding, the fixed thread stays open and holds back the approval, and no later scan reports it. A signature you cannot place is a reason to read the thread, not to drop it.
+Decide ownership on every scan, from those two conditions applied to the thread itself. Never carry a skip-list of thread ids or signatures from one pass to the next: a thread filtered out once as someone else's is never weighed again, so when the PR's author fixes the finding, the fixed thread stays open and holds back the approval, and no later scan reports it. A signature you cannot place is a reason to read the thread, not to drop it.
 
 ### Picking a PR back up
 
