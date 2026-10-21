@@ -125,6 +125,8 @@ Across several repos your reviews will not all sit on one account: a dedicated b
 
 The first pass adopts every thread of yours already on the PRs, whichever run posted it, so a new watch picks up where the earlier ones stopped instead of treating their threads as someone else's.
 
+Decide ownership on every scan, from those two conditions applied to the thread itself. Never carry a skip-list of thread ids or signatures from one pass to the next: a thread filtered out once as someone else's is never weighed again, so when its author fixes the finding, the fixed thread stays open and holds back the approval, and no later scan reports it. A signature you cannot place is a reason to read the thread, not to drop it.
+
 ### Picking a PR back up
 
 When you do pick a PR back up, handle it exactly as review-pr's *Re-reviewing a PR you have already reviewed* section says — that section is the single source for what to post and what to leave alone: review whatever code is new, resolve the threads that are now settled (resolving is the reviewer's job, not the author's), reply only on the threads that genuinely need it, and approve once nothing is left standing. Two of its rules matter most on a sweep like this, where the same PRs come back round after round: don't comment on an open thread just because a push happened, and don't re-post a finding that already has a thread.
