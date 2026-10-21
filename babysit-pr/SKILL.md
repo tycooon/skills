@@ -25,7 +25,7 @@ For a readiness-only watch, stop the loop and report when the PR is **done**. In
 
 1. **Approved by the external AI reviewer** — see *What counts as an approval* below.
 2. **Every discussion resolved.**
-3. **The pipeline green** on the current head.
+3. **The pipeline green** on the current head, or no CI to wait for under the rule in release's step 1: the repository has no CI at all, or no workflow ran for the head 10 minutes after the push and its changed files match none of the workflows' path filters.
 4. **Mergeable with the base** — no conflicts, and not held back for being behind where the host requires an up-to-date branch. Otherwise, being behind doesn't count against this; see step 2 of the loop.
 
 An approval on its own is not done. A PR can carry a current approval and still be unmergeable: a red pipeline, one unresolved thread, or a base that blocks the merge each leave it stuck, and none of them resolve themselves. Keep working the remaining conditions — that is what the address-pr pass is for — and stop only once all four hold at the same time, on the same head. Anything that moves the head resets the ones that depend on it.
@@ -74,7 +74,7 @@ The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`
 | 15 | the head conflicts with the base | run a round now: its address-pr pass merges the base and resolves the conflicts. Auto-fix may report the same conflict; whichever wakes the session first runs the round, and the other finds nothing left to do. When the round leaves that head still conflicting (address-pr stopped to ask rather than push a merge it couldn't resolve with confidence), record that head as `knownConflictHead` in the state file, re-arm with `--known-conflict`, which won't exit 15 for that head again, and put the conflict to the user |
 | 2, or any other | bad usage, the PR could not be read six times in a row, or the script failed | the hard-error stop |
 
-Pass `--no-ci` only for a project with no CI at all, as release's step 1 defines it; pass `--reviewer <login>` when the AI reviewer's verdicts carry no identity line.
+The waiter finds both no-CI cases release's step 1 describes on its own, each only once the head has had no checks for 10 minutes after the waiter first saw it, so a late external status lands first: a repository with no Actions workflow, and a head no workflow ran for. For the second its only evidence is the timeout, which a delayed Actions run also produces, so the round that takes its ready confirms the path filters before counting condition 3 as met. `--no-ci` skips the gate from the first read; pass it only for a project with no CI at all; pass `--reviewer <login>` when the AI reviewer's verdicts carry no identity line.
 
 It doesn't compete with Auto-fix: it never changes the PR, never fixes CI and never answers a comment. It only detects readiness, the one transition Auto-fix doesn't report, plus a conflict with the base and new findings, which nothing else reports where Auto-fix is off (a Codex PR, a PR whose `set_monitor` failed) or doesn't relay them. The two never act on the same thing, so its read-only polling is not the CI polling the app advises against.
 
