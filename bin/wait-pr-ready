@@ -290,8 +290,19 @@ def is_go(body, state):
     return state == "APPROVED" or (state != "CHANGES_REQUESTED" and bool(GO_SIGNAL.search(body)) and not NO_GO.search(body))
 
 
+def login_key(login):
+    """A login as `--reviewer` and the API both compare it: GraphQL drops a GitHub
+    App bot's `[bot]` suffix that REST and `gh` show, and logins ignore case."""
+    login = login.lower()
+    return login[: -len("[bot]")] if login.endswith("[bot]") else login
+
+
+def listed(author, reviewers):
+    return bool(author) and login_key(author["login"]) in reviewers
+
+
 def is_reviewer(author, body, reviewers):
-    return bool(author) and (author["login"] in reviewers or bool(IDENTITY.search(body)))
+    return listed(author, reviewers) or (bool(author) and bool(IDENTITY.search(body)))
 
 
 def counts_as_verdict(author, body, reviewers):
@@ -299,7 +310,7 @@ def counts_as_verdict(author, body, reviewers):
     are the only ones: another account's identity line (a session reviewer posting
     from the author's account, say) must not stand in for the repo's AI reviewer."""
     if reviewers:
-        return bool(author) and author["login"] in reviewers
+        return listed(author, reviewers)
     return is_reviewer(author, body, reviewers)
 
 
@@ -325,21 +336,26 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     back clears on its own: checks still running, or mergeability GitHub is
     still computing. A failed check, a BEHIND or BLOCKED base, or a verdict the
     approval gate doesn't count still wakes the session, as nothing else may.
+    With listed reviewers, another account's identity-line go is no verdict of
+    the gate's: when such posts are all that is new, only an open thread, a
+    failed check or a blocked base wakes the session.
     """
     unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
     fresh = [p for p in posts(pr) if p[0] not in seen and not is_thread_reply(p[2], p[4])]
-    # Another account's go verdict, with listed reviewers, is not the gate's: it neither
-    # satisfies the approval nor counts as a finding, so it alone wakes nobody.
-    if not unresolved and fresh and all(
-        reviewers and not counts_as_verdict(a, b, reviewers) and is_reviewer(a, b, reviewers) and is_go(b, st)
-        for _, a, b, _, st, _ in fresh
-    ):
-        return True
-    if unresolved or not approval_state(pr, reviewers, same_authored_lines)[0]:
+    if unresolved:
         return False
     if not (checks_state(pr, no_ci)[0] or checks_still_running(pr)):
         return False
     if not (pr["mergeStateStatus"] in MERGEABLE_STATES and pr["mergeable"] == "MERGEABLE") and pr["mergeable"] != "UNKNOWN":
+        return False
+    # Another account's go verdict, with listed reviewers, is not the gate's: it neither
+    # satisfies the approval nor counts as a finding, so it alone wakes nobody.
+    if fresh and all(
+        reviewers and not counts_as_verdict(a, b, reviewers) and is_reviewer(a, b, reviewers) and is_go(b, st)
+        for _, a, b, _, st, _ in fresh
+    ):
+        return True
+    if not approval_state(pr, reviewers, same_authored_lines)[0]:
         return False
     for key, author, body, _, state, _ in posts(pr):
         if key in seen or is_thread_reply(body, state):
@@ -490,7 +506,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
-        gates = {"no_ci": without_checks(pr, head), "reviewers": set(args.reviewer), "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
+        gates = {"no_ci": without_checks(pr, head), "reviewers": {login_key(r) for r in args.reviewer}, "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
         ready, reasons = evaluate(pr, **gates)
         if ready and not args.no_ci:
             running = active_runs(owner, name, head)
