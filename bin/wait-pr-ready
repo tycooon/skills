@@ -220,9 +220,6 @@ def workflow_runs(owner, name, sha):
     return int(r.stdout)
 
 
-ACTIVE_RUN_STATES = ("queued", "in_progress", "waiting", "requested", "pending")
-
-
 def active_runs(owner, name, sha):
     """Actions runs for sha still queued or running. A rerun resets its run to queued
     while the check rollup can list only what already finished, so a short green
