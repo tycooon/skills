@@ -45,6 +45,9 @@ Options:
                     without an identity line. Repeatable. Given, only listed
                     accounts' verdicts count toward the approval: another
                     account's identity-line go post neither approves nor wakes.
+                    Its formal approval on the head doesn't approve either, but
+                    wakes with exit 14, naming the account, since it likely
+                    means LOGIN is the wrong one.
   --after TIME      report ready only once the PR has activity newer than TIME
                     (ISO 8601), e.g. the mark of a ready that a recheck refused.
                     With --until-review: a review or comment posted after TIME
@@ -364,7 +367,9 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     approval gate doesn't count still wakes the session, as nothing else may.
     With listed reviewers, another account's identity-line go is no verdict of
     the gate's: when such posts are all that is new, only an open thread, a
-    failed check or a blocked base wakes the session.
+    failed check or a blocked base wakes the session. A formal approval from an
+    unlisted account still wakes it: a session reviewer posts plain comments, so
+    such an approval more likely means `--reviewer` names the wrong account.
     """
     unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
     fresh = [p for p in posts(pr) if p[0] not in seen and not is_thread_reply(p[2], p[4])]
@@ -378,6 +383,7 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     # satisfies the approval nor counts as a finding, so it alone wakes nobody.
     if fresh and all(
         reviewers and not counts_as_verdict(a, b, reviewers) and is_reviewer(a, b, reviewers) and is_go(b, st)
+        and st != "APPROVED"
         for _, a, b, _, st, _ in fresh
     ):
         return True
@@ -402,9 +408,14 @@ def approval_state(pr, reviewers, same_authored_lines):
             return True, f"approved by {login} on {head[:12]}"
         if sha and same_authored_lines(sha, head, at):
             return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
-    if not found:
-        return False, "no AI reviewer verdict yet"
-    return False, "no AI reviewer approval covering " + head[:12]
+    reason = "no AI reviewer verdict yet" if not found else "no AI reviewer approval covering " + head[:12]
+    unlisted = sorted({
+        a["login"] for _, a, _, _, st, commit in posts(pr)
+        if st == "APPROVED" and commit == head and a and not counts_as_verdict(a, "", reviewers)
+    })
+    if reviewers and unlisted:
+        reason += f" ({', '.join(unlisted)} approved it formally but is not a listed --reviewer)"
+    return False, reason
 
 
 def evaluate(pr, *, no_ci, reviewers, same_authored_lines):
