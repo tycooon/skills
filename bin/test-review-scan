@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Tests for bin/review-scan. Run: bin/test-review-scan"""
+
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # loading bin/review-scan as a module would litter bin/
+SCRIPT = Path(__file__).resolve().parent / "review-scan"
+TMP = tempfile.TemporaryDirectory()
+os.environ["REVIEW_SCAN_HOME"] = TMP.name
+
+
+def load_module():
+    loader = importlib.machinery.SourceFileLoader("review_scan", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("review_scan", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+rs = load_module()
+A, B = "a" * 40, "b" * 40
+PR1 = "https://github.com/acme/app/pull/1"
+PR2 = "https://github.com/acme/app/pull/2"
+RECENT = "2026-10-23T10:00:00Z"
+
+
+def row(url, head=A, updated=RECENT, draft=False, state="open", named=False):
+    return rs.pr_row(url, head, updated, draft, f"title {url[-1]}", "master", f"br{url[-1]}", "dev", state, named)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.listing = {"acme/app": [row(PR1), row(PR2)]}
+        self.activity = {}
+        self.spawned = []
+        rs.list_target = lambda spec: self.listing[spec]
+        rs.activity_since = lambda url, since: self.activity[url]
+        rs.now_utc = lambda: rs.parse_time("2026-10-23T12:00:00Z")
+        self.watch = f"w{self.id().split('.')[-1]}"
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--reviewer-model", "sonnet")
+
+    def cli(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = rs.main(list(argv)) if argv[0] != "tick" else rs.cmd_tick(self.tick_args(*argv[1:]), spawn=self.spawn)
+        return code, out.getvalue()
+
+    def tick_args(self, watch, *flags):
+        class A_: pass
+        a = A_()
+        a.watch, a.full, a.only, a.dry_run = watch, "--full" in flags, None, "--dry-run" in flags
+        if "--only" in flags:
+            a.only = flags[flags.index("--only") + 1]
+        return a
+
+    def spawn(self, w, url, brief):
+        self.spawned.append((url, brief))
+
+    def prs(self):
+        return json.loads((Path(TMP.name) / self.watch / "prs.json").read_text())
+
+
+class Tick(Base):
+    def test_first_tick_starts_a_run_per_unreviewed_pr(self):
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual(code, 0)
+        self.assertEqual([u for u, _ in self.spawned], [PR1, PR2])
+        self.assertIn("2 listed, 2 kept", out)
+
+    def test_settled_unchanged_pr_costs_no_run(self):
+        self.cli("tick", self.watch)
+        self.activity[PR1] = (A, RECENT, {"review-bot"})
+        self.activity[PR2] = (A, RECENT, set())
+        self.cli("settle", self.watch, PR1, "--head", A, "--since", "2026-10-23T11:00:00Z")
+        self.cli("settle", self.watch, PR2, "--head", A, "--since", "2026-10-23T11:00:00Z")
+        self.spawned.clear()
+        self.cli("tick", self.watch)
+        self.assertEqual(self.spawned, [])
+
+    def test_new_head_or_activity_makes_a_pr_owed(self):
+        self.cli("tick", self.watch)
+        for u in (PR1, PR2):
+            self.activity[u] = (A, RECENT, set())
+            self.cli("settle", self.watch, u, "--head", A, "--since", "2026-10-23T11:00:00Z")
+        self.listing["acme/app"] = [row(PR1, head=B), row(PR2, updated="2026-10-23T11:30:00Z")]
+        self.spawned.clear()
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR1, PR2])
+        self.assertIn("new head", out)
+        self.assertIn("activity at", out)
+
+    def test_drafts_and_dormant_prs_are_skipped(self):
+        self.listing["acme/app"] = [row(PR1, draft=True), row(PR2, updated="2026-09-01T00:00:00Z")]
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual(self.spawned, [])
+        self.assertIn("1 draft, 1 dormant", out)
+
+    def test_parallel_cap_holds_the_rest_for_a_later_tick(self):
+        self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual(len(self.spawned), 3)
+        self.assertEqual(out.count("waiting for a free slot"), 2)
+
+    def test_unreadable_target_is_reported_not_silent(self):
+        def boom(spec):
+            raise rs.ScanError("403")
+        rs.list_target = boom
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual(code, 5)
+        self.assertIn("UNREAD", out)
+
+    def test_brief_carries_the_settle_command_and_the_reviewed_head(self):
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        self.assertIn(f"review-scan settle {self.watch} {PR1} --head", brief)
+        self.assertIn("*One run reviews one PR*", brief)
+        self.assertIn(PR2, brief)  # siblings listed for related-PR checks
+
+    def test_unsettled_earlier_run_is_flagged_to_the_next(self):
+        self.cli("tick", self.watch)
+        self.spawned.clear()
+        self.cli("tick", self.watch)  # never settled: owed again, with the warning
+        self.assertIn("never settled", self.spawned[0][1])
+
+
+class Settle(Base):
+    def setUp(self):
+        super().setUp()
+        self.cli("tick", self.watch)
+
+    def test_refuses_when_head_moved(self):
+        self.activity[PR1] = (B, RECENT, set())
+        code, _ = self.cli("settle", self.watch, PR1, "--head", A, "--since", "2026-10-23T11:00:00Z")
+        self.assertEqual(code, 3)
+        self.assertNotIn("settled", self.prs()[PR1])
+
+    def test_refuses_when_someone_else_posted_during_the_run(self):
+        self.activity[PR1] = (A, RECENT, {"review-bot", "author"})
+        code, out = self.cli("settle", self.watch, PR1, "--head", A, "--since", "2026-10-23T11:00:00Z")
+        self.assertEqual(code, 4)
+        self.assertIn("author", out)
+
+    def test_records_weighed_threads_and_sibling_rechecks(self):
+        self.activity[PR1] = (A, RECENT, {"review-bot"})
+        code, _ = self.cli("settle", self.watch, PR1, "--head", A, "--since", "2026-10-23T11:00:00Z",
+                           "--weighed", "t1", "--recheck", PR2)
+        self.assertEqual(code, 0)
+        prs = self.prs()
+        self.assertEqual(prs[PR1]["settled"]["weighed"], ["t1"])
+        self.assertTrue(prs[PR2]["recheck"])
+
+
+class NamedPr(Base):
+    def test_named_pr_reviewed_as_draft_and_leaves_when_merged(self):
+        self.cli("init", self.watch, "--target", PR1)
+        self.listing[PR1] = [row(PR1, draft=True, named=True)]
+        self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR1])
+        self.listing[PR1] = [row(PR1, state="merged", named=True)]
+        _, out = self.cli("tick", self.watch)
+        self.assertIn("left the watch", out)
+        self.assertIn("nothing left to watch", out)
+
+
+class Spawn(Base):
+    def test_run_uses_the_configured_reviewer_model(self):
+        seen = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                seen["cmd"], self.pid = cmd, 4242
+
+        real = rs.subprocess.Popen
+        rs.subprocess.Popen = FakePopen
+        try:
+            w = rs.Watch(self.watch).load()
+            rs.spawn_run(w, PR1, "brief")
+        finally:
+            rs.subprocess.Popen = real
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("--model") + 1], "sonnet")
+        self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "auto")
+        self.assertEqual((w.runs / f"{w.slug(PR1)}.pid").read_text(), "4242")
+
+
+class Nudge(Base):
+    def test_nudge_marks_a_recheck_and_starts_a_tick_for_that_pr(self):
+        started = []
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                started.append(cmd)
+
+        real = rs.subprocess.Popen
+        rs.subprocess.Popen = FakePopen
+        try:
+            code, out = self.cli("nudge", PR1, "--head", B)
+            _, miss = self.cli("nudge", "https://github.com/other/repo/pull/9", "--head", B)
+        finally:
+            rs.subprocess.Popen = real
+        self.assertEqual(code, 0)
+        self.assertIn(f"nudged watch {self.watch}", out)
+        self.assertIn(["tick", self.watch, "--only", PR1], [c[1:] for c in started])
+        self.assertIn("nudge after a push", self.prs()[PR1]["recheck"][0])
+        self.assertNotIn(self.watch, miss)
+
+
+class Covers(unittest.TestCase):
+    def test_specs(self):
+        self.assertTrue(rs.covers("acme/app", PR1))
+        self.assertTrue(rs.covers("acme", PR1))
+        self.assertFalse(rs.covers("other", PR1))
+        mr = "https://gitlab.example.com/grp/sub/proj/-/merge_requests/5"
+        self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp", mr))
+        self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp/sub/proj!", mr))
+        self.assertFalse(rs.covers("gitlab:gitlab.example.com/gr", mr))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

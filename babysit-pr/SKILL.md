@@ -90,7 +90,7 @@ Use the following loop only when the native PR-watch tool is unavailable and no 
 
 You run as one continuous, self-paced task — not a fresh invocation per round — so between rounds wait *without blocking*: hand control back and schedule yourself to resume, rather than a foreground `sleep` (which is typically blocked). In Claude Code that's `ScheduleWakeup`, the mechanism `/loop`'s dynamic mode uses; end the loop with its `stop` once a stop condition is met.
 
-For Codex app review watches, create heartbeat automations with `notificationPolicy=failed_runs_only` by default, unless the user asks for routine notifications. Keep that policy when updating or resuming an existing watch; review-open-prs inherits this default. It mutes routine app notifications while allowing failed-run alerts, and it does not pause the watch or change its schedule. Task messages are separate: change the heartbeat prompt's reporting rule only when the user asks for fewer messages in the task.
+For Codex app review watches, create heartbeat automations with `notificationPolicy=failed_runs_only` by default, unless the user asks for routine notifications. Keep that policy when updating or resuming an existing watch. It mutes routine app notifications while allowing failed-run alerts, and it does not pause the watch or change its schedule. Task messages are separate: change the heartbeat prompt's reporting rule only when the user asks for fewer messages in the task.
 
 Let the wait grow while the PR sits idle. How long to wait depends on one thing only — how many quiet rounds you have behind you right now, a quiet round being one where nothing had changed and there was nothing to do:
 

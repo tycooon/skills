@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""Drive a review-open-prs watch without a long-running agent session.
+
+  review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--reviewer-model MODEL] [--effort LEVEL]
+                   [--own LOGIN]... [--max-parallel N] [--dormant-days N]
+  review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
+  review-scan settle <watch> <pr-url> --head SHA --since TIME [--recheck PR_URL]...
+  review-scan nudge <pr-url> --head SHA
+  review-scan status <watch>
+  review-scan install <watch> [--interval SECONDS]
+  review-scan uninstall <watch>
+
+A tick lists every open PR of the watch's targets in one cheap call per target and
+starts a fresh `claude -p` run, on the watch's reviewer model, for each PR that changed
+since a run last settled it: a new head, new activity, or a recheck someone asked for.
+A PR that has not changed costs nothing: no agent runs. The run follows review-open-prs'
+*One run reviews one PR* and ends with `settle`, which records the PR's state only when
+nothing but our own posts landed while the run was working.
+
+Targets: GitHub `owner/repo`, `owner` (every repo of an org or user) or a PR URL;
+GitLab `gitlab:HOST/group[/subgroup]`, `gitlab:HOST/group/project!` (a single project:
+note the trailing `!`) or an MR URL. A PR named by URL is reviewed even as a draft or
+dormant, and leaves the watch once merged or closed.
+
+State lives in $REVIEW_SCAN_HOME (default ~/.local/state/review-open-prs)/<watch>/.
+
+Exit codes: 0 success; 2 bad usage; 3 settle refused because the head moved;
+4 settle refused because someone else commented after --since; 5 a target could not
+be read (the tick still scanned the others).
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+HOME = Path(os.environ.get("REVIEW_SCAN_HOME", "~/.local/state/review-open-prs")).expanduser()
+GH_PR = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+GL_MR = re.compile(r"^https://([^/]+)/(.+?)/-/merge_requests/(\d+)/?$")
+SEARCH = """query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { url number title isDraft headRefOid updatedAt state
+      baseRefName headRefName author { login } repository { nameWithOwner } } }
+  }
+}"""
+ACTIVITY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    headRefOid state updatedAt
+    comments(last: 100) { nodes { author { login } createdAt } }
+    reviews(last: 100) { nodes { author { login } submittedAt } }
+    reviewThreads(last: 100) { nodes { comments(last: 50) { nodes { author { login } createdAt } } } }
+  } }
+}"""
+
+
+class ScanError(RuntimeError):
+    pass
+
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# --- host access (replaced in tests) ------------------------------------------------
+
+def run_json(cmd, timeout=120):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise ScanError(f"{shlex.join(cmd[:4])}…: {(p.stderr or p.stdout).strip()[:300]}")
+    return json.loads(p.stdout or "null")
+
+
+def gh_graphql(query, **variables):
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is not None:
+            cmd += ["-F" if isinstance(v, int) else "-f", f"{k}={v}"]
+    return run_json(cmd)["data"]
+
+
+def gh_rest(path):
+    return run_json(["gh", "api", path])
+
+
+def glab_api(host, path):
+    return run_json(["glab", "api", "--hostname", host, path])
+
+
+def glab_paged(host, path):
+    out, page = [], 1
+    sep = "&" if "?" in path else "?"
+    while True:
+        rows = glab_api(host, f"{path}{sep}per_page=100&page={page}")
+        out += rows
+        if len(rows) < 100:
+            return out
+        page += 1
+
+
+# --- listing -----------------------------------------------------------------------
+
+def pr_row(url, head, updated, draft, title, base, branch, author, state="open", named=False):
+    return {"url": url, "head": head, "updated": updated, "draft": bool(draft), "title": title,
+            "base": base, "branch": branch, "author": author, "state": state, "named": named}
+
+
+def list_target(spec):
+    """Every open PR of one target, as pr_row dicts. Raises ScanError when unreadable."""
+    m = GH_PR.match(spec)
+    if m:
+        pr = gh_rest(f"repos/{m[1]}/pulls/{m[2]}")
+        state = "merged" if pr.get("merged_at") else pr["state"]
+        return [pr_row(pr["html_url"], pr["head"]["sha"], pr["updated_at"], pr.get("draft"), pr["title"],
+                       pr["base"]["ref"], pr["head"]["ref"], pr["user"]["login"], state, named=True)]
+    m = GL_MR.match(spec)
+    if m:
+        mr = glab_api(m[1], f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}")
+        return [gl_row(mr, named=True)]
+    if spec.startswith("gitlab:"):
+        host, _, path = spec[len("gitlab:"):].partition("/")
+        if path.endswith("!"):
+            api = f"projects/{urllib.parse.quote(path[:-1], safe='')}/merge_requests?state=opened"
+        else:
+            api = f"groups/{urllib.parse.quote(path, safe='')}/merge_requests?state=opened&include_subgroups=true"
+        return [gl_row(mr) for mr in glab_paged(host, api)]
+    if "/" in spec:
+        qualifier = f"repo:{spec}"
+    else:  # search wants org: for an organisation and user: for a personal account
+        qualifier = ("org:" if gh_rest(f"users/{spec}").get("type") == "Organization" else "user:") + spec
+    rows, after = [], None
+    while True:
+        res = gh_graphql(SEARCH, q=f"is:pr is:open archived:false {qualifier}", after=after)["search"]
+        rows += [pr_row(n["url"], n["headRefOid"], n["updatedAt"], n["isDraft"], n["title"], n["baseRefName"],
+                        n["headRefName"], (n.get("author") or {}).get("login")) for n in res["nodes"] if n]
+        if not res["pageInfo"]["hasNextPage"]:
+            if len(rows) < res["issueCount"]:
+                raise ScanError(f"{spec}: search returned {len(rows)} of {res['issueCount']} open PRs")
+            return rows
+        after = res["pageInfo"]["endCursor"]
+
+
+def gl_row(mr, named=False):
+    return pr_row(mr["web_url"], mr["sha"], mr["updated_at"], mr.get("draft") or mr.get("work_in_progress"),
+                  mr["title"], mr["target_branch"], mr["source_branch"], (mr.get("author") or {}).get("username"),
+                  {"opened": "open"}.get(mr["state"], mr["state"]), named)
+
+
+def activity_since(url, since):
+    """(current head, last-activity time, authors of human comments, reviews and thread replies after `since`)."""
+    m = GH_PR.match(url)
+    if m:
+        owner, name = m[1].split("/")
+        pr = gh_graphql(ACTIVITY, owner=owner, name=name, number=int(m[2]))["repository"]["pullRequest"]
+        items = [(c["author"], c["createdAt"]) for c in pr["comments"]["nodes"]]
+        items += [(r["author"], r["submittedAt"]) for r in pr["reviews"]["nodes"] if r.get("submittedAt")]
+        items += [(c["author"], c["createdAt"]) for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
+        authors = {(a or {}).get("login") for a, at in items if parse_time(at) > since}
+        return pr["headRefOid"], pr["updatedAt"], authors
+    m = GL_MR.match(url)
+    if m:
+        base = f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}"
+        mr = glab_api(m[1], base)
+        notes = glab_api(m[1], f"{base}/notes?sort=desc&order_by=created_at&per_page=100")
+        authors = {n["author"]["username"] for n in notes if not n.get("system") and parse_time(n["created_at"]) > since}
+        return mr["sha"], mr["updated_at"], authors
+    raise ScanError(f"not a PR or MR URL: {url}")
+
+
+# --- state -------------------------------------------------------------------------
+
+class Watch:
+    def __init__(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise SystemExit(f"bad watch name {name!r}: letters, digits, '.', '_' and '-' only")
+        self.name, self.dir = name, HOME / name
+        self.runs = self.dir / "runs"
+
+    def load(self):
+        try:
+            self.config = json.loads((self.dir / "config.json").read_text())
+        except FileNotFoundError:
+            raise SystemExit(f"no watch {self.name!r}; create it with `review-scan init`")
+        p = self.dir / "prs.json"
+        self.prs = json.loads(p.read_text()) if p.exists() else {}
+        return self
+
+    def save(self):
+        tmp = self.dir / "prs.json.tmp"
+        tmp.write_text(json.dumps(self.prs, indent=1, sort_keys=True))
+        tmp.replace(self.dir / "prs.json")
+
+    def log(self, line):
+        with open(self.dir / "scan.log", "a") as f:
+            f.write(f"{iso(now_utc())} {line}\n")
+
+    def slug(self, url):
+        return re.sub(r"[^A-Za-z0-9]+", "-", url.split("://", 1)[-1]).strip("-")
+
+    def running(self, url):
+        pidfile = self.runs / f"{self.slug(url)}.pid"
+        try:
+            pid = int(pidfile.read_text())
+            os.kill(pid, 0)
+            return True
+        except (FileNotFoundError, ValueError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
+
+
+# --- commands ----------------------------------------------------------------------
+
+def cmd_init(a):
+    w = Watch(a.watch)
+    filters = {}
+    for f in a.filter or []:
+        spec, sep, text = f.partition("=")
+        if not sep:
+            raise SystemExit(f"--filter takes SPEC=TEXT, got {f!r}")
+        filters[spec] = text
+    unknown = set(filters) - set(a.target)
+    if unknown:
+        raise SystemExit(f"--filter names a target not in --target: {', '.join(sorted(unknown))}")
+    w.runs.mkdir(parents=True, exist_ok=True)
+    config = {"targets": [{"spec": t, "filter": filters.get(t)} for t in a.target],
+              "reviewer_model": a.reviewer_model, "effort": a.effort, "own": a.own or [],
+              "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
+    (w.dir / "config.json").write_text(json.dumps(config, indent=1))
+    print(f"watch {a.watch}: {len(a.target)} target(s), reviewer {a.reviewer_model} at {a.effort} effort, state in {w.dir}")
+    return 0
+
+
+def owed_reason(rec, row, full):
+    """Why a PR needs a run now, or None. Only "nothing changed since a run settled it" is quiet:
+    whether a changed PR actually owes anything is the run's to decide."""
+    if full:
+        return "full pass"
+    if "settled" not in rec:
+        return "never reviewed by this watch"
+    if rec.get("recheck"):
+        return "recheck: " + "; ".join(rec["recheck"])
+    s = rec["settled"]
+    if s["head"] != row["head"]:
+        return f"new head {row['head'][:12]} (settled at {s['head'][:12]})"
+    if s["updated"] != row["updated"]:
+        return f"activity at {row['updated']}"
+    return None
+
+
+def cmd_tick(a, spawn=None):
+    w = Watch(a.watch).load()
+    spawn = spawn or spawn_run
+    cfg, now = w.config, now_utc()
+    cutoff = now - dt.timedelta(days=cfg["dormant_days"])
+    listed, failed, accounting = {}, [], []
+    for t in cfg["targets"]:
+        try:
+            rows = list_target(t["spec"])
+        except (ScanError, subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError) as e:
+            failed.append(t["spec"])
+            accounting.append(f"{t['spec']}: UNREAD ({e})")
+            continue
+        kept = dormant = drafts = 0
+        for r in rows:
+            if r["state"] != "open":
+                continue
+            if r["draft"] and not r["named"]:
+                drafts += 1
+                continue
+            if parse_time(r["updated"]) < cutoff and not r["named"]:
+                dormant += 1
+                continue
+            r["target"], r["filter"] = t["spec"], t.get("filter")
+            listed[r["url"]] = r
+            kept += 1
+        accounting.append(f"{t['spec']}: {len(rows)} listed, {kept} kept, {drafts} draft, {dormant} dormant")
+    # A PR named outright that merged or closed has finished: it leaves the watch.
+    finished = [t for t in cfg["targets"] if (GH_PR.match(t["spec"]) or GL_MR.match(t["spec"]))
+                and t["spec"] not in failed and not any(r["target"] == t["spec"] for r in listed.values())]
+    owed = []
+    for url, r in listed.items():
+        if a.only and url != a.only:
+            continue
+        rec = w.prs.setdefault(url, {})
+        reason = owed_reason(rec, r, a.full)
+        if not reason:
+            continue
+        if w.running(url):
+            accounting.append(f"{url}: owed ({reason}), run still in flight")
+            continue
+        owed.append((url, r, reason))
+    in_flight = sum(w.running(u) for u in listed)
+    started = 0
+    for url, r, reason in owed:
+        if in_flight + started >= cfg["max_parallel"]:
+            accounting.append(f"{url}: owed ({reason}), waiting for a free slot")
+            continue
+        if a.dry_run:
+            accounting.append(f"{url}: would start a run ({reason})")
+            continue
+        rec = w.prs[url]
+        siblings = [s for s in listed.values() if s["url"] != url]
+        brief = build_brief(w, r, rec, reason, siblings, now)
+        rec.update(last_run={"started": iso(now), "head": r["head"], "reason": reason})
+        rec.pop("recheck", None)
+        spawn(w, url, brief)
+        started += 1
+        accounting.append(f"{url}: started a run ({reason})")
+    if not a.dry_run:
+        for t in finished:
+            cfg["targets"].remove(t)
+            accounting.append(f"{t['spec']}: merged or closed, left the watch")
+        if finished:
+            (w.dir / "config.json").write_text(json.dumps(cfg, indent=1))
+        w.save()
+    for line in accounting:
+        w.log(line)
+        print(line)
+    if not cfg["targets"]:
+        print(f"watch {w.name}: nothing left to watch; run `review-scan uninstall {w.name}`")
+    return 5 if failed else 0
+
+
+def build_brief(w, r, rec, reason, siblings, now):
+    cfg = w.config
+    prev = rec.get("last_run")
+    lines = [
+        f"Review one pull request for the `{w.name}` review watch: {r['url']}",
+        "",
+        "Use the review-open-prs skill, section *One run reviews one PR*, and follow it exactly; it points at",
+        "review-pr for how to review and post. This is a headless run: nobody reads your chat output,",
+        "so the PR is the whole report.",
+        "",
+        f"- Why this run: {reason}.",
+        f"- Head when the scan listed it: `{r['head']}`; base branch `{r['base']}`; author `{r['author']}`.",
+        f"- Run start time, for `settle --since`: `{iso(now)}`.",
+        f"- Accounts that post as you: {', '.join(cfg['own']) or 'your default account and the reviewer bot, per review-pr'}.",
+    ]
+    if r.get("filter"):
+        lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
+    settled = rec.get("settled")
+    if settled:
+        lines.append(f"- Last settled by this watch at head `{settled['head']}` on {settled['at']}; that is the head you last reviewed.")
+        if settled.get("weighed"):
+            lines.append(f"- Threads weighed and left silent at that head: {', '.join(settled['weighed'])}.")
+    if prev and prev.get("started") and not (settled and settled["at"] >= prev["started"]):
+        lines.append(f"- An earlier run started {prev['started']} for head `{prev['head'][:12]}` and never settled: before posting,")
+        lines.append("  check what of yours landed on the PR after that time, and don't post it again.")
+    if siblings:
+        lines.append("")
+        lines.append("Other open PRs in this watch, for related-PR checks (a starting point; verify before relying on it):")
+        lines += [f"- {s['url']} — {s['title']} (`{s['branch']}` → `{s['base']}`, head `{s['head'][:12]}`)" for s in siblings[:60]]
+    lines += ["", "End with:",
+              f"  ~/.claude/bin/review-scan settle {w.name} {r['url']} --head <the head you reviewed> --since {iso(now)} \\",
+              "    [--weighed <thread url>]... [--recheck <sibling PR url>]...",
+              "and if it exits 3 or 4, stop without settling: the next tick picks the PR up again."]
+    return "\n".join(lines) + "\n"
+
+
+def spawn_run(w, url, brief):
+    slug = w.slug(url)
+    (w.runs / f"{slug}.brief.md").write_text(brief)
+    cfg = w.config
+    cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+           "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+    with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
+        p = subprocess.Popen(cmd, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
+                             start_new_session=True)
+    (w.runs / f"{slug}.pid").write_text(str(p.pid))
+
+
+def cmd_settle(a):
+    w = Watch(a.watch).load()
+    since = parse_time(a.since)
+    head, updated, authors = activity_since(a.url, since)
+    rec = w.prs.setdefault(a.url, {})
+    for sib in a.recheck or []:
+        w.prs.setdefault(sib, {}).setdefault("recheck", []).append(f"sibling {a.url} changed")
+    if head != a.head:
+        w.save()
+        print(f"refused: head is now {head}, not {a.head}; the next tick reviews it")
+        return 3
+    own = set(w.config["own"])
+    others = sorted(x for x in authors - own if x)
+    if others:
+        w.save()
+        print(f"refused: {', '.join(others)} posted after {a.since}; the next tick reviews it")
+        return 4
+    rec["settled"] = {"head": head, "updated": updated, "at": iso(now_utc()), "weighed": a.weighed or []}
+    w.save()
+    w.log(f"{a.url}: settled at {head[:12]}")
+    print(f"settled {a.url} at {head}")
+    return 0
+
+
+def covers(spec, url):
+    if spec == url:
+        return True
+    m = GH_PR.match(url)
+    if m and not spec.startswith("gitlab:") and not spec.startswith("https://"):
+        return m[1] == spec or m[1].split("/")[0] == spec
+    m = GL_MR.match(url)
+    if m and spec.startswith("gitlab:"):
+        host, _, path = spec[len("gitlab:"):].partition("/")
+        path = path.rstrip("!")
+        return host == m[1] and (m[2] == path or m[2].startswith(path + "/"))
+    return False
+
+
+def cmd_nudge(a):
+    """address-pr's nudge: every watch covering the PR rechecks it on a tick started now."""
+    hit = 0
+    for d in sorted(HOME.glob("*/config.json")):
+        w = Watch(d.parent.name).load()
+        if not any(covers(t["spec"], a.url) for t in w.config["targets"]):
+            continue
+        w.prs.setdefault(a.url, {}).setdefault("recheck", []).append(f"nudge after a push of {a.head[:12]}")
+        w.save()
+        subprocess.Popen([sys.argv[0], "tick", w.name, "--only", a.url], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        hit += 1
+        print(f"nudged watch {w.name}")
+    if not hit:
+        print("no review watch covers this PR")
+    return 0
+
+
+def cmd_status(a):
+    w = Watch(a.watch).load()
+    cfg = w.config
+    print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
+          f"dormant after {cfg['dormant_days']} days")
+    for t in cfg["targets"]:
+        print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
+    for url, rec in sorted(w.prs.items()):
+        state = "running" if w.running(url) else ("settled " + rec["settled"]["at"]) if rec.get("settled") else "never settled"
+        print(f"  {url}: {state}" + (f", recheck pending" if rec.get("recheck") else ""))
+    log = w.dir / "scan.log"
+    if log.exists():
+        print("last scan lines:")
+        print("".join(log.read_text().splitlines(keepends=True)[-8:]), end="")
+    return 0
+
+
+def plist_path(name):
+    return Path("~/Library/LaunchAgents").expanduser() / f"com.github.tycooon.review-scan.{name}.plist"
+
+
+def cmd_install(a):
+    w = Watch(a.watch).load()
+    exe = Path(sys.argv[0]).resolve()
+    script = f"exec {shlex.quote(str(exe))} tick {shlex.quote(w.name)}"
+    if sys.platform != "darwin":
+        print(f"not macOS: add this crontab line instead:\n*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)}")
+        return 0
+    plist = plist_path(w.name)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.github.tycooon.review-scan.{w.name}</string>
+  <key>ProgramArguments</key><array><string>/bin/zsh</string><string>-lc</string><string>{script}</string></array>
+  <key>StartInterval</key><integer>{a.interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{w.dir / "launchd.log"}</string>
+  <key>StandardErrorPath</key><string>{w.dir / "launchd.log"}</string>
+</dict></plist>
+""")
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(plist)], check=True)
+    print(f"installed {plist}: a tick every {a.interval}s, the first one now")
+    return 0
+
+
+def cmd_uninstall(a):
+    w = Watch(a.watch).load()
+    plist = plist_path(w.name)
+    if plist.exists():
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        plist.unlink()
+    for pidfile in w.runs.glob("*.pid"):
+        try:
+            os.killpg(int(pidfile.read_text()), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    print(f"uninstalled watch {w.name}; its state stays in {w.dir}")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init")
+    i.add_argument("watch")
+    i.add_argument("--target", action="append", required=True)
+    i.add_argument("--filter", action="append", help="SPEC=TEXT: a judgment-call filter the run applies")
+    i.add_argument("--reviewer-model", default="opus", help="model for every review run (default: opus)")
+    i.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
+    i.add_argument("--own", action="append", help="an account that posts as you (repeat)")
+    i.add_argument("--max-parallel", type=int, default=3)
+    i.add_argument("--dormant-days", type=int, default=14)
+    t = sub.add_parser("tick")
+    t.add_argument("watch")
+    t.add_argument("--full", action="store_true", help="treat every PR as owed (first pass, lost state)")
+    t.add_argument("--only", help="consider just this PR")
+    t.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("settle")
+    s.add_argument("watch")
+    s.add_argument("url")
+    s.add_argument("--head", required=True)
+    s.add_argument("--since", required=True)
+    s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
+    s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
+    n = sub.add_parser("nudge")
+    n.add_argument("url")
+    n.add_argument("--head", required=True)
+    for name in ("status", "uninstall"):
+        sub.add_parser(name).add_argument("watch")
+    ins = sub.add_parser("install")
+    ins.add_argument("watch")
+    ins.add_argument("--interval", type=int, default=300)
+    a = p.parse_args(argv)
+    try:
+        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status,
+                "install": cmd_install, "uninstall": cmd_uninstall}[a.cmd](a)
+    except ScanError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())
