@@ -58,6 +58,17 @@ def ready_pr(**overrides):
     return pr
 
 
+def finding_thread(review_id, path, state="APPROVED", answered=True, opener="review-bot"):
+    """A thread a review opened; answered means the author replied after it."""
+    last = "author" if answered else opener
+    return {
+        "isResolved": False,
+        "path": path,
+        "comments": {"nodes": [{"author": {"login": opener}, "pullRequestReview": {"id": review_id, "state": state}}]},
+        "replies": {"totalCount": 2 if answered else 1, "nodes": [{"author": {"login": last}}]},
+    }
+
+
 def evaluate(pr, no_ci=False, reviewers=(), same=lambda old, new, at: False):
     return w.evaluate(pr, no_ci=no_ci, reviewers=set(reviewers), same_authored_lines=same)
 
@@ -464,6 +475,21 @@ class Loop(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(len(waits), 3)
 
+    def test_an_approved_head_waiting_only_on_checks_polls_every_minute(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        approved_pending = ready_pr()
+        approved_pending["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, waits = self.run_main([approved_pending] * 6 + [ready_pr()])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [w.CHECKS_ONLY_WAIT] * 6)
+
+    def test_an_unapproved_head_backs_off_as_before(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        unapproved = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        unapproved["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, waits = self.run_main([unapproved] * 6 + [ready_pr()])
+        self.assertEqual(waits[:6], w.BACKOFF + [w.BACKOFF[-1]])
+
     def test_an_approval_wakes_when_what_blocks_wont_clear_by_itself(self):
         none = {"totalCount": 0, "nodes": []}
         approved = {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}
@@ -495,6 +521,32 @@ class Loop(unittest.TestCase):
         code, out, _ = self.run_main([waiting, bot], args=["--reviewer", "someone-else"])
         self.assertEqual(code, 14, out)
         self.assertIn("review-bot approved it formally but is not a listed --reviewer", out)
+
+    def test_an_unanswered_non_blocking_finding_holds_until_answered(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}."), "id": "R1"}
+        open_finding = finding_thread("R1", "src/a.rs", answered=False)
+        held = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [open_finding]})
+        ready, reasons = evaluate(held)
+        self.assertFalse(ready)
+        self.assertIn("1 unresolved threads", reasons)
+        answered = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs")]})
+        self.assertTrue(evaluate(answered)[0])
+
+    def test_a_blocking_thread_still_holds_once_answered(self):
+        findings = {**review("review-bot", "COMMENTED", "AI reviewer: Claude."), "id": "R1"}
+        thread = finding_thread("R1", "src/a.rs", state="COMMENTED")
+        self.assertFalse(evaluate(ready_pr(reviewThreads={"totalCount": 1, "nodes": [thread]}, reviews={"totalCount": 2, "nodes": [findings, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}))[0])
+
+    def test_an_approval_with_findings_carries_to_a_fix_on_their_files(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs")]})
+        same = lambda *_: False
+        ok = w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: {"src/a.rs"})
+        self.assertTrue(ok[0], ok[1])
+        self.assertIn("touch only its findings' files", ok[1][0])
+        wider = w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: {"src/a.rs", "src/b.rs"})
+        self.assertFalse(wider[0])
+        self.assertFalse(w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: None)[0])
 
     def test_listed_reviewer_matches_case_and_bot_suffix(self):
         # GraphQL gives a GitHub App bot's login without the [bot] suffix REST and gh show.

@@ -71,6 +71,9 @@ from datetime import datetime, timezone
 # reviewer or CI run usually lands within minutes; one GraphQL read per wait
 # keeps even the 1-minute rungs far inside the API's hourly budget.
 BACKOFF = [60, 60, 120, 120, 300]
+# While the head is approved, no thread holds it and only its checks are left,
+# readiness is one CI finish away, so the wait stays at the first step.
+CHECKS_ONLY_WAIT = 60
 QUIET_LIMIT = 4 * 3600
 # Wait after a failed read. Kept apart from BACKOFF so MAX_FAILED_READS still
 # tolerates about 15 minutes of fast failures (a GitHub blip, a laptop waking).
@@ -99,10 +102,18 @@ query($owner: String!, $name: String!, $number: Int!) {
           ... on AutomaticBaseChangeSucceededEvent { createdAt oldBase }
         }
       }
-      reviewThreads(first: 100) { totalCount nodes { isResolved } }
+      reviewThreads(first: 100) {
+        totalCount
+        nodes {
+          isResolved
+          path
+          comments(first: 1) { nodes { author { login } pullRequestReview { id state } } }
+          replies: comments(last: 1) { totalCount nodes { author { login } } }
+        }
+      }
       reviews(last: 50) {
         totalCount
-        nodes { author { login } state body submittedAt commit { oid } }
+        nodes { id author { login } state body submittedAt commit { oid } }
       }
       comments(last: 50) {
         totalCount
@@ -163,6 +174,14 @@ def read_pr(owner, name, number):
     if pr is None:
         raise RuntimeError("no such pull request")
     return pr
+
+
+def changed_files(owner, name, old, new):
+    """The files that differ between two commits, or None when the compare fails."""
+    r = gh(["api", f"repos/{owner}/{name}/compare/{old}...{new}", "--jq", "[.files[].filename]"])
+    if r.returncode != 0:
+        return None
+    return set(json.loads(r.stdout))
 
 
 def authored_lines(owner, name, base, sha):
@@ -310,6 +329,30 @@ def posts(pr):
     return out
 
 
+def thread_opener(t):
+    first = (t.get("comments") or {}).get("nodes") or [{}]
+    return first[0] or {}
+
+
+def non_blocking(t):
+    """A thread an approving review opened: review-pr's P2/P3 findings on a head it approved."""
+    return ((thread_opener(t).get("pullRequestReview") or {}).get("state")) == "APPROVED"
+
+
+def answered(t):
+    """Someone other than the thread's opener has replied to it."""
+    replies = t.get("replies") or {}
+    last = (replies.get("nodes") or [{}])[0] or {}
+    opener = (thread_opener(t).get("author") or {}).get("login")
+    return replies.get("totalCount", 0) > 1 and (last.get("author") or {}).get("login") != opener
+
+
+def blocking_threads(pr):
+    """Unresolved threads that hold the merge. A non-blocking finding stops holding it
+    once the author has answered it, by a fix or by declining."""
+    return sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"] and not (non_blocking(t) and answered(t)))
+
+
 def is_thread_reply(body, state):
     # A thread reply shows up as a bodiless COMMENTED review; it is no verdict.
     return not body.strip() and state != "APPROVED"
@@ -357,7 +400,7 @@ def verdicts(pr, reviewers):
     return list(newest.values())
 
 
-def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
+def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, files_between=None):
     """Whether the posts not in `seen` leave the session nothing to do.
 
     That holds when each is an AI reviewer's go verdict or a thread reply, the
@@ -371,7 +414,7 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     unlisted account still wakes it: a session reviewer posts plain comments, so
     such an approval more likely means `--reviewer` names the wrong account.
     """
-    unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
+    unresolved = blocking_threads(pr)
     fresh = [p for p in posts(pr) if p[0] not in seen and not is_thread_reply(p[2], p[4])]
     if unresolved:
         return False
@@ -387,7 +430,7 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
         for _, a, b, _, st, _ in fresh
     ):
         return True
-    if not approval_state(pr, reviewers, same_authored_lines)[0]:
+    if not approval_state(pr, reviewers, same_authored_lines, files_between)[0]:
         return False
     for key, author, body, _, state, _ in posts(pr):
         if key in seen or is_thread_reply(body, state):
@@ -397,7 +440,17 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines):
     return True
 
 
-def approval_state(pr, reviewers, same_authored_lines):
+def finding_paths(pr, sha, reviewers):
+    """The files a listed or identity-line reviewer's formal approval of `sha` left findings on."""
+    ids = {
+        r["id"] for r in pr["reviews"]["nodes"]
+        if r.get("id") and r["state"] == "APPROVED" and (r.get("commit") or {}).get("oid") == sha
+        and counts_as_verdict(r["author"], r["body"] or "", reviewers)
+    }
+    return {t["path"] for t in pr["reviewThreads"]["nodes"] if (thread_opener(t).get("pullRequestReview") or {}).get("id") in ids and t.get("path")}
+
+
+def approval_state(pr, reviewers, same_authored_lines, files_between=None):
     head = pr["headRefOid"]
     head_date = ts(pr["commits"]["nodes"][0]["commit"]["committedDate"]) if pr["commits"]["nodes"] else 0
     found = verdicts(pr, reviewers)
@@ -408,6 +461,13 @@ def approval_state(pr, reviewers, same_authored_lines):
             return True, f"approved by {login} on {head[:12]}"
         if sha and same_authored_lines(sha, head, at):
             return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
+        # An approval with non-blocking findings carries to the author's fix: commits
+        # after it that touch only the files those findings are on.
+        paths = finding_paths(pr, sha, reviewers) if sha and files_between else set()
+        if paths:
+            changed = files_between(sha, head)
+            if changed is not None and changed <= paths:
+                return True, f"approved by {login} on {sha[:12]}; later commits touch only its findings' files"
     reason = "no AI reviewer verdict yet" if not found else "no AI reviewer approval covering " + head[:12]
     unlisted = sorted({
         a["login"] for _, a, _, _, st, commit in posts(pr)
@@ -418,13 +478,13 @@ def approval_state(pr, reviewers, same_authored_lines):
     return False, reason
 
 
-def evaluate(pr, *, no_ci, reviewers, same_authored_lines):
+def evaluate(pr, *, no_ci, reviewers, same_authored_lines, files_between=None):
     """Returns (ready, reasons) for one read of the PR."""
     gates = [
-        approval_state(pr, reviewers, same_authored_lines),
+        approval_state(pr, reviewers, same_authored_lines, files_between),
         checks_state(pr, no_ci),
     ]
-    unresolved = sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"])
+    unresolved = blocking_threads(pr)
     gates.append((unresolved == 0, f"{unresolved} unresolved threads"))
     mergeable, status = pr["mergeable"], pr["mergeStateStatus"]
     gates.append((mergeable == "MERGEABLE" and status in MERGEABLE_STATES, f"mergeable={mergeable}/{status}"))
@@ -543,13 +603,22 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark
-        gates = {"no_ci": without_checks(pr, head), "reviewers": {login_key(r) for r in args.reviewer}, "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at)}
+        gates = {
+            "no_ci": without_checks(pr, head),
+            "reviewers": {login_key(r) for r in args.reviewer},
+            "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at),
+            "files_between": lambda o, n: changed_files(owner, name, o, n),
+        }
         ready, reasons = evaluate(pr, **gates)
+        state["checks_only"] = not ready and approval_state(
+            pr, gates["reviewers"], gates["same_authored_lines"], gates["files_between"]
+        )[0] and blocking_threads(pr) == 0 and has_checks(pr) and checks_still_running(pr)
         runs_failed = []
         if ready and not args.no_ci:
             running, runs_failed, oldest = head_runs(owner, name, head)
             if running:
                 ready = False
+                state["checks_only"] = True
                 reasons.append("workflow runs still active: " + ", ".join(sorted(set(running))[:5]))
             elif runs_failed:
                 ready = False
@@ -592,7 +661,12 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         if now() - mark > QUIET_LIMIT:
             print(f"quiet: no activity on {args.url} for {int((now() - mark) / 3600)}h; still waiting: {waiting}")
             return 13
-        sleep(RETRY_WAIT if failures else BACKOFF[min(step, len(BACKOFF) - 1)])
+        if failures:
+            sleep(RETRY_WAIT)
+        elif state.get("checks_only"):
+            sleep(CHECKS_ONLY_WAIT)
+        else:
+            sleep(BACKOFF[min(step, len(BACKOFF) - 1)])
         if not failures:
             step += 1
 
