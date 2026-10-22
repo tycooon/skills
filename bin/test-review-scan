@@ -33,9 +33,11 @@ PR2 = "https://github.com/acme/app/pull/2"
 RECENT = "2026-10-23T10:00:00Z"
 
 
-def act(head=A, updated=RECENT, authors=(), approvers=("review-bot",), threads=(), approved_at=()):
-    return {"head": head, "updated": updated, "authors": set(authors), "approvers": set(approvers),
-            "threads": set(threads), "approved_at": set(approved_at)}
+def act(head=A, updated=RECENT, authors=(), approvers=("review-bot",), threads=(), approved_at=None):
+    if approved_at is None:
+        approved_at = {(who, head) for who in approvers}
+    return {"head": head, "updated": updated, "authors": set(authors), "approved_at": set(approved_at),
+            "noted_at": set(), "author": "dev", "threads": set(threads)}
 
 
 SINCE = ["--since", "2026-10-23T11:00:00Z", "--verdict", "approved"]
@@ -226,6 +228,16 @@ class Settle(Base):
         code, _ = self.cli("settle", self.watch, PR2, "--head", B, *SINCE, "--covered-by", A)
         self.assertEqual(code, 6)
 
+    def test_an_approved_comment_covers_only_where_a_formal_approval_is_impossible(self):
+        pr = act(head=B, approvers=())
+        pr.update(noted_at={("review-bot", A[:12])}, author="dev")
+        self.activity[PR1] = pr
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 6)
+        pr["author"] = "review-bot"  # GitHub refuses a self-approval
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)
+
     def test_sibling_recheck_registers_once_and_only_on_success(self):
         self.activity[PR1] = act(approvers=())
         code, _ = self.cli("settle", self.watch, PR1, "--head", A, *SINCE, "--recheck", PR2)
@@ -308,6 +320,13 @@ class Nudge(Base):
         self.assertIn(["tick", self.watch, "--only", PR1], [c[1:] for c in started])
         self.assertIn("nudge after a push", self.prs()[PR1]["recheck"][0])
         self.assertNotIn(self.watch, miss)
+
+
+class VerdictNotes(unittest.TestCase):
+    def test_only_a_note_that_opens_with_approved_counts(self):
+        notes = rs.verdict_notes([("bot", f"APPROVED (formal approval refused: self-approval). AI reviewer: Claude. Reviewed {A}."),
+                                  ("bot", f"P3: an APPROVED comment naming {B} is not a formal approval")])
+        self.assertEqual(notes, {("bot", A)})
 
 
 class Init(unittest.TestCase):

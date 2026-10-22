@@ -66,7 +66,7 @@ SEARCH = """query($q: String!, $after: String) {
 }"""
 ACTIVITY = """query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-    headRefOid state updatedAt
+    headRefOid state updatedAt author { login }
     comments(last: 100) { nodes { author { login } createdAt body } }
     reviews(last: 100) { nodes { author { login } submittedAt state body commit { oid } } }
     reviewThreads(last: 100) { nodes { isResolved
@@ -182,9 +182,9 @@ def login(author):
 
 def activity_since(url, since):
     """The PR as settle needs it: current head and last-activity time; `authors`, who posted
-    a human comment, review or reply after `since`; `approvers`, who approved the current head
-    (a formal approval at it, or an APPROVED post after `since` where a formal one is impossible);
-    `threads`, who opened each thread still unresolved."""
+    a human comment, review or reply after `since`; `approved_at`, (who, sha) for each formal
+    approval; `noted_at`, (who, sha) for each APPROVED verdict note; `author`, the PR's author;
+    `threads`, who opened each thread still unresolved. `covered` decides which of them count."""
     m = GH_PR.match(url)
     if m:
         owner, name = m[1].split("/")
@@ -198,30 +198,34 @@ def activity_since(url, since):
         recent = [(who, body) for who, at, body in posts if parse_time(at) > since]
         approved_at = {(login(r["author"]), (r.get("commit") or {}).get("oid")) for r in pr["reviews"]["nodes"]
                        if r.get("state") == "APPROVED"}
-        approvers = {who for who, oid in approved_at if oid == head}
-        approvers |= {who for who, body in recent if "APPROVED" in body}
-        # An APPROVED post naming a sha, for hosts where a formal approval is impossible.
-        approved_at |= {(who, sha) for who, _, body in posts if "APPROVED" in body
-                        for sha in re.findall(r"\b[0-9a-f]{7,40}\b", body)}
+        noted_at = verdict_notes((login(c["author"]), c.get("body")) for c in pr["comments"]["nodes"])
         threads = [login(t["first"]["nodes"][0]["author"]) for t in pr["reviewThreads"]["nodes"]
                    if not t["isResolved"] and t["first"]["nodes"]]
         return {"head": head, "updated": pr["updatedAt"], "authors": {w for w, _ in recent},
-                "approvers": approvers, "approved_at": approved_at, "threads": set(threads)}
+                "approved_at": approved_at, "noted_at": noted_at,
+                "author": login(pr.get("author")), "threads": set(threads)}
     m = GL_MR.match(url)
     if m:
         base = f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}"
         mr = glab_api(m[1], base)
         notes = glab_api(m[1], f"{base}/notes?sort=desc&order_by=created_at&per_page=100")
         recent = [n for n in notes if not n.get("system") and parse_time(n["created_at"]) > since]
-        approvers = {n["author"]["username"] for n in recent if "APPROVED" in (n.get("body") or "")}
-        approvers |= {u["user"]["username"] for u in (glab_api(m[1], f"{base}/approvals").get("approved_by") or [])}
-        approved_at = {(n["author"]["username"], sha) for n in notes if not n.get("system") and "APPROVED" in (n.get("body") or "")
-                       for sha in re.findall(r"\b[0-9a-f]{7,40}\b", n["body"])}
+        # Approvals carry no sha here and may be stale after a push: only verdict notes say which head.
+        noted_at = verdict_notes((n["author"]["username"], n.get("body")) for n in notes
+                                 if not n.get("system") and n.get("type") is None)
         threads = {d["notes"][0]["author"]["username"] for d in glab_paged(m[1], f"{base}/discussions")
                    if d["notes"] and d["notes"][0].get("resolvable") and not d["notes"][0].get("resolved")}
         return {"head": mr["sha"], "updated": mr["updated_at"], "authors": {n["author"]["username"] for n in recent},
-                "approvers": approvers, "approved_at": approved_at, "threads": threads}
+                "approved_at": set(), "noted_at": noted_at, "author": None,
+                "notes_approve": True, "threads": threads}
     raise ScanError(f"not a PR or MR URL: {url}")
+
+
+def verdict_notes(posts):
+    """(author, sha) for each top-level verdict note: a post that starts with APPROVED and names
+    the head it approves, as review-pr writes one. A mention of the word elsewhere is not one."""
+    return {(who, sha) for who, body in posts if (body or "").lstrip().startswith("APPROVED")
+            for sha in re.findall(r"\b[0-9a-f]{7,40}\b", body)}
 
 
 def write_json(path, obj):
@@ -509,7 +513,7 @@ def settle(w, a, pr):
     if others:
         print(f"refused: {', '.join(others)} posted after {a.since}; the next tick reviews it")
         return 4
-    if a.verdict == "approved" and not pr["approvers"] & own and not covered(pr, own, a.covered_by):
+    if a.verdict == "approved" and not covered(pr, own, a.head) and not covered(pr, own, a.covered_by):
         print(f"refused: no approval of ours covers {a.head[:12]}"
               + (f" or {a.covered_by[:12]}" if a.covered_by else "") + "; post it, then settle again")
         return 6
@@ -543,11 +547,21 @@ def settle(w, a, pr):
 
 
 def covered(pr, own, sha):
-    """An approval of ours at `sha`, an earlier head whose approval review-pr says still covers this one."""
+    """Whether an approval of ours exists at `sha`: the head itself, or the earlier head the run
+    says still covers this one.
+
+    This is a gate against a run forgetting the verdict, not a check of the covering rule: whether
+    the changes since `sha` stay inside review-pr's *Only a formal approval covers a head* is the
+    run's judgement, and settle takes its word for it. Only a formal approval counts, except where
+    a formal one is impossible (GitLab, whose hosts may forbid it, and a GitHub PR authored by one
+    of our accounts), where an APPROVED post naming the sha stands in for it."""
     if not sha:
         return False
+    entries = set(pr.get("approved_at", ()))
+    if pr.get("notes_approve") or pr.get("author") in own:
+        entries |= set(pr.get("noted_at", ()))
     return any(who in own and oid and (oid.startswith(sha) or sha.startswith(oid)) and len(min(oid, sha, key=len)) >= 7
-               for who, oid in pr.get("approved_at", ()))
+               for who, oid in entries)
 
 
 def covers(spec, url):
@@ -679,7 +693,8 @@ def main(argv=None):
     s.add_argument("--verdict", required=True, choices=["approved", "findings", "outside-filter"],
                    help="what the run left: an approval at the head, open threads of ours, or a PR outside the filter")
     s.add_argument("--covered-by", help="with --verdict approved: the earlier head whose approval of ours still "
-                   "covers this one under review-pr's covering rule")
+                   "covers this one under review-pr's covering rule; settle checks the approval exists, "
+                   "the covering judgement is the run's")
     s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
     s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
     n = sub.add_parser("nudge")
