@@ -5,7 +5,7 @@
                    --own LOGIN... [--max-parallel N] [--dormant-days N]
   review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
-                     [--weighed THREAD]... [--recheck PR_URL]...
+                     [--covered-by SHA] [--weighed THREAD]... [--recheck PR_URL]...
   review-scan nudge <pr-url> --head SHA
   review-scan status <watch>
   review-scan install <watch> [--interval SECONDS]
@@ -196,13 +196,17 @@ def activity_since(url, since):
         posts += [(login(c["author"]), c["createdAt"], c.get("body") or "")
                   for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
         recent = [(who, body) for who, at, body in posts if parse_time(at) > since]
-        approvers = {login(r["author"]) for r in pr["reviews"]["nodes"]
-                     if r.get("state") == "APPROVED" and (r.get("commit") or {}).get("oid") == head}
+        approved_at = {(login(r["author"]), (r.get("commit") or {}).get("oid")) for r in pr["reviews"]["nodes"]
+                       if r.get("state") == "APPROVED"}
+        approvers = {who for who, oid in approved_at if oid == head}
         approvers |= {who for who, body in recent if "APPROVED" in body}
+        # An APPROVED post naming a sha, for hosts where a formal approval is impossible.
+        approved_at |= {(who, sha) for who, _, body in posts if "APPROVED" in body
+                        for sha in re.findall(r"\b[0-9a-f]{7,40}\b", body)}
         threads = [login(t["first"]["nodes"][0]["author"]) for t in pr["reviewThreads"]["nodes"]
                    if not t["isResolved"] and t["first"]["nodes"]]
         return {"head": head, "updated": pr["updatedAt"], "authors": {w for w, _ in recent},
-                "approvers": approvers, "threads": set(threads)}
+                "approvers": approvers, "approved_at": approved_at, "threads": set(threads)}
     m = GL_MR.match(url)
     if m:
         base = f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}"
@@ -211,10 +215,12 @@ def activity_since(url, since):
         recent = [n for n in notes if not n.get("system") and parse_time(n["created_at"]) > since]
         approvers = {n["author"]["username"] for n in recent if "APPROVED" in (n.get("body") or "")}
         approvers |= {u["user"]["username"] for u in (glab_api(m[1], f"{base}/approvals").get("approved_by") or [])}
+        approved_at = {(n["author"]["username"], sha) for n in notes if not n.get("system") and "APPROVED" in (n.get("body") or "")
+                       for sha in re.findall(r"\b[0-9a-f]{7,40}\b", n["body"])}
         threads = {d["notes"][0]["author"]["username"] for d in glab_paged(m[1], f"{base}/discussions")
                    if d["notes"] and d["notes"][0].get("resolvable") and not d["notes"][0].get("resolved")}
         return {"head": mr["sha"], "updated": mr["updated_at"], "authors": {n["author"]["username"] for n in recent},
-                "approvers": approvers, "threads": threads}
+                "approvers": approvers, "approved_at": approved_at, "threads": threads}
     raise ScanError(f"not a PR or MR URL: {url}")
 
 
@@ -462,7 +468,8 @@ def build_brief(w, r, rec, reason, siblings, now):
         lines += [f"- {s['url']} — {s['title']} (`{s['branch']}` → `{s['base']}`, head `{s['head'][:12]}`)" for s in siblings[:60]]
     lines += ["", "End with:",
               f"  ~/.claude/bin/review-scan settle {w.name} {r['url']} --head <the head you reviewed> --since {iso(now)} \\",
-              "    --verdict approved|findings|outside-filter [--weighed <thread url>]... [--recheck <sibling PR url>]...",
+              "    --verdict approved|findings|outside-filter [--covered-by <approved earlier head>] \\",
+              "    [--weighed <thread url>]... [--recheck <sibling PR url>]...",
               "If it exits 6, the PR does not show that verdict yet: post it, then settle again.",
               "If it exits 3 or 4, stop without settling: the next tick picks the PR up again."]
     return "\n".join(lines) + "\n"
@@ -494,9 +501,6 @@ def cmd_settle(a):
 
 def settle(w, a, pr):
     rec = w.prs.setdefault(a.url, {})
-    for sib in a.recheck or []:
-        w.prs.setdefault(sib, {}).setdefault("recheck", []).append(f"sibling {a.url} changed")
-    w.save()
     own = set(w.config["own"])
     if pr["head"] != a.head:
         print(f"refused: head is now {pr['head']}, not {a.head}; the next tick reviews it")
@@ -505,8 +509,9 @@ def settle(w, a, pr):
     if others:
         print(f"refused: {', '.join(others)} posted after {a.since}; the next tick reviews it")
         return 4
-    if a.verdict == "approved" and not pr["approvers"] & own:
-        print(f"refused: no approval of ours covers {a.head[:12]}; post it, then settle again")
+    if a.verdict == "approved" and not pr["approvers"] & own and not covered(pr, own, a.covered_by):
+        print(f"refused: no approval of ours covers {a.head[:12]}"
+              + (f" or {a.covered_by[:12]}" if a.covered_by else "") + "; post it, then settle again")
         return 6
     if a.verdict == "findings" and not pr["threads"] & own:
         print("refused: no open thread of ours on the PR; post the findings, then settle again")
@@ -522,12 +527,27 @@ def settle(w, a, pr):
         rec["recheck"] = left
     else:
         rec.pop("recheck", None)
+    # Registered only once the settle passes, and once each: a retried settle must not
+    # leave the sibling a second copy that outlives its next run.
+    for sib in a.recheck or []:
+        entries = w.prs.setdefault(sib, {}).setdefault("recheck", [])
+        entry = f"sibling {a.url} changed"
+        if entry not in entries:
+            entries.append(entry)
     rec["settled"] = {"head": pr["head"], "updated": pr["updated"], "at": iso(now_utc()),
                       "verdict": a.verdict, "weighed": a.weighed or []}
     w.save()
     w.log(f"{a.url}: settled at {pr['head'][:12]} ({a.verdict})")
     print(f"settled {a.url} at {pr['head']}")
     return 0
+
+
+def covered(pr, own, sha):
+    """An approval of ours at `sha`, an earlier head whose approval review-pr says still covers this one."""
+    if not sha:
+        return False
+    return any(who in own and oid and (oid.startswith(sha) or sha.startswith(oid)) and len(min(oid, sha, key=len)) >= 7
+               for who, oid in pr.get("approved_at", ()))
 
 
 def covers(spec, url):
@@ -592,7 +612,9 @@ def cmd_install(a):
     exe = Path(sys.argv[0]).resolve()
     script = f"exec {shlex.quote(str(exe))} tick {shlex.quote(w.name)}"
     if sys.platform != "darwin":
-        print(f"not macOS: add this crontab line instead:\n*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)}")
+        log = shlex.quote(str(w.dir / "cron.log"))
+        print("not macOS: add this crontab line instead; problems land in the log it names and in `status`:\n"
+              f"*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)} >> {log} 2>&1")
         return 0
     plist = plist_path(w.name)
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -656,6 +678,8 @@ def main(argv=None):
     s.add_argument("--since", required=True)
     s.add_argument("--verdict", required=True, choices=["approved", "findings", "outside-filter"],
                    help="what the run left: an approval at the head, open threads of ours, or a PR outside the filter")
+    s.add_argument("--covered-by", help="with --verdict approved: the earlier head whose approval of ours still "
+                   "covers this one under review-pr's covering rule")
     s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
     s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
     n = sub.add_parser("nudge")

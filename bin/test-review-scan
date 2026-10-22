@@ -33,9 +33,9 @@ PR2 = "https://github.com/acme/app/pull/2"
 RECENT = "2026-10-23T10:00:00Z"
 
 
-def act(head=A, updated=RECENT, authors=(), approvers=("review-bot",), threads=()):
+def act(head=A, updated=RECENT, authors=(), approvers=("review-bot",), threads=(), approved_at=()):
     return {"head": head, "updated": updated, "authors": set(authors), "approvers": set(approvers),
-            "threads": set(threads)}
+            "threads": set(threads), "approved_at": set(approved_at)}
 
 
 SINCE = ["--since", "2026-10-23T11:00:00Z", "--verdict", "approved"]
@@ -215,6 +215,26 @@ class Settle(Base):
                            "--verdict", "findings")
         self.assertEqual(code, 0)
         self.assertNotIn("settled", self.prs()[PR2])
+
+    def test_an_approval_of_an_earlier_covering_head_settles(self):
+        self.activity[PR1] = act(head=B, approvers=(), approved_at={("review-bot", A)})
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE)
+        self.assertEqual(code, 6)
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)
+        self.activity[PR2] = act(head=B, approvers=(), approved_at={("someone-else", A)})
+        code, _ = self.cli("settle", self.watch, PR2, "--head", B, *SINCE, "--covered-by", A)
+        self.assertEqual(code, 6)
+
+    def test_sibling_recheck_registers_once_and_only_on_success(self):
+        self.activity[PR1] = act(approvers=())
+        code, _ = self.cli("settle", self.watch, PR1, "--head", A, *SINCE, "--recheck", PR2)
+        self.assertEqual(code, 6)
+        self.assertNotIn("recheck", self.prs()[PR2])
+        self.activity[PR1] = act()
+        self.cli("settle", self.watch, PR1, "--head", A, *SINCE, "--recheck", PR2)
+        self.cli("settle", self.watch, PR1, "--head", A, *SINCE, "--recheck", PR2)
+        self.assertEqual(len(self.prs()[PR2]["recheck"]), 1)
 
     def test_rechecks_survive_a_failed_run_and_clear_on_settle(self):
         self.activity[PR1] = act()
