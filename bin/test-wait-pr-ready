@@ -550,7 +550,10 @@ class Loop(unittest.TestCase):
         ok = run({"src/a.rs": [(39, 41)]})
         self.assertTrue(ok[0], ok[1])
         self.assertIn("change only its findings' lines", ok[1][0])
-        self.assertTrue(run({"src/a.rs": [(44, 44)]})[0], "within the slack")
+        self.assertTrue(run({"src/a.rs": [(45, 45)]})[0], "within the slack")
+        self.assertFalse(run({"src/a.rs": [(46, 46)]})[0], "past the slack")
+        self.assertFalse(run({"src/a.rs": [(37, 400)]})[0], "starts at the finding and runs past it")
+        self.assertFalse(run({"src/a.rs": [(1, 600)]})[0], "the whole file")
         self.assertFalse(run({"src/a.rs": [(39, 41), (300, 320)]})[0], "same file, unrelated lines")
         self.assertFalse(run({"src/a.rs": [(40, 40)], "src/b.rs": [(1, 2)]})[0], "another file")
         self.assertFalse(run(None)[0], "an unreadable compare")
@@ -558,10 +561,11 @@ class Loop(unittest.TestCase):
 
     def test_hunk_ranges_are_read_on_the_old_side(self):
         original = w.gh
-        patch = "@@ -10,3 +10,4 @@ fn a()\n a\n+b\n@@ -50,0 +52,2 @@\n+c\n+d"
+        # Context lines don't count: only the changed runs, at their old-side lines.
+        patch = "@@ -10,7 +10,7 @@ fn a()\n a\n b\n c\n-d\n+D\n e\n f\n g\n@@ -50,0 +51,2 @@\n+x\n+y\n@@ -80,3 +81,1 @@\n-p\n-q\n r"
         w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "src/a.rs", "patch": patch}]), "")
         try:
-            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(10, 12), (50, 50)]})
+            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(13, 13), (50, 50), (80, 81)]})
             w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "big.bin"}]), "")
             self.assertIsNone(w.changed_hunks("o", "n", OLD, HEAD))
         finally:

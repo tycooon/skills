@@ -183,11 +183,39 @@ def read_pr(owner, name, number):
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? ")
 
 
+def changed_spans(patch):
+    """The runs of changed lines in a unified diff, as (first, last) on the old
+    side, without the context lines around them."""
+    spans, run, old = [], None, 0
+    for line in patch.splitlines():
+        m = HUNK.match(line)
+        if m:
+            if run:
+                spans.append(run)
+            run, old = None, int(m.group(1))
+            continue
+        if line[:1] == "-":
+            run = (run[0], old) if run else (old, old)
+            old += 1
+        elif line[:1] == "+":
+            # An addition joins the run it follows (a replacement), or else sits
+            # at the old line it goes before.
+            run = run or (old, old)
+        elif line[:1] == " ":
+            if run:
+                spans.append(run)
+            run = None
+            old += 1
+    if run:
+        spans.append(run)
+    return spans
+
+
 def changed_hunks(owner, name, old, new):
-    """Each changed file's hunks between two commits, as line ranges on old's side:
-    {path: [(first, last)]}. None when the compare fails or a file has no patch
-    to read (binary, or too large for the API), since then nothing proves the
-    change is small."""
+    """Each changed file's runs of changed lines between two commits, on old's
+    side: {path: [(first, last)]}. None when the compare fails or a file has no
+    patch to read (binary, or too large for the API), since then nothing proves
+    the change is small."""
     r = gh(["api", f"repos/{owner}/{name}/compare/{old}...{new}", "--jq", "[.files[] | {filename, patch}]"])
     if r.returncode != 0:
         return None
@@ -195,11 +223,7 @@ def changed_hunks(owner, name, old, new):
     for f in json.loads(r.stdout):
         if not f.get("patch"):
             return None
-        for line in f["patch"].splitlines():
-            m = HUNK.match(line)
-            if m:
-                start, length = int(m.group(1)), int(m.group(2) or 1)
-                hunks.setdefault(f["filename"], []).append((start, start + max(length, 1) - 1))
+        hunks[f["filename"]] = changed_spans(f["patch"])
     return hunks
 
 
@@ -484,9 +508,9 @@ def finding_ranges(pr, sha, reviewers):
 
 
 def answers_findings(hunks, ranges):
-    """Whether every changed hunk overlaps one of the findings' line ranges."""
+    """Whether every run of changed lines sits inside one of the findings' line ranges."""
     return bool(hunks) and all(
-        any(lo <= last and first <= hi for lo, hi in ranges.get(path, []))
+        any(lo <= first and last <= hi for lo, hi in ranges.get(path, []))
         for path, spans in hunks.items() for first, last in spans
     )
 
@@ -503,7 +527,7 @@ def approval_state(pr, reviewers, same_authored_lines, hunks_between=None):
         if sha and same_authored_lines(sha, head, at):
             return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
         # An approval with non-blocking findings carries to the author's fix: commits
-        # after it whose every hunk sits on the lines those findings name.
+        # after it whose every changed line sits within those findings' lines.
         ranges = finding_ranges(pr, sha, reviewers) if sha and hunks_between else {}
         if ranges:
             hunks = hunks_between(sha, head)
