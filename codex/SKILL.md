@@ -52,7 +52,21 @@ When the user asks for the session on another machine, or your machine rules sen
 
 ## 1. Write the brief
 
-Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief carries only the task: the problem with its evidence, what done looks like, what is out of scope. It also tells Codex to:
+Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of git as [design-brainstorming](../design-brainstorming/SKILL.md) describes, so the user can open it. Codex follows the same global rules and has the same skills, so the brief doesn't repeat them. It carries the task: the problem with its evidence, what done looks like, what is out of scope.
+
+It also carries the implementation plan. The diagnosis and the design are yours, and Codex knows only what the brief tells it: whatever you found and leave out, Codex finds again or misses, and a miss comes back as a review round. Write down what you already know:
+
+- **Approach.** The change you decided on, at the level of the files, functions and types it touches, and the existing path it extends rather than a new one beside it.
+- **Code map.** The entry points and call paths you traced, with file paths, and every caller or consumer that must get the change. Where you haven't traced one, say so and ask Codex to.
+- **What stays the same.** Behaviour the change must not alter compared with the base branch, named one by one: an ordering, a fallback, a default, which component wins a choice. A change that quietly replaces one of these is the costliest kind of review finding.
+- **Where it runs and how often.** Which path the new code sits on (a latency-critical one, a background job, a request handler), the project rules that bind that path, such as no network or database calls on a hot path, and the volumes it sees: items per round, rounds per minute, rows per query.
+- **Failure modes.** The cases you know of and the answer you want for each: a timeout, a partial or stale result, a value missing, an input arriving late or out of order, a retry.
+- **Tests.** The cases that prove the change, each named by its input and expected result.
+- **Choices left to Codex.** What it may decide on its own, and what it must report in the PR for you or the user instead of deciding.
+
+Leave out what you haven't settled rather than guess: a wrong instruction costs more than a missing one. When a question needs more than the brief can answer, settle it before the launch; diagnosis isn't Codex's job.
+
+The brief also tells Codex to:
 
 - work in the worktree it starts in and on the branch it finds there, making no other worktree: step 2 cuts both from the latest `origin/<default>` for it, or from the PR it stacks on when the brief says so;
 - stop once its non-draft PR is open, with no babysit-pr and no waiting for a review, because you are the reviewer;
