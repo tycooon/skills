@@ -547,17 +547,26 @@ class Loop(unittest.TestCase):
         def run(hunks):
             return w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, hunks_between=lambda o, n: hunks)
 
-        ok = run({"src/a.rs": [(39, 41)]})
+        ok = run({"src/a.rs": [(39, 41, 3)]})
         self.assertTrue(ok[0], ok[1])
         self.assertIn("change only its findings' lines", ok[1][0])
-        self.assertTrue(run({"src/a.rs": [(45, 45)]})[0], "within the slack")
-        self.assertFalse(run({"src/a.rs": [(46, 46)]})[0], "past the slack")
-        self.assertFalse(run({"src/a.rs": [(37, 400)]})[0], "starts at the finding and runs past it")
-        self.assertFalse(run({"src/a.rs": [(1, 600)]})[0], "the whole file")
-        self.assertFalse(run({"src/a.rs": [(39, 41), (300, 320)]})[0], "same file, unrelated lines")
-        self.assertFalse(run({"src/a.rs": [(40, 40)], "src/b.rs": [(1, 2)]})[0], "another file")
+        self.assertTrue(run({"src/a.rs": [(45, 45, 0)]})[0], "within the slack")
+        self.assertFalse(run({"src/a.rs": [(46, 46, 0)]})[0], "past the slack")
+        self.assertFalse(run({"src/a.rs": [(37, 400, 0)]})[0], "starts at the finding and runs past it")
+        self.assertFalse(run({"src/a.rs": [(1, 600, 0)]})[0], "the whole file")
+        self.assertFalse(run({"src/a.rs": [(40, 40, 500)]})[0], "one line swapped for 500")
+        self.assertFalse(run({"src/a.rs": [(41, 41, 500)]})[0], "500 lines inserted beside it")
+        self.assertTrue(run({"src/a.rs": [(40, 40, 11)]})[0], "as many lines as the range holds")
+        self.assertFalse(run({"src/a.rs": [(39, 41, 3), (300, 320, 0)]})[0], "same file, unrelated lines")
+        self.assertFalse(run({"src/a.rs": [(40, 40, 1)], "src/b.rs": [(1, 2, 0)]})[0], "another file")
         self.assertFalse(run(None)[0], "an unreadable compare")
         self.assertFalse(run({})[0], "nothing changed is no fix")
+
+    def test_a_finding_on_a_removed_line_carries_nothing(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        left = {**finding_thread("R1", "src/a.rs", line=40), "diffSide": "LEFT"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [left]})
+        self.assertFalse(w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=lambda *_: False, hunks_between=lambda o, n: {"src/a.rs": [(40, 40, 1)]})[0])
 
     def test_hunk_ranges_are_read_on_the_old_side(self):
         original = w.gh
@@ -565,7 +574,7 @@ class Loop(unittest.TestCase):
         patch = "@@ -10,7 +10,7 @@ fn a()\n a\n b\n c\n-d\n+D\n e\n f\n g\n@@ -50,0 +51,2 @@\n+x\n+y\n@@ -80,3 +81,1 @@\n-p\n-q\n r"
         w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "src/a.rs", "patch": patch}]), "")
         try:
-            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(13, 13), (50, 50), (80, 81)]})
+            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(13, 13, 1), (50, 50, 2), (80, 81, 0)]})
             w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "big.bin"}]), "")
             self.assertIsNone(w.changed_hunks("o", "n", OLD, HEAD))
         finally:

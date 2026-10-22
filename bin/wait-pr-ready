@@ -111,6 +111,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           startLine
           originalLine
           originalStartLine
+          diffSide
           comments(first: 1) { nodes { author { login } pullRequestReview { id state } } }
           replies: comments(last: 1) { totalCount nodes { author { login } } }
         }
@@ -184,8 +185,9 @@ HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? ")
 
 
 def changed_spans(patch):
-    """The runs of changed lines in a unified diff, as (first, last) on the old
-    side, without the context lines around them."""
+    """The runs of changed lines in a unified diff, without the context lines around
+    them: (first, last, added), the run's lines on the old side and how many lines
+    it adds."""
     spans, run, old = [], None, 0
     for line in patch.splitlines():
         m = HUNK.match(line)
@@ -195,12 +197,13 @@ def changed_spans(patch):
             run, old = None, int(m.group(1))
             continue
         if line[:1] == "-":
-            run = (run[0], old) if run else (old, old)
+            run = (run[0], old, run[2]) if run else (old, old, 0)
             old += 1
         elif line[:1] == "+":
             # An addition joins the run it follows (a replacement), or else sits
             # at the old line it goes before.
-            run = run or (old, old)
+            first, last, added = run or (old, old, 0)
+            run = (first, last, added + 1)
         elif line[:1] == " ":
             if run:
                 spans.append(run)
@@ -499,6 +502,9 @@ def finding_ranges(pr, sha, reviewers):
     for t in pr["reviewThreads"]["nodes"]:
         if (thread_opener(t).get("pullRequestReview") or {}).get("id") not in ids or not t.get("path"):
             continue
+        # A finding on a removed line is numbered in the base's file, not the approved head's.
+        if t.get("diffSide") == "LEFT":
+            continue
         last = t.get("originalLine") or t.get("line")
         if not last:
             continue
@@ -508,10 +514,12 @@ def finding_ranges(pr, sha, reviewers):
 
 
 def answers_findings(hunks, ranges):
-    """Whether every run of changed lines sits inside one of the findings' line ranges."""
+    """Whether every run of changed lines sits inside one of the findings' line ranges,
+    adding no more lines than that range holds: a large insertion beside a nit is new
+    code, not its fix."""
     return bool(hunks) and all(
-        any(lo <= first and last <= hi for lo, hi in ranges.get(path, []))
-        for path, spans in hunks.items() for first, last in spans
+        any(lo <= first and last <= hi and added <= hi - lo + 1 for lo, hi in ranges.get(path, []))
+        for path, spans in hunks.items() for first, last, added in spans
     )
 
 
