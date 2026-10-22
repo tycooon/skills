@@ -57,7 +57,7 @@ Save it as `<working-dir>/.plans/YYYY-MM-DD-<topic>-codex-brief.md`, kept out of
 It also carries the implementation plan. The diagnosis and the design are yours, and Codex knows only what the brief tells it: whatever you found and leave out, Codex finds again or misses, and a miss comes back as a review round. Write down what you already know:
 
 - **Approach.** The change you decided on, at the level of the files, functions and types it touches, and the existing path it extends rather than a new one beside it.
-- **Code map.** The entry points and call paths you traced, with file paths, and every caller or consumer that must get the change. Where you haven't traced one, say so and ask Codex to.
+- **Code map.** The entry points and call paths you traced, with file paths relative to the repository root, and every caller or consumer that must get the change. Where you haven't traced one, say so and ask Codex to. An absolute path would point at your own checkout, not the worktree Codex runs in.
 - **What stays the same.** Behaviour the change must not alter compared with the base branch, named one by one: an ordering, a fallback, a default, which component wins a choice. A change that quietly replaces one of these is the costliest kind of review finding.
 - **Where it runs and how often.** Which path the new code sits on (a latency-critical one, a background job, a request handler), the project rules that bind that path, such as no network or database calls on a hot path, and the volumes it sees: items per round, rounds per minute, rows per query.
 - **Failure modes.** The cases you know of and the answer you want for each: a timeout, a partial or stale result, a value missing, an input arriving late or out of order, a retry.
@@ -69,6 +69,7 @@ Leave out what you haven't settled rather than guess: a wrong instruction costs 
 The brief also tells Codex to:
 
 - work in the worktree it starts in and on the branch it finds there, making no other worktree: step 2 cuts both from the latest `origin/<default>` for it, or from the PR it stacks on when the brief says so;
+- follow the code where it contradicts the plan (a caller the map missed, a function that isn't where the approach says, a behaviour to keep that the base branch doesn't have) and name each contradiction in its report block, so you review against the corrected plan;
 - stop once its non-draft PR is open, with no babysit-pr and no waiting for a review, because you are the reviewer;
 - not merge or deploy;
 - end its final message with a report block: PR URL, one-line summary, each command it ran with its result, anything the reviewer or the user must know or answer.
