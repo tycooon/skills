@@ -6,6 +6,7 @@ import copy
 import importlib.machinery
 import importlib.util
 import io
+import json
 import subprocess
 import sys
 import unittest
@@ -58,12 +59,13 @@ def ready_pr(**overrides):
     return pr
 
 
-def finding_thread(review_id, path, state="APPROVED", answered=True, opener="review-bot"):
-    """A thread a review opened; answered means the author replied after it."""
+def finding_thread(review_id, path, state="APPROVED", answered=True, opener="review-bot", line=40):
+    """A thread a review opened on `line`; answered means the author replied after it."""
     last = "author" if answered else opener
     return {
         "isResolved": False,
         "path": path,
+        "originalLine": line,
         "comments": {"nodes": [{"author": {"login": opener}, "pullRequestReview": {"id": review_id, "state": state}}]},
         "replies": {"totalCount": 2 if answered else 1, "nodes": [{"author": {"login": last}}]},
     }
@@ -537,16 +539,33 @@ class Loop(unittest.TestCase):
         thread = finding_thread("R1", "src/a.rs", state="COMMENTED")
         self.assertFalse(evaluate(ready_pr(reviewThreads={"totalCount": 1, "nodes": [thread]}, reviews={"totalCount": 2, "nodes": [findings, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}))[0])
 
-    def test_an_approval_with_findings_carries_to_a_fix_on_their_files(self):
+    def test_an_approval_with_findings_carries_only_to_a_fix_on_their_lines(self):
         approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
-        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs")]})
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", line=40)]})
         same = lambda *_: False
-        ok = w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: {"src/a.rs"})
+
+        def run(hunks):
+            return w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, hunks_between=lambda o, n: hunks)
+
+        ok = run({"src/a.rs": [(39, 41)]})
         self.assertTrue(ok[0], ok[1])
-        self.assertIn("touch only its findings' files", ok[1][0])
-        wider = w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: {"src/a.rs", "src/b.rs"})
-        self.assertFalse(wider[0])
-        self.assertFalse(w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=same, files_between=lambda o, n: None)[0])
+        self.assertIn("change only its findings' lines", ok[1][0])
+        self.assertTrue(run({"src/a.rs": [(44, 44)]})[0], "within the slack")
+        self.assertFalse(run({"src/a.rs": [(39, 41), (300, 320)]})[0], "same file, unrelated lines")
+        self.assertFalse(run({"src/a.rs": [(40, 40)], "src/b.rs": [(1, 2)]})[0], "another file")
+        self.assertFalse(run(None)[0], "an unreadable compare")
+        self.assertFalse(run({})[0], "nothing changed is no fix")
+
+    def test_hunk_ranges_are_read_on_the_old_side(self):
+        original = w.gh
+        patch = "@@ -10,3 +10,4 @@ fn a()\n a\n+b\n@@ -50,0 +52,2 @@\n+c\n+d"
+        w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "src/a.rs", "patch": patch}]), "")
+        try:
+            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(10, 12), (50, 50)]})
+            w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "big.bin"}]), "")
+            self.assertIsNone(w.changed_hunks("o", "n", OLD, HEAD))
+        finally:
+            w.gh = original
 
     def test_listed_reviewer_matches_case_and_bot_suffix(self):
         # GraphQL gives a GitHub App bot's login without the [bot] suffix REST and gh show.

@@ -107,6 +107,10 @@ query($owner: String!, $name: String!, $number: Int!) {
         nodes {
           isResolved
           path
+          line
+          startLine
+          originalLine
+          originalStartLine
           comments(first: 1) { nodes { author { login } pullRequestReview { id state } } }
           replies: comments(last: 1) { totalCount nodes { author { login } } }
         }
@@ -176,12 +180,27 @@ def read_pr(owner, name, number):
     return pr
 
 
-def changed_files(owner, name, old, new):
-    """The files that differ between two commits, or None when the compare fails."""
-    r = gh(["api", f"repos/{owner}/{name}/compare/{old}...{new}", "--jq", "[.files[].filename]"])
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? ")
+
+
+def changed_hunks(owner, name, old, new):
+    """Each changed file's hunks between two commits, as line ranges on old's side:
+    {path: [(first, last)]}. None when the compare fails or a file has no patch
+    to read (binary, or too large for the API), since then nothing proves the
+    change is small."""
+    r = gh(["api", f"repos/{owner}/{name}/compare/{old}...{new}", "--jq", "[.files[] | {filename, patch}]"])
     if r.returncode != 0:
         return None
-    return set(json.loads(r.stdout))
+    hunks = {}
+    for f in json.loads(r.stdout):
+        if not f.get("patch"):
+            return None
+        for line in f["patch"].splitlines():
+            m = HUNK.match(line)
+            if m:
+                start, length = int(m.group(1)), int(m.group(2) or 1)
+                hunks.setdefault(f["filename"], []).append((start, start + max(length, 1) - 1))
+    return hunks
 
 
 def authored_lines(owner, name, base, sha):
@@ -400,7 +419,7 @@ def verdicts(pr, reviewers):
     return list(newest.values())
 
 
-def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, files_between=None):
+def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
     """Whether the posts not in `seen` leave the session nothing to do.
 
     That holds when each is an AI reviewer's go verdict or a thread reply, the
@@ -430,7 +449,7 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, files_bet
         for _, a, b, _, st, _ in fresh
     ):
         return True
-    if not approval_state(pr, reviewers, same_authored_lines, files_between)[0]:
+    if not approval_state(pr, reviewers, same_authored_lines, hunks_between)[0]:
         return False
     for key, author, body, _, state, _ in posts(pr):
         if key in seen or is_thread_reply(body, state):
@@ -440,17 +459,39 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, files_bet
     return True
 
 
-def finding_paths(pr, sha, reviewers):
-    """The files a listed or identity-line reviewer's formal approval of `sha` left findings on."""
+# How far a fix may reach past the lines its finding names and still answer it.
+FINDING_SLACK = 5
+
+
+def finding_ranges(pr, sha, reviewers):
+    """The lines a listed or identity-line reviewer's formal approval of `sha` left
+    findings on, as {path: [(first, last)]} on sha's side of the diff."""
     ids = {
         r["id"] for r in pr["reviews"]["nodes"]
         if r.get("id") and r["state"] == "APPROVED" and (r.get("commit") or {}).get("oid") == sha
         and counts_as_verdict(r["author"], r["body"] or "", reviewers)
     }
-    return {t["path"] for t in pr["reviewThreads"]["nodes"] if (thread_opener(t).get("pullRequestReview") or {}).get("id") in ids and t.get("path")}
+    ranges = {}
+    for t in pr["reviewThreads"]["nodes"]:
+        if (thread_opener(t).get("pullRequestReview") or {}).get("id") not in ids or not t.get("path"):
+            continue
+        last = t.get("originalLine") or t.get("line")
+        if not last:
+            continue
+        first = t.get("originalStartLine") or t.get("startLine") or last
+        ranges.setdefault(t["path"], []).append((first - FINDING_SLACK, last + FINDING_SLACK))
+    return ranges
 
 
-def approval_state(pr, reviewers, same_authored_lines, files_between=None):
+def answers_findings(hunks, ranges):
+    """Whether every changed hunk overlaps one of the findings' line ranges."""
+    return bool(hunks) and all(
+        any(lo <= last and first <= hi for lo, hi in ranges.get(path, []))
+        for path, spans in hunks.items() for first, last in spans
+    )
+
+
+def approval_state(pr, reviewers, same_authored_lines, hunks_between=None):
     head = pr["headRefOid"]
     head_date = ts(pr["commits"]["nodes"][0]["commit"]["committedDate"]) if pr["commits"]["nodes"] else 0
     found = verdicts(pr, reviewers)
@@ -462,12 +503,12 @@ def approval_state(pr, reviewers, same_authored_lines, files_between=None):
         if sha and same_authored_lines(sha, head, at):
             return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
         # An approval with non-blocking findings carries to the author's fix: commits
-        # after it that touch only the files those findings are on.
-        paths = finding_paths(pr, sha, reviewers) if sha and files_between else set()
-        if paths:
-            changed = files_between(sha, head)
-            if changed is not None and changed <= paths:
-                return True, f"approved by {login} on {sha[:12]}; later commits touch only its findings' files"
+        # after it whose every hunk sits on the lines those findings name.
+        ranges = finding_ranges(pr, sha, reviewers) if sha and hunks_between else {}
+        if ranges:
+            hunks = hunks_between(sha, head)
+            if hunks is not None and answers_findings(hunks, ranges):
+                return True, f"approved by {login} on {sha[:12]}; later commits change only its findings' lines"
     reason = "no AI reviewer verdict yet" if not found else "no AI reviewer approval covering " + head[:12]
     unlisted = sorted({
         a["login"] for _, a, _, _, st, commit in posts(pr)
@@ -478,10 +519,10 @@ def approval_state(pr, reviewers, same_authored_lines, files_between=None):
     return False, reason
 
 
-def evaluate(pr, *, no_ci, reviewers, same_authored_lines, files_between=None):
+def evaluate(pr, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
     """Returns (ready, reasons) for one read of the PR."""
     gates = [
-        approval_state(pr, reviewers, same_authored_lines, files_between),
+        approval_state(pr, reviewers, same_authored_lines, hunks_between),
         checks_state(pr, no_ci),
     ]
     unresolved = blocking_threads(pr)
@@ -607,11 +648,11 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             "no_ci": without_checks(pr, head),
             "reviewers": {login_key(r) for r in args.reviewer},
             "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at),
-            "files_between": lambda o, n: changed_files(owner, name, o, n),
+            "hunks_between": lambda o, n: changed_hunks(owner, name, o, n),
         }
         ready, reasons = evaluate(pr, **gates)
         state["checks_only"] = not ready and approval_state(
-            pr, gates["reviewers"], gates["same_authored_lines"], gates["files_between"]
+            pr, gates["reviewers"], gates["same_authored_lines"], gates["hunks_between"]
         )[0] and blocking_threads(pr) == 0 and has_checks(pr) and checks_still_running(pr)
         runs_failed = []
         if ready and not args.no_ci:
