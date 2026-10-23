@@ -520,6 +520,32 @@ class Loop(unittest.TestCase):
         self.assertEqual(code, 12)
         self.assertEqual(len(waits), 2)
 
+    def test_until_review_exits_on_a_listed_verdict_already_on_the_head(self):
+        # The verdict landed before the waiter was armed, and --after was taken at arming time.
+        approved = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:05:00Z")]})
+        code, out, waits = self.run_main([approved], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"])
+        self.assertEqual(code, 14, out)
+        self.assertIn("review-bot's verdict is already on", out)
+        self.assertEqual(waits, [])
+
+    def test_until_review_keeps_waiting_on_a_listed_verdict_for_an_older_head(self):
+        old = "d" * 40
+        stale = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {old}.", sha=old)]})
+        newer = copy.deepcopy(stale)
+        newer["reviews"]["totalCount"] = 2
+        newer["reviews"]["nodes"].append(review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z"))
+        code, _, waits = self.run_main([stale, stale, newer], args=["--until-review", "--reviewer", "review-bot"])
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_ignores_an_unlisted_verdict_already_on_the_head(self):
+        handoff = review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (Codex handoff). Reviewed {HEAD}.", at="2026-10-15T10:05:00Z")
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [handoff]})
+        more = ready_pr(reviews={"totalCount": 2, "nodes": [handoff, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z")]})
+        code, _, waits = self.run_main([pr, pr, more], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"])
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
+
     def test_until_review_still_exits_on_head_change(self):
         moved = ready_pr(headRefOid="c" * 40)
         self.assertEqual(self.run_main([ready_pr(), moved], args=["--until-review"])[0], 12)
