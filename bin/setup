@@ -13,7 +13,8 @@
 # It also installs bin/claude-memory into ~/.claude/bin and registers its hook:
 # on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
 # setup script) the SessionStart pull. bin/wait-pr-ready, which babysit-pr,
-# release and codex run as a background waiter, goes into ~/.claude/bin as well.
+# release and codex run as a background waiter, goes into ~/.claude/bin as well,
+# and so does bin/review-scan, review-open-prs' scheduled scanner.
 
 set -euo pipefail
 shopt -s nullglob
@@ -84,6 +85,7 @@ memory="$HOME/.claude/bin/claude-memory"
 mkdir -p "$(dirname "$memory")"
 install -m 0755 "$repo_root/bin/claude-memory" "$memory"
 install -m 0755 "$repo_root/bin/wait-pr-ready" "$(dirname "$memory")/wait-pr-ready"
+install -m 0755 "$repo_root/bin/review-scan" "$(dirname "$memory")/review-scan"
 if $cloud; then
   "$memory" hooks --cloud
   echo "Registered the memory pull hook."

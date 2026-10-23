@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Drive a review-open-prs watch without a long-running agent session.
+
+  review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--reviewer-model MODEL] [--effort LEVEL]
+                   --own LOGIN... [--max-parallel N] [--dormant-days N]
+  review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
+  review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
+                     [--covered-by SHA] [--weighed THREAD]... [--recheck PR_URL]...
+  review-scan nudge <pr-url> --head SHA
+  review-scan status <watch>
+  review-scan install <watch> [--interval SECONDS]
+  review-scan uninstall <watch>
+
+A tick lists every open PR of the watch's targets in one cheap call per target and
+starts a fresh `claude -p` run, on the watch's reviewer model, for each PR that changed
+since a run last settled it: a new head, new activity, or a recheck someone asked for.
+A PR that has not changed costs nothing: no agent runs. The run follows review-open-prs'
+*One run reviews one PR* and ends with `settle`, which records the PR's state only when
+nothing but our own posts landed while the run was working, and only once the PR shows
+the verdict the run claims: an approval of ours at the head, or an open thread of ours.
+
+A watch never stops on its own. A tick sends a desktop notification when it can read none
+of the targets, when a review run fails to start, and when nothing is left to watch;
+`status` shows the same problem until it clears.
+
+Targets: GitHub `owner/repo`, `owner` (every repo of an org or user) or a PR URL;
+GitLab `gitlab:HOST/group[/subgroup]`, `gitlab:HOST/group/project!` (a single project:
+note the trailing `!`) or an MR URL. A PR named by URL is reviewed even as a draft or
+dormant, and leaves the watch once merged or closed.
+
+State lives in $REVIEW_SCAN_HOME (default ~/.local/state/review-open-prs)/<watch>/.
+
+Exit codes: 0 success; 2 bad usage; 3 settle refused because the head moved;
+4 settle refused because someone else commented after --since; 5 a target could not
+be read or a run could not start (the tick still handled the others); 6 settle refused
+because the PR does not show the claimed verdict.
+"""
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from pathlib import Path
+
+HOME = Path(os.environ.get("REVIEW_SCAN_HOME", "~/.local/state/review-open-prs")).expanduser()
+GH_PR = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+GL_MR = re.compile(r"^https://([^/]+)/(.+?)/-/merge_requests/(\d+)/?$")
+SEARCH = """query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    issueCount
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { url number title isDraft headRefOid updatedAt state
+      baseRefName headRefName author { login } repository { nameWithOwner } } }
+  }
+}"""
+ACTIVITY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    headRefOid state updatedAt author { login }
+    comments(last: 100) { nodes { author { login } createdAt body } }
+    reviews(last: 100) { nodes { author { login } submittedAt state body commit { oid } } }
+    reviewThreads(last: 100) { nodes { isResolved
+      first: comments(first: 1) { nodes { author { login } } }
+      comments(last: 50) { nodes { author { login } createdAt body } } } }
+  } }
+}"""
+
+
+class ScanError(RuntimeError):
+    pass
+
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+# --- host access (replaced in tests) ------------------------------------------------
+
+def run_json(cmd, timeout=120):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise ScanError(f"{shlex.join(cmd[:4])}…: {(p.stderr or p.stdout).strip()[:300]}")
+    return json.loads(p.stdout or "null")
+
+
+def gh_graphql(query, **variables):
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is not None:
+            cmd += ["-F" if isinstance(v, int) else "-f", f"{k}={v}"]
+    return run_json(cmd)["data"]
+
+
+def gh_rest(path):
+    return run_json(["gh", "api", path])
+
+
+def glab_api(host, path):
+    return run_json(["glab", "api", "--hostname", host, path])
+
+
+def glab_paged(host, path):
+    out, page = [], 1
+    sep = "&" if "?" in path else "?"
+    while True:
+        rows = glab_api(host, f"{path}{sep}per_page=100&page={page}")
+        out += rows
+        if len(rows) < 100:
+            return out
+        page += 1
+
+
+# --- listing -----------------------------------------------------------------------
+
+def pr_row(url, head, updated, draft, title, base, branch, author, state="open", named=False):
+    return {"url": url, "head": head, "updated": updated, "draft": bool(draft), "title": title,
+            "base": base, "branch": branch, "author": author, "state": state, "named": named}
+
+
+def list_target(spec):
+    """Every open PR of one target, as pr_row dicts. Raises ScanError when unreadable."""
+    m = GH_PR.match(spec)
+    if m:
+        pr = gh_rest(f"repos/{m[1]}/pulls/{m[2]}")
+        state = "merged" if pr.get("merged_at") else pr["state"]
+        return [pr_row(pr["html_url"], pr["head"]["sha"], pr["updated_at"], pr.get("draft"), pr["title"],
+                       pr["base"]["ref"], pr["head"]["ref"], pr["user"]["login"], state, named=True)]
+    m = GL_MR.match(spec)
+    if m:
+        mr = glab_api(m[1], f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}")
+        return [gl_row(mr, named=True)]
+    if spec.startswith("gitlab:"):
+        host, _, path = spec[len("gitlab:"):].partition("/")
+        if path.endswith("!"):
+            api = f"projects/{urllib.parse.quote(path[:-1], safe='')}/merge_requests?state=opened"
+        else:
+            api = f"groups/{urllib.parse.quote(path, safe='')}/merge_requests?state=opened&include_subgroups=true"
+        return [gl_row(mr) for mr in glab_paged(host, api)]
+    if "/" in spec:
+        qualifier = f"repo:{spec}"
+    else:  # search wants org: for an organisation and user: for a personal account
+        qualifier = ("org:" if gh_rest(f"users/{spec}").get("type") == "Organization" else "user:") + spec
+    rows, after = [], None
+    while True:
+        res = gh_graphql(SEARCH, q=f"is:pr is:open archived:false {qualifier}", after=after)["search"]
+        rows += [pr_row(n["url"], n["headRefOid"], n["updatedAt"], n["isDraft"], n["title"], n["baseRefName"],
+                        n["headRefName"], (n.get("author") or {}).get("login")) for n in res["nodes"] if n]
+        if not res["pageInfo"]["hasNextPage"]:
+            if len(rows) < res["issueCount"]:
+                raise ScanError(f"{spec}: search returned {len(rows)} of {res['issueCount']} open PRs")
+            return rows
+        after = res["pageInfo"]["endCursor"]
+
+
+def gl_row(mr, named=False):
+    return pr_row(mr["web_url"], mr["sha"], mr["updated_at"], mr.get("draft") or mr.get("work_in_progress"),
+                  mr["title"], mr["target_branch"], mr["source_branch"], (mr.get("author") or {}).get("username"),
+                  {"opened": "open"}.get(mr["state"], mr["state"]), named)
+
+
+def login(author):
+    return (author or {}).get("login")
+
+
+def activity_since(url, since):
+    """The PR as settle needs it: current head and last-activity time; `authors`, who posted
+    a human comment, review or reply after `since`; `approved_at`, (who, sha) for each formal
+    approval; `noted_at`, (who, sha) for each APPROVED verdict note; `author`, the PR's author;
+    `threads`, who opened each thread still unresolved. `covered` decides which of them count."""
+    m = GH_PR.match(url)
+    if m:
+        owner, name = m[1].split("/")
+        pr = gh_graphql(ACTIVITY, owner=owner, name=name, number=int(m[2]))["repository"]["pullRequest"]
+        head = pr["headRefOid"]
+        posts = [(login(c["author"]), c["createdAt"], c.get("body") or "") for c in pr["comments"]["nodes"]]
+        posts += [(login(r["author"]), r["submittedAt"], r.get("body") or "") for r in pr["reviews"]["nodes"]
+                  if r.get("submittedAt")]
+        posts += [(login(c["author"]), c["createdAt"], c.get("body") or "")
+                  for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
+        recent = [(who, body) for who, at, body in posts if parse_time(at) > since]
+        approved_at = {(login(r["author"]), (r.get("commit") or {}).get("oid")) for r in pr["reviews"]["nodes"]
+                       if r.get("state") == "APPROVED"}
+        noted_at = verdict_notes((login(c["author"]), c.get("body")) for c in pr["comments"]["nodes"])
+        threads = [login(t["first"]["nodes"][0]["author"]) for t in pr["reviewThreads"]["nodes"]
+                   if not t["isResolved"] and t["first"]["nodes"]]
+        return {"head": head, "updated": pr["updatedAt"], "authors": {w for w, _ in recent},
+                "approved_at": approved_at, "noted_at": noted_at,
+                "author": login(pr.get("author")), "threads": set(threads)}
+    m = GL_MR.match(url)
+    if m:
+        base = f"projects/{urllib.parse.quote(m[2], safe='')}/merge_requests/{m[3]}"
+        mr = glab_api(m[1], base)
+        notes = glab_api(m[1], f"{base}/notes?sort=desc&order_by=created_at&per_page=100")
+        recent = [n for n in notes if not n.get("system") and parse_time(n["created_at"]) > since]
+        # Approvals carry no sha here and may be stale after a push: only verdict notes say which head.
+        noted_at = verdict_notes((n["author"]["username"], n.get("body")) for n in notes
+                                 if not n.get("system") and n.get("type") is None)
+        threads = {d["notes"][0]["author"]["username"] for d in glab_paged(m[1], f"{base}/discussions")
+                   if d["notes"] and d["notes"][0].get("resolvable") and not d["notes"][0].get("resolved")}
+        return {"head": mr["sha"], "updated": mr["updated_at"], "authors": {n["author"]["username"] for n in recent},
+                "approved_at": set(), "noted_at": noted_at, "author": None,
+                "notes_approve": True, "threads": threads}
+    raise ScanError(f"not a PR or MR URL: {url}")
+
+
+def verdict_notes(posts):
+    """(author, sha) for each top-level verdict note: a post that starts with APPROVED and names
+    the head it approves, as review-pr writes one. A mention of the word elsewhere is not one."""
+    return {(who, sha) for who, body in posts if (body or "").lstrip().startswith("APPROVED")
+            for sha in re.findall(r"\b[0-9a-f]{7,40}\b", body)}
+
+
+def write_json(path, obj):
+    """Atomic replace through a unique temp file, so concurrent writers never share one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def proc_start(pid):
+    """A process's start time as ps prints it, or None when there is no such process."""
+    p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+    return p.stdout.strip() or None
+
+
+def our_pid(pidfile):
+    """The pid in a run's pidfile while that same process is alive, else None. The pidfile
+    holds the start time too, so a pid the system has since reused for something else fails."""
+    try:
+        pid, start = pidfile.read_text().split(" ", 1)
+        pid = int(pid)
+    except (FileNotFoundError, ValueError):
+        return None
+    return pid if proc_start(pid) == start.strip() else None
+
+
+def notify(message):
+    print(message, file=sys.stderr)
+    if sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", f"display notification {json.dumps(message)} with title \"review-scan\""],
+                       capture_output=True)
+
+
+# --- state -------------------------------------------------------------------------
+
+class Watch:
+    def __init__(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise SystemExit(f"bad watch name {name!r}: letters, digits, '.', '_' and '-' only")
+        self.name, self.dir = name, HOME / name
+        self.runs = self.dir / "runs"
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Hold the watch's lock while reading, changing and saving its state: tick, settle
+        and nudge all modify prs.json, and two ticks must not both start a run for one PR."""
+        if not (self.dir / "config.json").exists():
+            raise SystemExit(f"no watch {self.name!r}; create it with `review-scan init`")
+        with open(self.dir / ".lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield self.load()
+
+    def load(self):
+        try:
+            self.config = json.loads((self.dir / "config.json").read_text())
+        except FileNotFoundError:
+            raise SystemExit(f"no watch {self.name!r}; create it with `review-scan init`")
+        p = self.dir / "prs.json"
+        self.prs = json.loads(p.read_text()) if p.exists() else {}
+        return self
+
+    def save(self):
+        write_json(self.dir / "prs.json", self.prs)
+
+    def log(self, line):
+        with open(self.dir / "scan.log", "a") as f:
+            f.write(f"{iso(now_utc())} {line}\n")
+
+    def slug(self, url):
+        return re.sub(r"[^A-Za-z0-9]+", "-", url.split("://", 1)[-1]).strip("-")
+
+    def running(self, url):
+        return our_pid(self.runs / f"{self.slug(url)}.pid") is not None
+
+
+# --- commands ----------------------------------------------------------------------
+
+def cmd_init(a):
+    w = Watch(a.watch)
+    filters = {}
+    for f in a.filter or []:
+        spec, sep, text = f.partition("=")
+        if not sep:
+            raise SystemExit(f"--filter takes SPEC=TEXT, got {f!r}")
+        filters[spec] = text
+    unknown = set(filters) - set(a.target)
+    if unknown:
+        raise SystemExit(f"--filter names a target not in --target: {', '.join(sorted(unknown))}")
+    w.runs.mkdir(parents=True, exist_ok=True)
+    config = {"targets": [{"spec": t, "filter": filters.get(t)} for t in a.target],
+              "reviewer_model": a.reviewer_model, "effort": a.effort, "own": a.own,
+              "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
+    write_json(w.dir / "config.json", config)
+    print(f"watch {a.watch}: {len(a.target)} target(s), reviewer {a.reviewer_model} at {a.effort} effort, state in {w.dir}")
+    return 0
+
+
+def owed_reason(rec, row, full):
+    """Why a PR needs a run now, or None. Only "nothing changed since a run settled it" is quiet:
+    whether a changed PR actually owes anything is the run's to decide."""
+    if full:
+        return "full pass"
+    if "settled" not in rec:
+        return "never reviewed by this watch"
+    if rec.get("recheck"):
+        return "recheck: " + "; ".join(rec["recheck"])
+    s = rec["settled"]
+    listed, settled = parse_time(row["updated"]), parse_time(s["updated"])
+    if listed < settled:  # a listing older than the settle (search lags): nothing it says is news
+        return None
+    if s["head"] != row["head"]:
+        return f"new head {row['head'][:12]} (settled at {s['head'][:12]})"
+    if listed > settled:
+        return f"activity at {row['updated']}"
+    return None
+
+
+def cmd_tick(a, spawn=None):
+    with Watch(a.watch).locked() as w:
+        return tick(w, a, spawn or spawn_run)
+
+
+def tick(w, a, spawn):
+    cfg, now = w.config, now_utc()
+    cutoff = now - dt.timedelta(days=cfg["dormant_days"])
+    listed, failed, accounting = {}, [], []
+    for t in cfg["targets"]:
+        try:
+            rows = list_target(t["spec"])
+        except (ScanError, OSError, subprocess.SubprocessError, json.JSONDecodeError, KeyError, TypeError) as e:
+            failed.append(t["spec"])
+            accounting.append(f"{t['spec']}: UNREAD ({e})")
+            continue
+        kept = dormant = drafts = 0
+        for r in rows:
+            if r["state"] != "open":
+                continue
+            if r["draft"] and not r["named"]:
+                drafts += 1
+                continue
+            if parse_time(r["updated"]) < cutoff and not r["named"]:
+                dormant += 1
+                continue
+            r["target"], r["filter"] = t["spec"], t.get("filter")
+            listed[r["url"]] = r
+            kept += 1
+        accounting.append(f"{t['spec']}: {len(rows)} listed, {kept} kept, {drafts} draft, {dormant} dormant")
+    # A PR named outright that merged or closed has finished: it leaves the watch.
+    finished = [t for t in cfg["targets"] if (GH_PR.match(t["spec"]) or GL_MR.match(t["spec"]))
+                and t["spec"] not in failed and not any(r["target"] == t["spec"] for r in listed.values())]
+    owed = []
+    for url, r in listed.items():
+        if a.only and url != a.only:
+            continue
+        rec = w.prs.setdefault(url, {})
+        reason = owed_reason(rec, r, a.full)
+        if not reason:
+            continue
+        if w.running(url):
+            accounting.append(f"{url}: owed ({reason}), run still in flight")
+            continue
+        owed.append((url, r, reason))
+    in_flight = sum(w.running(u) for u in listed)
+    started, not_started = 0, []
+    for url, r, reason in owed:
+        if in_flight + started >= cfg["max_parallel"]:
+            accounting.append(f"{url}: owed ({reason}), waiting for a free slot")
+            continue
+        if a.dry_run:
+            accounting.append(f"{url}: would start a run ({reason})")
+            continue
+        rec = w.prs[url]
+        siblings = [s for s in listed.values() if s["url"] != url]
+        brief = build_brief(w, r, rec, reason, siblings, now)
+        try:
+            spawn(w, url, brief)
+        except OSError as e:
+            not_started.append(url)
+            accounting.append(f"{url}: owed ({reason}), run FAILED to start ({e})")
+            continue
+        # The rechecks stay until a settle clears the ones this run was started for.
+        rec.update(last_run={"started": iso(now), "head": r["head"], "reason": reason,
+                             "recheck": list(rec.get("recheck", []))})
+        started += 1
+        accounting.append(f"{url}: started a run ({reason})")
+    if not a.dry_run:
+        for t in finished:
+            cfg["targets"].remove(t)
+            accounting.append(f"{t['spec']}: merged or closed, left the watch")
+        if finished:
+            write_json(w.dir / "config.json", cfg)
+    for line in accounting:
+        w.log(line)
+        print(line)
+    problem = None
+    if not cfg["targets"]:
+        problem = f"watch {w.name}: nothing left to watch; run `review-scan uninstall {w.name}`"
+    elif failed and len(failed) == len(cfg["targets"]):
+        problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `review-scan status {w.name}`"
+    elif not_started:
+        problem = f"watch {w.name}: {len(not_started)} review run(s) failed to start; see `review-scan status {w.name}`"
+    if problem:
+        print(problem)
+    if not a.dry_run:
+        alert = w.prs.setdefault("_alert", {})
+        if problem and alert.get("problem") != problem:
+            notify(problem)  # once per new problem, not on every tick
+        alert.clear()
+        if problem:
+            alert.update(problem=problem, since=alert.get("since") or iso(now))
+        w.save()
+    return 5 if failed or not_started else 0
+
+
+def build_brief(w, r, rec, reason, siblings, now):
+    cfg = w.config
+    prev = rec.get("last_run")
+    lines = [
+        f"Review one pull request for the `{w.name}` review watch: {r['url']}",
+        "",
+        "Use the review-open-prs skill, section *One run reviews one PR*, and follow it exactly; it points at",
+        "review-pr for how to review and post. This is a headless run: nobody reads your chat output,",
+        "so the PR is the whole report.",
+        "",
+        f"- Why this run: {reason}.",
+        f"- Head when the scan listed it: `{r['head']}`; base branch `{r['base']}`; author `{r['author']}`.",
+        f"- Run start time, for `settle --since`: `{iso(now)}`.",
+        f"- Accounts that post as you: {', '.join(cfg['own'])}.",
+    ]
+    if r.get("filter"):
+        lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
+    settled = rec.get("settled")
+    if settled:
+        lines.append(f"- Last settled by this watch at head `{settled['head']}` on {settled['at']}; that is the head you last reviewed.")
+        if settled.get("weighed"):
+            lines.append(f"- Threads weighed and left silent at that head: {', '.join(settled['weighed'])}.")
+    if prev and prev.get("started") and not (settled and settled["at"] >= prev["started"]):
+        lines.append(f"- An earlier run started {prev['started']} for head `{prev['head'][:12]}` and never settled: before posting,")
+        lines.append("  check what of yours landed on the PR after that time, and don't post it again.")
+    if siblings:
+        lines.append("")
+        lines.append("Other open PRs in this watch, for related-PR checks (a starting point; verify before relying on it):")
+        lines += [f"- {s['url']} — {s['title']} (`{s['branch']}` → `{s['base']}`, head `{s['head'][:12]}`)" for s in siblings[:60]]
+    lines += ["", "End with:",
+              f"  ~/.claude/bin/review-scan settle {w.name} {r['url']} --head <the head you reviewed> --since {iso(now)} \\",
+              "    --verdict approved|findings|outside-filter [--covered-by <approved earlier head>] \\",
+              "    [--weighed <thread url>]... [--recheck <sibling PR url>]...",
+              "If it exits 6, the PR does not show that verdict yet: post it, then settle again.",
+              "If it exits 3 or 4, stop without settling: the next tick picks the PR up again."]
+    return "\n".join(lines) + "\n"
+
+
+def spawn_run(w, url, brief):
+    slug = w.slug(url)
+    (w.runs / f"{slug}.brief.md").write_text(brief)
+    cfg = w.config
+    cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+           "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+    if not shutil.which("claude"):  # inside the wrapper a missing CLI would fail unseen
+        raise FileNotFoundError("claude is not on PATH")
+    pidfile = w.runs / f"{slug}.pid"
+    # The shell outlives the run only to remove its pidfile, so a finished run leaves none.
+    wrapper = ["/bin/sh", "-c", '"$@"; rc=$?; rm -f "$0"; exit $rc', str(pidfile), *cmd]
+    with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
+        p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
+                             start_new_session=True)
+    pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
+
+
+def cmd_settle(a):
+    since = parse_time(a.since)
+    pr = activity_since(a.url, since)  # outside the lock: a slow API call must not hold up ticks
+    with Watch(a.watch).locked() as w:
+        return settle(w, a, pr)
+
+
+def settle(w, a, pr):
+    rec = w.prs.setdefault(a.url, {})
+    own = set(w.config["own"])
+    if pr["head"] != a.head:
+        print(f"refused: head is now {pr['head']}, not {a.head}; the next tick reviews it")
+        return 3
+    others = sorted(x for x in pr["authors"] - own if x)
+    if others:
+        print(f"refused: {', '.join(others)} posted after {a.since}; the next tick reviews it")
+        return 4
+    if a.verdict == "approved" and not covered(pr, own, a.head) and not covered(pr, own, a.covered_by):
+        print(f"refused: no approval of ours covers {a.head[:12]}"
+              + (f" or {a.covered_by[:12]}" if a.covered_by else "") + "; post it, then settle again")
+        return 6
+    if a.verdict == "findings" and not pr["threads"] & own:
+        print("refused: no open thread of ours on the PR; post the findings, then settle again")
+        return 6
+    done = list((rec.get("last_run") or {}).get("recheck", []))
+    left = []
+    for entry in rec.get("recheck", []):  # keep rechecks that arrived after this run started
+        if entry in done:
+            done.remove(entry)
+        else:
+            left.append(entry)
+    if left:
+        rec["recheck"] = left
+    else:
+        rec.pop("recheck", None)
+    # Registered only once the settle passes, and once each: a retried settle must not
+    # leave the sibling a second copy that outlives its next run.
+    for sib in a.recheck or []:
+        entries = w.prs.setdefault(sib, {}).setdefault("recheck", [])
+        entry = f"sibling {a.url} changed"
+        if entry not in entries:
+            entries.append(entry)
+    rec["settled"] = {"head": pr["head"], "updated": pr["updated"], "at": iso(now_utc()),
+                      "verdict": a.verdict, "weighed": a.weighed or []}
+    w.save()
+    w.log(f"{a.url}: settled at {pr['head'][:12]} ({a.verdict})")
+    print(f"settled {a.url} at {pr['head']}")
+    return 0
+
+
+def covered(pr, own, sha):
+    """Whether an approval of ours exists at `sha`: the head itself, or the earlier head the run
+    says still covers this one.
+
+    This is a gate against a run forgetting the verdict, not a check of the covering rule: whether
+    the changes since `sha` stay inside review-pr's *Only a formal approval covers a head* is the
+    run's judgement, and settle takes its word for it. Only a formal approval counts, except where
+    a formal one is impossible (GitLab, whose hosts may forbid it, and a GitHub PR authored by one
+    of our accounts), where an APPROVED post naming the sha stands in for it."""
+    if not sha:
+        return False
+    entries = set(pr.get("approved_at", ()))
+    if pr.get("notes_approve") or pr.get("author") in own:
+        entries |= set(pr.get("noted_at", ()))
+    return any(who in own and oid and (oid.startswith(sha) or sha.startswith(oid)) and len(min(oid, sha, key=len)) >= 7
+               for who, oid in entries)
+
+
+def covers(spec, url):
+    if spec == url:
+        return True
+    m = GH_PR.match(url)
+    if m and not spec.startswith("gitlab:") and not spec.startswith("https://"):
+        return m[1] == spec or m[1].split("/")[0] == spec
+    m = GL_MR.match(url)
+    if m and spec.startswith("gitlab:"):
+        host, _, path = spec[len("gitlab:"):].partition("/")
+        path = path.rstrip("!")
+        return host == m[1] and (m[2] == path or m[2].startswith(path + "/"))
+    return False
+
+
+def cmd_nudge(a):
+    """address-pr's nudge: every watch covering the PR rechecks it on a tick started now."""
+    hit = 0
+    for d in sorted(HOME.glob("*/config.json")):
+        with Watch(d.parent.name).locked() as w:
+            if not any(covers(t["spec"], a.url) for t in w.config["targets"]):
+                continue
+            w.prs.setdefault(a.url, {}).setdefault("recheck", []).append(f"nudge after a push of {a.head[:12]}")
+            w.save()
+        subprocess.Popen([str(Path(sys.argv[0]).resolve()), "tick", w.name, "--only", a.url], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        hit += 1
+        print(f"nudged watch {w.name}")
+    if not hit:
+        print("no review watch covers this PR")
+    return 0
+
+
+def cmd_status(a):
+    w = Watch(a.watch).load()
+    cfg = w.config
+    print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
+          f"dormant after {cfg['dormant_days']} days")
+    for t in cfg["targets"]:
+        print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
+    if w.prs.get("_alert", {}).get("problem"):
+        print(f"PROBLEM since {w.prs['_alert']['since']}: {w.prs['_alert']['problem']}")
+    for url, rec in sorted(w.prs.items()):
+        if url == "_alert":
+            continue
+        state = "running" if w.running(url) else ("settled " + rec["settled"]["at"]) if rec.get("settled") else "never settled"
+        print(f"  {url}: {state}" + (f", recheck pending" if rec.get("recheck") else ""))
+    log = w.dir / "scan.log"
+    if log.exists():
+        print("last scan lines:")
+        print("".join(log.read_text().splitlines(keepends=True)[-8:]), end="")
+    return 0
+
+
+def plist_path(name):
+    return Path("~/Library/LaunchAgents").expanduser() / f"com.github.tycooon.review-scan.{name}.plist"
+
+
+def cmd_install(a):
+    w = Watch(a.watch).load()
+    exe = Path(sys.argv[0]).resolve()
+    script = f"exec {shlex.quote(str(exe))} tick {shlex.quote(w.name)}"
+    if sys.platform != "darwin":
+        log = shlex.quote(str(w.dir / "cron.log"))
+        print("not macOS: add this crontab line instead; problems land in the log it names and in `status`:\n"
+              f"*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)} >> {log} 2>&1")
+        return 0
+    plist = plist_path(w.name)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.github.tycooon.review-scan.{w.name}</string>
+  <key>ProgramArguments</key><array><string>/bin/zsh</string><string>-lc</string><string>{script}</string></array>
+  <key>StartInterval</key><integer>{a.interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{w.dir / "launchd.log"}</string>
+  <key>StandardErrorPath</key><string>{w.dir / "launchd.log"}</string>
+</dict></plist>
+""")
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(plist)], check=True)
+    print(f"installed {plist}: a tick every {a.interval}s, the first one now")
+    return 0
+
+
+def cmd_uninstall(a):
+    w = Watch(a.watch).load()
+    plist = plist_path(w.name)
+    if plist.exists():
+        subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+        plist.unlink()
+    for pidfile in w.runs.glob("*.pid"):
+        pid = our_pid(pidfile)
+        if pid is None:
+            continue
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    print(f"uninstalled watch {w.name}; its state stays in {w.dir}")
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init")
+    i.add_argument("watch")
+    i.add_argument("--target", action="append", required=True)
+    i.add_argument("--filter", action="append", help="SPEC=TEXT: a judgment-call filter the run applies")
+    i.add_argument("--reviewer-model", default="opus", help="model for every review run (default: opus)")
+    i.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
+    i.add_argument("--own", action="append", required=True,
+                   help="an account that posts as you: your default account and the reviewer bot (repeat)")
+    i.add_argument("--max-parallel", type=int, default=3)
+    i.add_argument("--dormant-days", type=int, default=14)
+    t = sub.add_parser("tick")
+    t.add_argument("watch")
+    t.add_argument("--full", action="store_true", help="treat every PR as owed (first pass, lost state)")
+    t.add_argument("--only", help="consider just this PR")
+    t.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("settle")
+    s.add_argument("watch")
+    s.add_argument("url")
+    s.add_argument("--head", required=True)
+    s.add_argument("--since", required=True)
+    s.add_argument("--verdict", required=True, choices=["approved", "findings", "outside-filter"],
+                   help="what the run left: an approval at the head, open threads of ours, or a PR outside the filter")
+    s.add_argument("--covered-by", help="with --verdict approved: the earlier head whose approval of ours still "
+                   "covers this one under review-pr's covering rule; settle checks the approval exists, "
+                   "the covering judgement is the run's")
+    s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
+    s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
+    n = sub.add_parser("nudge")
+    n.add_argument("url")
+    n.add_argument("--head", required=True)
+    for name in ("status", "uninstall"):
+        sub.add_parser(name).add_argument("watch")
+    ins = sub.add_parser("install")
+    ins.add_argument("watch")
+    ins.add_argument("--interval", type=int, default=300)
+    a = p.parse_args(argv)
+    try:
+        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status,
+                "install": cmd_install, "uninstall": cmd_uninstall}[a.cmd](a)
+    except ScanError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())
