@@ -36,7 +36,7 @@ When the user asks for the session on another machine, or your machine rules sen
 - **Launch and resume.** The brief and follow-ups stay local and go in on stdin, so `< BRIEF` stays outside the quotes. The run's output stays on HOST, in the worktree's ignored `.plans/`, so a dropped connection can't cut it off, and the shell records its pid first:
 
   ```bash
-  ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST 'cd WORKTREE && mkdir -p .plans && echo $$ > .plans/NAME.pid && exec codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o .plans/NAME-last.md - > .plans/NAME.log 2>&1' < BRIEF
+  ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST 'cd WORKTREE && mkdir -p .plans && echo $$ > .plans/NAME.pid && G=$(git rev-parse --absolute-git-dir) && C=$(git rev-parse --path-format=absolute --git-common-dir) && exec codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --add-dir "$G" --add-dir "$C/objects" --add-dir "$C/refs" --add-dir "$C/logs" --approve-for-me --color never -o .plans/NAME-last.md - > .plans/NAME.log 2>&1' < BRIEF
   ```
 
   A resume is the same command with step 4's `resume SESSION_ID`, its follow-up on stdin, and the next numbered `-o` file, log and pidfile (`NAME-2.pid`, …), so a watch can never read the previous run's pid. Read both files with `ssh HOST cat` (or `tail` for the log) wherever this skill reads the `-o` file or the log.
@@ -102,10 +102,11 @@ A repository's own command for making a worktree comes first: when its instructi
 Then start Codex in it, in a background Bash with `timeout: 7200000`. Two hours is the maximum, and the default stops it after 30 minutes.
 
 ```bash
-codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
+G=$(git -C WORKTREE rev-parse --absolute-git-dir) C=$(git -C WORKTREE rev-parse --path-format=absolute --git-common-dir); codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --add-dir "$G" --add-dir "$C/objects" --add-dir "$C/refs" --add-dir "$C/logs" --approve-for-me --color never -o SCRATCHPAD/NAME-last.md - < BRIEF > SCRATCHPAD/NAME.log 2>&1
 ```
 
 - Never pass `--worktree`. Codex would make a worktree of its own at `<its worktree root>/<4 hex digits>/<repo>`, detached at the main checkout's HEAD: outside the place your instructions and the project's tooling expect a worktree, and on a base that can be behind.
+- The `--add-dir` flags let the sandbox write what `git add`, `commit` and `fetch` write in a linked worktree: its own git dir (index, HEAD, FETCH_HEAD) and the main checkout's `objects`, `refs` and `logs`. Without them each of those commands waits for an approval, since the sandbox keeps a worktree's git dir read-only even under a writable parent. The main checkout's `config` and hooks stay read-only, so a sandboxed command can't plant code that runs at the next git call outside it.
 - `--approve-for-me` keeps the `workspace-write` sandbox and sends approval requests to Codex's automatic reviewer, since nobody is there to answer a prompt. Never pass `--dangerously-bypass-approvals-and-sandbox`.
 - Never pass `--ephemeral`: it keeps no session to resume.
 
@@ -137,11 +138,11 @@ You are re-invoked when the run exits as well (on a remote host, by the process 
 Resume the session when anything is left for it to do: an open review thread, yours or another reviewer's, a failed or still-running check, a conflict with the base, or a run that stopped short of its PR. Use the same background Bash and timeout.
 
 ```bash
-codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
+G=$(git -C WORKTREE rev-parse --absolute-git-dir) C=$(git -C WORKTREE rev-parse --path-format=absolute --git-common-dir); codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --add-dir "$G" --add-dir "$C/objects" --add-dir "$C/refs" --add-dir "$C/logs" --approve-for-me --color never -o SCRATCHPAD/NAME-last-2.md resume SESSION_ID - < FOLLOW_UP > SCRATCHPAD/NAME-2.log 2>&1
 ```
 
 - Always pass `-C` with the session's worktree. A resumed run works in the directory it is given (the current one by default), not where the session began.
-- Keep the flags before the word `resume`, which takes neither `-C` nor `--approve-for-me` after it.
+- Keep the flags before the word `resume`, which takes neither `-C`, `--add-dir` nor `--approve-for-me` after it. Pass the `--add-dir` flags on every resume: a session doesn't keep them, and a resume without them is back to asking for every git write.
 - Pass the session's MODEL, EFFORT and SPEED again, so a resume never falls back to the user's config.
 
 The follow-up says what is left: for one [address-pr](../address-pr/SKILL.md) pass (fix or argue, reply without resolving, push), the links to each open thread and failed check and the text of any finding that has no thread; or what a run that stopped short still owes. It always ends by asking Codex, once that is done, to wait for the checks on the head it leaves and to report them with what changed, and, while it waits, to check the PR for review threads opened since its pass and give each the same address-pr treatment before it reports. A run spends most of its time waiting on CI, and Codex can't be messaged mid-run, so a finding the repo's reviewer posts then is handled in that run rather than after it exits and you resume it. When the run exits, re-review the head it leaves unless you already reviewed it mid-run (step 3).
