@@ -335,6 +335,21 @@ class Init(unittest.TestCase):
             rs.main(["init", "noown", "--target", "acme/app"])
 
 
+class List(Base):
+    def test_list_and_bare_status_show_every_watch(self):
+        real, real_plist = rs.our_pid, rs.plist_path
+        rs.our_pid = lambda pidfile: None
+        rs.plist_path = lambda name: Path(TMP.name) / "no-such.plist"
+        try:
+            _, out = self.cli("list")
+            _, bare = self.cli("status")
+        finally:
+            rs.our_pid, rs.plist_path = real, real_plist
+        self.assertIn(f"{self.watch}: reviewer sonnet, not scheduled, 0 run(s) in flight", out)
+        self.assertIn("  acme/app", out)
+        self.assertEqual(out, bare)
+
+
 class Covers(unittest.TestCase):
     def test_specs(self):
         self.assertTrue(rs.covers("acme/app", PR1))

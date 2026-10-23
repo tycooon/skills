@@ -49,6 +49,7 @@ Transient trouble with one target is not a problem of the watch: the tick report
 
 **Status, nudges and stopping.**
 
+- `review-scan list` (or `status` with no name) shows every watch on the machine: its targets, reviewer, whether it is scheduled, runs in flight and any problem. A nudge needs no watch name.
 - `review-scan status <watch>` shows the config, each PR's last settled head and run, and the tick log.
 - `review-scan nudge <pr-url> --head <sha>` makes every watch covering that PR look at it at once; address-pr's push step sends it. A nudge never changes the schedule.
 - `review-scan uninstall <watch>` stops the schedule and kills runs still in flight. The state stays on disk, so `install` later picks up where the watch left off. After a long gap, start with a `tick --full`.
