@@ -287,7 +287,7 @@ class Spawn(Base):
 
         real, real_start, real_login = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in
         rs.subprocess.Popen = FakePopen
-        rs.claude_logged_in = lambda: True
+        rs.claude_logged_in = lambda *_: True
         rs.proc_start = lambda pid: "Fri Oct 23 12:00:00 2026" if pid == 4242 else None
         try:
             w = rs.Watch(self.watch).load()
@@ -303,7 +303,7 @@ class Spawn(Base):
 
     def test_a_logged_out_cli_fails_the_start_and_notifies(self):
         real_login = rs.claude_logged_in
-        rs.claude_logged_in = lambda: False
+        rs.claude_logged_in = lambda *_: False
         try:
             code, out = self.cli("tick", self.watch, spawn=rs.spawn_run)
         finally:
@@ -324,12 +324,12 @@ class Spawn(Base):
         rs.subprocess.run = fake_run
         try:
             for out, expected in (('{"loggedIn": false}', False), ('{"loggedIn": true}', True), ("garbage", True)):
-                rs._logged_in, self.status_out = None, out
+                rs._logged_in, self.status_out = {}, out
                 self.assertEqual(rs.claude_logged_in(), expected)
                 rs.claude_logged_in()
             self.assertEqual(len(calls), 3)
         finally:
-            rs.subprocess.run, rs._logged_in = real_run, None
+            rs.subprocess.run, rs._logged_in = real_run, {}
 
 
 class Nudge(Base):
@@ -491,7 +491,7 @@ class ChainTick(unittest.TestCase):
 
         real = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which
         rs.subprocess.Popen, rs.proc_start = FakePopen, (lambda pid: "t")
-        rs.claude_logged_in, rs.shutil.which = (lambda: True), (lambda name: "/bin/claude")
+        rs.claude_logged_in, rs.shutil.which = (lambda *_: True), (lambda name: "/bin/claude")
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 rs.main(["init", "chain", "--target", "acme/app", "--own", "x"])
@@ -501,6 +501,55 @@ class ChainTick(unittest.TestCase):
         cmd = seen["cmd"]
         self.assertEqual(cmd[:3], ["/bin/sh", "-c", rs.WRAPPER])
         self.assertEqual(cmd[5:9], ["chain", str(rs.CHAIN_AFTER), "claude", "-p"])
+
+
+class Account(Base):
+    def switch(self, config):
+        real = rs.claude_auth_status
+        rs.claude_auth_status = lambda d=None: {"loggedIn": d is not None, "email": "me@x", "orgName": "Team", "subscriptionType": "team"}
+        try:
+            return self.cli("account", self.watch, config)
+        finally:
+            rs.claude_auth_status = real
+
+    def config(self):
+        return json.loads((Path(TMP.name) / self.watch / "config.json").read_text())
+
+    def test_switching_links_the_shared_setup_and_back(self):
+        d = Path(tempfile.mkdtemp(dir=TMP.name)) / "secondary"
+        code, out = self.switch(str(d))
+        self.assertEqual(code, 0)
+        self.assertIn("logged in as me@x (Team, team)", out)
+        self.assertEqual(self.config()["claude_config"], str(d.resolve()))
+        for name in rs.SHARED:
+            if (Path("~/.claude").expanduser() / name).exists():
+                self.assertTrue((d / name).is_symlink(), name)
+        _, out = self.switch("default")
+        self.assertIsNone(self.config()["claude_config"])
+        self.assertIn("not logged in yet: run `claude auth login`", out)
+
+    def test_runs_get_the_account_s_config_dir_and_init_keeps_it(self):
+        d = Path(tempfile.mkdtemp(dir=TMP.name))
+        self.switch(str(d))
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
+        self.assertEqual(self.config()["claude_config"], str(d.resolve()))
+        self.assertEqual(rs.claude_env(str(d))["CLAUDE_CONFIG_DIR"], str(d))
+        os.environ["CLAUDE_CONFIG_DIR"] = "/elsewhere"
+        try:
+            self.assertNotIn("CLAUDE_CONFIG_DIR", rs.claude_env(None))
+        finally:
+            del os.environ["CLAUDE_CONFIG_DIR"]
+
+
+class Model(Base):
+    def test_model_and_effort_change_in_place(self):
+        _, out = self.cli("model", self.watch)
+        self.assertIn("sonnet at medium effort", out)
+        self.cli("model", self.watch, "opus", "--effort", "high")
+        cfg = json.loads((Path(TMP.name) / self.watch / "config.json").read_text())
+        self.assertEqual((cfg["reviewer_model"], cfg["effort"]), ("opus", "high"))
+        self.cli("tick", self.watch)
+        self.assertTrue(self.spawned)  # state and targets untouched
 
 
 class Covers(unittest.TestCase):

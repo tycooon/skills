@@ -10,6 +10,8 @@
   review-scan nudge <pr-url> --head SHA
   review-scan list
   review-scan status [<watch>]
+  review-scan account <watch> [CONFIG_DIR | default]
+  review-scan model <watch> [MODEL] [--effort LEVEL]
   review-scan install <watch> [--interval SECONDS]
   review-scan uninstall <watch>
 
@@ -328,6 +330,9 @@ def cmd_init(a):
     config = {"targets": [{"spec": t, "filter": filters.get(t), "token": tokens.get(t)} for t in a.target],
               "reviewer_model": a.reviewer_model, "effort": a.effort, "own": a.own,
               "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
+    old = w.dir / "config.json"
+    if old.exists():  # re-running init redefines targets; the account stays as `account` set it
+        config["claude_config"] = json.loads(old.read_text()).get("claude_config")
     write_json(w.dir / "config.json", config)
     print(f"watch {a.watch}: {len(a.target)} target(s), reviewer {a.reviewer_model} at {a.effort} effort, state in {w.dir}")
     return 0
@@ -503,21 +508,35 @@ def build_brief(w, r, rec, reason, siblings, now):
     return "\n".join(lines) + "\n"
 
 
-_logged_in = None
+_logged_in = {}
 
 
-def claude_logged_in():
-    """Whether the claude CLI has a login, read once per process. Its login is separate from the
-    desktop app's, and a logged-out CLI fails every run in its first second, so the tick checks
-    before starting any. An unreadable status is not taken as logged out: the run's own log says why."""
-    global _logged_in
-    if _logged_in is None:
+def claude_env(config_dir):
+    """The environment a run gets: the CLI's own login, or the one in config_dir."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def claude_auth_status(config_dir=None):
+    p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30,
+                       env=claude_env(config_dir))
+    return json.loads(p.stdout)
+
+
+def claude_logged_in(config_dir=None):
+    """Whether the claude CLI has a login in config_dir (None: its default one), read once per
+    process. Its login is separate from the desktop app's, and a logged-out CLI fails every run
+    in its first second, so the tick checks before starting any. An unreadable status is not
+    taken as logged out: the run's own log says why."""
+    if config_dir not in _logged_in:
         try:
-            p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
-            _logged_in = json.loads(p.stdout).get("loggedIn") is not False
+            _logged_in[config_dir] = claude_auth_status(config_dir).get("loggedIn") is not False
         except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
-            _logged_in = True
-    return _logged_in
+            _logged_in[config_dir] = True
+    return _logged_in[config_dir]
 
 
 CHAIN_AFTER = 60
@@ -537,8 +556,10 @@ def spawn_run(w, url, brief):
            "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
     if not shutil.which("claude"):  # inside the wrapper a missing CLI would fail unseen
         raise FileNotFoundError("claude is not on PATH")
-    if not claude_logged_in():
-        raise PermissionError("the claude CLI is logged out; run `claude auth login`")
+    account = cfg.get("claude_config")
+    if not claude_logged_in(account):
+        login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
+        raise PermissionError(f"the claude CLI is logged out; run `{login}`")
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
     # start the next tick at once: runs take a minute or two, so waiting for the schedule left
@@ -547,7 +568,7 @@ def spawn_run(w, url, brief):
     wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
     with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
         p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
-                             start_new_session=True)
+                             start_new_session=True, env=claude_env(account))
     pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
 
 
@@ -673,12 +694,72 @@ def cmd_list(a):
         cfg = w.config
         scheduled = "scheduled" if is_scheduled(name) else "not scheduled"
         running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
-        print(f"{name}: reviewer {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight")
+        print(f"{name}: reviewer {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
+              + (f", account {cfg['claude_config']}" if cfg.get("claude_config") else ""))
         for t in cfg["targets"]:
             print(f"  {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
         problem = w.prs.get("_alert", {}).get("problem")
         if problem:
             print(f"  PROBLEM since {w.prs['_alert']['since']}: {problem}")
+    return 0
+
+
+# What a run loads from ~/.claude besides the login: rules, settings, skills and plugins. An
+# account directory links them, so a review behaves the same whichever account pays for it.
+SHARED = ("CLAUDE.md", "settings.json", "skills", "plugins")
+
+
+def cmd_account(a):
+    """Show or switch the Claude account a watch's runs use: a config directory with its own
+    login (`claude auth login` under CLAUDE_CONFIG_DIR), or `default`, the CLI's own login.
+    Runs already going finish on the account they started with."""
+    w = Watch(a.watch)
+    if a.config is None:
+        print(f"watch {a.watch}: {w.load().config.get('claude_config') or 'default'}")
+        return 0
+    target = None
+    if a.config != "default":
+        target = str(Path(a.config).expanduser().resolve())
+        d, home = Path(target), Path("~/.claude").expanduser()
+        if d == home.resolve():
+            raise SystemExit("that is the default login's directory; use `default` instead")
+        d.mkdir(parents=True, exist_ok=True)
+        for name in SHARED:
+            link, src = d / name, home / name
+            if src.exists() and not link.exists() and not link.is_symlink():
+                link.symlink_to(src)
+                print(f"linked {link} -> {src}")
+    try:
+        status = claude_auth_status(target)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        status = {"error": str(e)}
+    with w.locked() as w:
+        w.config["claude_config"] = target
+        write_json(w.dir / "config.json", w.config)
+    who = f"{status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})"
+    print(f"watch {a.watch}: runs from now on use {target or 'the default login'}")
+    if status.get("loggedIn"):
+        print(f"  logged in as {who}")
+    else:
+        login = f"CLAUDE_CONFIG_DIR={target} claude auth login" if target else "claude auth login"
+        print(f"  not logged in yet: run `{login}`; until then the tick reports its runs as failing to start")
+    return 0
+
+
+def cmd_model(a):
+    """Show or change the model and effort a watch's runs use. Runs already going keep theirs."""
+    w = Watch(a.watch)
+    if a.model is None and a.effort is None:
+        cfg = w.load().config
+        print(f"watch {a.watch}: {cfg['reviewer_model']} at {cfg['effort']} effort")
+        return 0
+    with w.locked() as w:
+        if a.model:
+            w.config["reviewer_model"] = a.model
+        if a.effort:
+            w.config["effort"] = a.effort
+        write_json(w.dir / "config.json", w.config)
+    print(f"watch {a.watch}: runs from now on use {w.config['reviewer_model']} at {w.config['effort']} effort")
     return 0
 
 
@@ -703,6 +784,7 @@ def cmd_status(a, limit=15):
         return cmd_list(a)
     w = Watch(a.watch).load()
     cfg, now = w.config, now_utc()
+    print(f"account: {cfg.get('claude_config') or 'the claude CLI default login'}")
     print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
           f"dormant after {cfg['dormant_days']} days, {'scheduled' if is_scheduled(w.name) else 'not scheduled'}")
     for t in cfg["targets"]:
@@ -844,6 +926,13 @@ def main(argv=None):
     n.add_argument("url")
     n.add_argument("--head", required=True)
     sub.add_parser("list")
+    mod = sub.add_parser("model", help="show or change the model and effort the watch's runs use")
+    mod.add_argument("watch")
+    mod.add_argument("model", nargs="?", help="e.g. opus, sonnet, or a full model id")
+    mod.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    acc = sub.add_parser("account", help="show or switch the Claude account the watch's runs use")
+    acc.add_argument("watch")
+    acc.add_argument("config", nargs="?", help="a claude config directory with its own login, or `default`")
     sub.add_parser("status").add_argument("watch", nargs="?", help="omit to list every watch")
     sub.add_parser("uninstall").add_argument("watch")
     ins = sub.add_parser("install")
@@ -851,7 +940,7 @@ def main(argv=None):
     ins.add_argument("--interval", type=int, default=120, help="seconds between scheduled ticks (default: 120)")
     a = p.parse_args(argv)
     try:
-        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status, "list": cmd_list,
+        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status, "list": cmd_list, "account": cmd_account, "model": cmd_model,
                 "install": cmd_install, "uninstall": cmd_uninstall}[a.cmd](a)
     except ScanError as e:
         print(f"error: {e}", file=sys.stderr)
