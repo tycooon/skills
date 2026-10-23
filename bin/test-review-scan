@@ -341,6 +341,7 @@ class TargetToken(Base):
                  "--token", "acme/app=PR_REVIEW_TOKEN_ACME")
         self.cli("tick", self.watch)
         self.assertIn("`$PR_REVIEW_TOKEN_ACME`", self.spawned[0][1])
+        self.assertIn('`PR_REVIEW_GH_TOKEN="$PR_REVIEW_TOKEN_ACME"` exported', self.spawned[0][1])
         _, out = self.cli("status", self.watch)
         self.assertIn("posts with $PR_REVIEW_TOKEN_ACME", out)
 

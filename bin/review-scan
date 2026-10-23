@@ -467,8 +467,10 @@ def build_brief(w, r, rec, reason, siblings, now):
     if r.get("filter"):
         lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
     if r.get("token"):
-        lines.append(f"- Post on this target with the token in `${r['token']}`, not the default reviewer-bot variable: "
-                     "export its value as the reviewer token for the posting commands.")
+        default = "PR_REVIEW_GH_TOKEN" if GH_PR.match(r["url"]) else "PR_REVIEW_GITLAB_TOKEN"
+        # Under the default name, so every posting command and helper that reads it gets this target's token.
+        lines.append(f"- Post on this target with the token in `${r['token']}`: run every posting command, helper "
+                     f"scripts included, with `{default}=\"${r['token']}\"` exported, never with the default value.")
     settled = rec.get("settled")
     if settled:
         lines.append(f"- Last settled by this watch at head `{settled['head']}` on {settled['at']}; that is the head you last reviewed.")
