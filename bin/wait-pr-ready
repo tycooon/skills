@@ -48,8 +48,8 @@ Options:
                     the head the first read sees.
   --no-ci           the repository has no CI at all, so skip the checks gate.
                     Without it, a repository with no Actions workflow and no
-                    check on its base branch's tip has none to pass from the
-                    first read; otherwise a head still without checks CI_SETTLE
+                    check on its base branch's tip or its last few merged heads
+                    has none to pass from the first read; otherwise a head still without checks CI_SETTLE
                     after the waiter first saw it counts as having none to pass
                     when the repository has no Actions workflow, or when none of its
                     workflows ran for the head (path filters that matched
@@ -308,15 +308,28 @@ def workflow_count(owner, name):
     return int(r.stdout)
 
 
-def ref_checks(owner, name, ref):
-    """How many checks and commit statuses `ref`'s tip carries."""
-    total = 0
-    for kind in ("check-runs", "status"):
-        r = gh(["api", f"repos/{owner}/{name}/commits/{ref}/{kind}", "--jq", ".total_count"])
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip() or f"gh api commits/{kind} failed")
-        total += int(r.stdout)
-    return total
+RECENT_CHECKS_QUERY = """
+query($owner: String!, $name: String!, $ref: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $ref) { target { ... on Commit { statusCheckRollup { state } } } }
+    pullRequests(states: MERGED, first: 5, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }
+    }
+  }
+}
+"""
+
+
+def recent_checks(owner, name, base):
+    """How many of the base's tip and the last few merged PRs' heads carry a check or status.
+    A PR-only integration (a CLA or title check, a deploy preview) never posts on the base."""
+    r = gh(["api", "graphql", "-f", f"query={RECENT_CHECKS_QUERY}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"ref=refs/heads/{base}"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api graphql failed")
+    repo = json.loads(r.stdout)["data"]["repository"]
+    tips = [((repo.get("ref") or {}).get("target") or {})]
+    tips += [n["commit"] for pr in repo["pullRequests"]["nodes"] for n in pr["commits"]["nodes"]]
+    return sum(1 for c in tips if c.get("statusCheckRollup"))
 
 
 def workflow_runs(owner, name, sha):
@@ -566,10 +579,12 @@ def gl_workflow_count(host, project):
         return 0
 
 
-def gl_ref_checks(host, project, ref):
-    """How many external commit statuses `ref`'s tip carries; pipelines are gl_workflow_count's."""
-    sha = glab(host, f"{gl_project(project)}/repository/commits/{ref.replace('/', '%2F')}")["id"]
-    return len(glab(host, f"{gl_project(project)}/repository/commits/{sha}/statuses?per_page=1"))
+def gl_recent_checks(host, project, base):
+    """How many of the base's tip and the last few merged MRs' heads carry an external commit
+    status; pipelines are gl_workflow_count's."""
+    shas = [glab(host, f"{gl_project(project)}/repository/commits/{base.replace('/', '%2F')}")["id"]]
+    shas += [mr["sha"] for mr in glab(host, f"{gl_project(project)}/merge_requests?state=merged&order_by=updated_at&per_page=5") if mr.get("sha")]
+    return sum(1 for sha in shas if glab(host, f"{gl_project(project)}/repository/commits/{sha}/statuses?per_page=1"))
 
 
 def gl_workflow_runs(host, project, iid, sha):
@@ -594,7 +609,7 @@ def forge(url):
             "merged_branch_tip": lambda branch: merged_branch_tip(owner, name, branch),
             "changed_hunks": lambda old, new: changed_hunks(owner, name, old, new),
             "workflow_count": lambda: workflow_count(owner, name),
-            "ref_checks": lambda ref: ref_checks(owner, name, ref),
+            "recent_checks": lambda base: recent_checks(owner, name, base),
             "workflow_runs": lambda sha: workflow_runs(owner, name, sha),
             "head_runs": lambda sha: head_runs(owner, name, sha),
         }
@@ -607,7 +622,7 @@ def forge(url):
             "merged_branch_tip": lambda branch: gl_merged_branch_tip(host, project, branch),
             "changed_hunks": lambda old, new: gl_changed_hunks(host, project, old, new),
             "workflow_count": lambda: gl_workflow_count(host, project),
-            "ref_checks": lambda ref: gl_ref_checks(host, project, ref),
+            "recent_checks": lambda base: gl_recent_checks(host, project, base),
             "workflow_runs": lambda sha: gl_workflow_runs(host, project, iid, sha),
             # The head pipeline's own status covers what Actions runs add on GitHub.
             "head_runs": lambda sha: ([], [], None),
@@ -937,15 +952,15 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return False
         if state["workflows"] is None:
             state["workflows"] = host["workflow_count"]()
-        # No workflow and not a check on the base's tip either: the repository has no CI
+        # No workflow and not a check on any recent head either: the repository has no CI
         # at all, as release's step 1 defines it, and nothing is worth waiting for.
         if state["workflows"] == 0:
-            if state.get("base_checks") is None:
-                state["base_checks"] = host["ref_checks"](pr["baseRefName"])
-            if state["base_checks"] == 0:
-                return f"no CI: the repository has no Actions workflow and {pr['baseRefName']} carries no checks"
+            if state.get("recent_checks") is None:
+                state["recent_checks"] = host["recent_checks"](pr["baseRefName"])
+            if state["recent_checks"] == 0:
+                return f"no CI: the repository has no Actions workflow and no check on {pr['baseRefName']} or recently merged heads"
         # External CI (a GitHub App or commit status) posts its first check some time
-        # after a push, so a repository whose base has checks waits before it counts.
+        # after a push, so a repository where recent heads have checks waits before it counts.
         if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
             return False
         if state["workflows"] == 0:
