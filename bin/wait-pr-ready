@@ -47,9 +47,11 @@ Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
                     the head the first read sees.
   --no-ci           the repository has no CI at all, so skip the checks gate.
-                    Without it, a head still without checks CI_SETTLE after the
-                    waiter first saw it counts as having none to pass when the
-                    repository has no Actions workflow, or when none of its
+                    Without it, a repository with no Actions workflow and no
+                    check on its base branch's tip has none to pass from the
+                    first read; otherwise a head still without checks CI_SETTLE
+                    after the waiter first saw it counts as having none to pass
+                    when the repository has no Actions workflow, or when none of its
                     workflows ran for the head (path filters that matched
                     nothing, as far as the timeout can tell).
   --reviewer LOGIN  the AI reviewer's account; its reviews count even
@@ -306,6 +308,17 @@ def workflow_count(owner, name):
     return int(r.stdout)
 
 
+def ref_checks(owner, name, ref):
+    """How many checks and commit statuses `ref`'s tip carries."""
+    total = 0
+    for kind in ("check-runs", "status"):
+        r = gh(["api", f"repos/{owner}/{name}/commits/{ref}/{kind}", "--jq", ".total_count"])
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or f"gh api commits/{kind} failed")
+        total += int(r.stdout)
+    return total
+
+
 def workflow_runs(owner, name, sha):
     r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=1", "--jq", ".total_count"])
     if r.returncode != 0:
@@ -553,6 +566,12 @@ def gl_workflow_count(host, project):
         return 0
 
 
+def gl_ref_checks(host, project, ref):
+    """How many external commit statuses `ref`'s tip carries; pipelines are gl_workflow_count's."""
+    sha = glab(host, f"{gl_project(project)}/repository/commits/{ref.replace('/', '%2F')}")["id"]
+    return len(glab(host, f"{gl_project(project)}/repository/commits/{sha}/statuses?per_page=1"))
+
+
 def gl_workflow_runs(host, project, iid, sha):
     """Pipelines that may test this head: any on its sha, and any merged results or merge
     train pipeline of the MR, whose sha is a merge commit's. Counting the MR's own too
@@ -575,6 +594,7 @@ def forge(url):
             "merged_branch_tip": lambda branch: merged_branch_tip(owner, name, branch),
             "changed_hunks": lambda old, new: changed_hunks(owner, name, old, new),
             "workflow_count": lambda: workflow_count(owner, name),
+            "ref_checks": lambda ref: ref_checks(owner, name, ref),
             "workflow_runs": lambda sha: workflow_runs(owner, name, sha),
             "head_runs": lambda sha: head_runs(owner, name, sha),
         }
@@ -587,6 +607,7 @@ def forge(url):
             "merged_branch_tip": lambda branch: gl_merged_branch_tip(host, project, branch),
             "changed_hunks": lambda old, new: gl_changed_hunks(host, project, old, new),
             "workflow_count": lambda: gl_workflow_count(host, project),
+            "ref_checks": lambda ref: gl_ref_checks(host, project, ref),
             "workflow_runs": lambda sha: gl_workflow_runs(host, project, iid, sha),
             # The head pipeline's own status covers what Actions runs add on GitHub.
             "head_runs": lambda sha: ([], [], None),
@@ -914,12 +935,19 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             return True
         if has_checks(pr):
             return False
-        # External CI (a GitHub App or commit status) posts its first check some time
-        # after a push, so even a repository without workflows waits before it counts.
-        if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
-            return False
         if state["workflows"] is None:
             state["workflows"] = host["workflow_count"]()
+        # No workflow and not a check on the base's tip either: the repository has no CI
+        # at all, as release's step 1 defines it, and nothing is worth waiting for.
+        if state["workflows"] == 0:
+            if state.get("base_checks") is None:
+                state["base_checks"] = host["ref_checks"](pr["baseRefName"])
+            if state["base_checks"] == 0:
+                return f"no CI: the repository has no Actions workflow and {pr['baseRefName']} carries no checks"
+        # External CI (a GitHub App or commit status) posts its first check some time
+        # after a push, so a repository whose base has checks waits before it counts.
+        if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
+            return False
         if state["workflows"] == 0:
             return f"no CI: the repository has no Actions workflow and no check came in {CI_SETTLE // 60} min"
         if host["workflow_runs"](head) == 0:
