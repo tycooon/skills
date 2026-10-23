@@ -52,6 +52,7 @@ Transient trouble with one target is not a problem of the watch: the tick report
 - `review-scan list` (or `status` with no name) shows every watch on the machine: its targets, reviewer, whether it is scheduled, runs in flight and any problem. A nudge needs no watch name.
 - `review-scan status <watch>` shows the config and the last tick, then the PRs in four groups: runs going now (when each started, why, and its log), PRs waiting for a free slot, runs that ended without settling, and settled PRs with their verdict and head.
 - `review-scan nudge <pr-url> --head <sha>` makes every watch covering that PR look at it at once; address-pr's push step sends it. A nudge never changes the schedule.
+- `review-scan account <watch> <config dir>` moves the watch's runs to another Claude account: a config directory with its own login (`CLAUDE_CONFIG_DIR=<dir> claude auth login`), which the command links your rules, settings, skills and plugins into, so reviews behave the same. `review-scan account <watch> default` moves them back to the CLI's own login. Runs already going finish on the account they started with.
 - `review-scan uninstall <watch>` stops the schedule and kills runs still in flight. The state stays on disk, so `install` later picks up where the watch left off. After a long gap, start with a `tick --full`.
 
 Each run's brief, its stream-json log and its pidfile sit in the watch's state directory under `runs/`. When the user asks how a review went, read the log there; don't rerun the review.
