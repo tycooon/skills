@@ -71,6 +71,7 @@ class Base(unittest.TestCase):
         class A_: pass
         a = A_()
         a.watch, a.full, a.only, a.dry_run = watch, "--full" in flags, None, "--dry-run" in flags
+        a.chained = "--chained" in flags
         if "--only" in flags:
             a.only = flags[flags.index("--only") + 1]
         return a
@@ -435,6 +436,29 @@ class TargetToken(Base):
             rs.main(["init", self.watch, "--target", "acme/app", "--own", "x", "--token", "other=VAR"])
 
 
+class ChainedTick(Base):
+    def test_a_chained_tick_does_nothing_once_the_watch_is_uninstalled(self):
+        real = rs.is_scheduled
+        try:
+            rs.is_scheduled = lambda name: False
+            self.assertEqual(self.cli("tick", self.watch, "--chained")[0], 0)
+            self.assertEqual(self.spawned, [])
+            rs.is_scheduled = lambda name: True
+            self.cli("tick", self.watch, "--chained")
+            self.assertEqual(len(self.spawned), 2)
+        finally:
+            rs.is_scheduled = real
+
+    def test_a_manual_tick_runs_whether_or_not_the_watch_is_installed(self):
+        real = rs.is_scheduled
+        rs.is_scheduled = lambda name: False
+        try:
+            self.cli("tick", self.watch)
+        finally:
+            rs.is_scheduled = real
+        self.assertEqual(len(self.spawned), 2)
+
+
 class ChainTick(unittest.TestCase):
     def wrap(self, min_seconds, command):
         """Runs the real wrapper with a stand-in review-scan that records the tick it was asked for."""
@@ -452,7 +476,7 @@ class ChainTick(unittest.TestCase):
 
     def test_a_finished_run_starts_a_tick_and_keeps_its_exit_code(self):
         rc, ticked, pidfile_left = self.wrap(0, ["sh", "-c", "exit 3"])
-        self.assertEqual((rc, ticked, pidfile_left), (3, "tick work", False))
+        self.assertEqual((rc, ticked, pidfile_left), (3, "tick --chained work", False))
 
     def test_a_run_under_the_threshold_starts_none(self):
         rc, ticked, pidfile_left = self.wrap(60, ["true"])

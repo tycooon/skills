@@ -355,6 +355,11 @@ def owed_reason(rec, row, full):
 
 def cmd_tick(a, spawn=None):
     with Watch(a.watch).locked() as w:
+        # Checked under the lock, so a chained tick queued behind another one still sees an
+        # uninstall that landed while it waited: a stopped watch must not go on reviewing.
+        if getattr(a, "chained", False) and not is_scheduled(w.name):
+            w.log("chained tick skipped: the watch is not installed")
+            return 0
         return tick(w, a, spawn or spawn_run)
 
 
@@ -520,7 +525,7 @@ WRAPPER = """exe=$1 watch=$2 min=$3; shift 3
 start=$(date +%s)
 "$@"; rc=$?
 rm -f "$0"
-if [ $(( $(date +%s) - start )) -ge "$min" ]; then "$exe" tick "$watch" >/dev/null 2>&1 & fi
+if [ $(( $(date +%s) - start )) -ge "$min" ]; then "$exe" tick --chained "$watch" >/dev/null 2>&1 & fi
 exit $rc"""
 
 
@@ -822,6 +827,7 @@ def main(argv=None):
     t.add_argument("--full", action="store_true", help="treat every PR as owed (first pass, lost state)")
     t.add_argument("--only", help="consider just this PR")
     t.add_argument("--dry-run", action="store_true")
+    t.add_argument("--chained", action="store_true", help="started by a run that ended: do nothing unless the watch is installed")
     s = sub.add_parser("settle")
     s.add_argument("watch")
     s.add_argument("url")
