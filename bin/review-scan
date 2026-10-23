@@ -8,7 +8,8 @@
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
                      [--covered-by SHA] [--weighed THREAD]... [--recheck PR_URL]...
   review-scan nudge <pr-url> --head SHA
-  review-scan status <watch>
+  review-scan list
+  review-scan status [<watch>]
   review-scan install <watch> [--interval SECONDS]
   review-scan uninstall <watch>
 
@@ -223,9 +224,9 @@ def activity_since(url, since):
 
 
 def verdict_notes(posts):
-    """(author, sha) for each top-level verdict note: a post that starts with APPROVED and names
-    the head it approves, as review-pr writes one. A mention of the word elsewhere is not one."""
-    return {(who, sha) for who, body in posts if (body or "").lstrip().startswith("APPROVED")
+    """(author, sha) for each top-level verdict note: a post that starts with APPROVED, bold or
+    not, and names the head it approves, as review-pr writes one. A mention elsewhere is not one."""
+    return {(who, sha) for who, body in posts if (body or "").lstrip(" \t\r\n*_#>`").startswith("APPROVED")
             for sha in re.findall(r"\b[0-9a-f]{7,40}\b", body)}
 
 
@@ -398,10 +399,11 @@ def tick(w, a, spawn):
             continue
         owed.append((url, r, reason))
     in_flight = sum(w.running(u) for u in listed)
-    started, not_started = 0, []
+    started, not_started, waiting = 0, [], []
     for url, r, reason in owed:
         if in_flight + started >= cfg["max_parallel"]:
             accounting.append(f"{url}: owed ({reason}), waiting for a free slot")
+            waiting.append([url, reason])
             continue
         if a.dry_run:
             accounting.append(f"{url}: would start a run ({reason})")
@@ -439,6 +441,8 @@ def tick(w, a, spawn):
     if problem:
         print(problem)
     if not a.dry_run:
+        # The queue as this tick left it, for status: only the tick knows what is owed.
+        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "waiting": waiting}
         alert = w.prs.setdefault("_alert", {})
         if problem and alert.get("problem") != problem:
             notify(problem)  # once per new problem, not on every tick
@@ -628,25 +632,87 @@ def cmd_nudge(a):
     return 0
 
 
-def cmd_status(a):
+def is_scheduled(name):
+    """A launchd agent on a Mac; elsewhere a line in the user's crontab running this watch's tick."""
+    if sys.platform == "darwin":
+        return plist_path(name).exists()
+    try:
+        tab = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return re.search(rf"review-scan tick {re.escape(name)}(?![\w.-])", tab) is not None
+
+
+def cmd_list(a):
+    """Every watch on this machine: its targets, reviewer, schedule, runs in flight and any problem."""
+    watches = sorted(d.parent.name for d in HOME.glob("*/config.json"))
+    if not watches:
+        print(f"no watches in {HOME}; create one with `review-scan init`")
+        return 0
+    for name in watches:
+        w = Watch(name).load()
+        cfg = w.config
+        scheduled = "scheduled" if is_scheduled(name) else "not scheduled"
+        running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
+        print(f"{name}: reviewer {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight")
+        for t in cfg["targets"]:
+            print(f"  {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
+        problem = w.prs.get("_alert", {}).get("problem")
+        if problem:
+            print(f"  PROBLEM since {w.prs['_alert']['since']}: {problem}")
+    return 0
+
+
+def ago(t, now):
+    mins = int((now - parse_time(t)).total_seconds() // 60)
+    return f"{mins}m ago" if mins < 120 else f"{mins // 60}h ago"
+
+
+def cmd_status(a, limit=15):
+    if a.watch is None:
+        return cmd_list(a)
     w = Watch(a.watch).load()
-    cfg = w.config
+    cfg, now = w.config, now_utc()
     print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
-          f"dormant after {cfg['dormant_days']} days")
+          f"dormant after {cfg['dormant_days']} days, {'scheduled' if is_scheduled(w.name) else 'not scheduled'}")
     for t in cfg["targets"]:
         print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "")
               + (f" (posts with ${t['token']})" if t.get("token") else ""))
     if w.prs.get("_alert", {}).get("problem"):
         print(f"PROBLEM since {w.prs['_alert']['since']}: {w.prs['_alert']['problem']}")
-    for url, rec in sorted(w.prs.items()):
-        if url == "_alert":
-            continue
-        state = "running" if w.running(url) else ("settled " + rec["settled"]["at"]) if rec.get("settled") else "never settled"
-        print(f"  {url}: {state}" + (f", recheck pending" if rec.get("recheck") else ""))
-    log = w.dir / "scan.log"
-    if log.exists():
-        print("last scan lines:")
-        print("".join(log.read_text().splitlines(keepends=True)[-8:]), end="")
+    prs = {u: r for u, r in w.prs.items() if not u.startswith("_")}
+    tick = w.prs.get("_tick")
+    if tick:
+        print(f"last tick {tick['at']} ({ago(tick['at'], now)}): {tick['kept']} PRs kept, {tick['started']} started, "
+              f"{len(tick['waiting'])} waiting for a slot")
+    running, ended, settled = [], [], []
+    for url, rec in sorted(prs.items()):
+        run, done = rec.get("last_run") or {}, rec.get("settled")
+        if w.running(url):
+            running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
+                           f"log runs/{w.slug(url)}.jsonl")
+        elif run.get("started") and not (done and done["at"] >= run["started"]):
+            ended.append(f"{url}: run started {run['started']} ended without settling; log runs/{w.slug(url)}.jsonl")
+        elif done:
+            settled.append((done["at"], f"{url}: {done.get('verdict', 'settled')} at {done['head'][:12]}, {done['at']}"
+                            + (", recheck pending" if rec.get("recheck") else "")))
+    busy = {u for u, r in prs.items() if w.running(u) or (r.get("settled") and tick and r["settled"]["at"] >= tick["at"])}
+    waiting = [f"{u}: {why}" for u, why in (tick or {}).get("waiting", []) if u not in busy]
+    settled = [line for _, line in sorted(settled, reverse=True)]
+
+    def section(title, lines):
+        if not lines:
+            return
+        print(f"{title} ({len(lines)}):")
+        for line in lines[:limit]:
+            print(f"  {line}")
+        if len(lines) > limit:
+            print(f"  … and {len(lines) - limit} more")
+
+    section("running", running)
+    section("waiting for a slot", waiting)
+    section("ended without settling", ended)
+    section("settled, newest first", settled)
     return 0
 
 
@@ -735,14 +801,15 @@ def main(argv=None):
     n = sub.add_parser("nudge")
     n.add_argument("url")
     n.add_argument("--head", required=True)
-    for name in ("status", "uninstall"):
-        sub.add_parser(name).add_argument("watch")
+    sub.add_parser("list")
+    sub.add_parser("status").add_argument("watch", nargs="?", help="omit to list every watch")
+    sub.add_parser("uninstall").add_argument("watch")
     ins = sub.add_parser("install")
     ins.add_argument("watch")
     ins.add_argument("--interval", type=int, default=300)
     a = p.parse_args(argv)
     try:
-        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status,
+        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status, "list": cmd_list,
                 "install": cmd_install, "uninstall": cmd_uninstall}[a.cmd](a)
     except ScanError as e:
         print(f"error: {e}", file=sys.stderr)
