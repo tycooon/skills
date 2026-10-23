@@ -37,9 +37,10 @@ Exit codes:
 
 GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab and
 the same four conditions: an approval (a formal one, or a verdict note), every
-resolvable discussion resolved, the head pipeline green, and
-detailed_merge_status neither a conflict nor need_rebase. A discussion whose
-first note says "non-blocking" counts as an approved review's finding.
+resolvable discussion resolved, the head pipeline green (one on the head sha, or a
+merged results pipeline on the MR's merge ref), and detailed_merge_status neither
+a conflict nor need_rebase. A discussion whose first note says "non-blocking"
+counts as a finding of the verdict its reviewer posted with or after it.
 
 Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
@@ -382,20 +383,56 @@ GL_MERGE = {
     "discussions_not_resolved": ("MERGEABLE", "UNSTABLE"),
     "not_approved": ("MERGEABLE", "UNSTABLE"),
 }
-# A pipeline paused on a manual job has nothing automated left to run.
-GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "manual": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
+GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
+# The statuses with which GitLab says the pipeline still gates the merge.
+GL_CI_GATING = {"ci_must_pass", "ci_still_running"}
 NON_BLOCKING = re.compile(r"non[- ]blocking", re.I)
+VERDICT_NOTE = re.compile(r"^[\s*_#>`]*APPROVED\b")
 
 
 def gl_user(user):
     return {"login": (user or {}).get("username")} if user else None
 
 
+def gl_pipeline_state(pipeline, merge):
+    """A pipeline's state as a status check. `manual` means a blocking manual job is still
+    pending (optional ones don't change the status), so it is green only when GitLab says
+    the pipeline doesn't gate the merge."""
+    status = pipeline.get("status")
+    if status == "manual":
+        return "PENDING" if merge in GL_CI_GATING else "SUCCESS"
+    return GL_PIPELINE.get(status, "PENDING")
+
+
+def head_pipeline(mr):
+    """The MR's head pipeline when it tests the current head: one on the head sha, or a
+    merged results (or merge train) pipeline on the MR's merge ref, whose sha is the merge
+    commit's. A push recreates that ref and its pipeline, so an older push's one doesn't stay."""
+    pipeline = mr.get("head_pipeline") or {}
+    merge_refs = {f"refs/merge-requests/{mr.get('iid')}/merge", f"refs/merge-requests/{mr.get('iid')}/train"}
+    if pipeline and (pipeline.get("sha") == mr["sha"] or pipeline.get("ref") in merge_refs):
+        return pipeline
+    return None
+
+
+def gl_position(note):
+    """(path, first, last, side) of a diff note's original anchor. GitLab moves `position`
+    to newer diff versions, so `original_position` wins when it is there."""
+    pos = note.get("original_position") or note.get("position") or {}
+    rng = pos.get("line_range") or {}
+    start, end = rng.get("start") or {}, rng.get("end") or {}
+    last = pos.get("new_line") or end.get("new_line")
+    first = start.get("new_line") or last
+    return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT"
+
+
 def gl_mr_to_pr(mr, discussions, commit):
-    """One GitLab read in the GitHub PR shape: approvals as formal reviews (their system
-    notes carry who and when), top-level notes as comments, resolvable discussions as
-    review threads, the head pipeline as the one status check."""
-    reviews, comments, threads = [], [], []
+    """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
+    when) and APPROVED verdict notes as reviews, other top-level notes as comments,
+    resolvable discussions as review threads, the head pipeline as the one status check.
+    A non-blocking finding is tied to the verdict its reviewer posted with or after it, as a
+    GitHub finding belongs to the approving review that opened it."""
+    reviews, comments, threads, replies = [], [], [], 0
     for d in discussions:
         notes = d.get("notes") or []
         human = [n for n in notes if not n.get("system")]
@@ -410,23 +447,40 @@ def gl_mr_to_pr(mr, discussions, commit):
         resolvable = [n for n in human if n.get("resolvable")]
         if resolvable:
             first, last = human[0], human[-1]
-            pos = first.get("position") or {}
+            path, line_first, line_last, side = gl_position(first)
             threads.append({
                 "isResolved": all(n.get("resolved") for n in resolvable),
-                "path": pos.get("new_path"), "line": pos.get("new_line"), "originalLine": pos.get("new_line"),
+                "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
                 "comments": {"nodes": [{"author": gl_user(first.get("author")), "pullRequestReview": {
                     "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
                 "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author"))}]},
+                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"],
             })
-        else:
-            comments += [{"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]} for n in human]
-    pipeline = mr.get("head_pipeline") or {}
-    contexts = []
-    if pipeline and pipeline.get("sha") == mr["sha"]:
-        contexts.append({"__typename": "StatusContext", "context": f"pipeline {pipeline.get('id')}",
-                         "state": GL_PIPELINE.get(pipeline.get("status"), "PENDING"),
-                         "createdAt": pipeline.get("finished_at") or pipeline.get("updated_at")})
+            # A reply lands inside its thread and moves no other count; review_count reads this.
+            replies += len(human) - 1
+            continue
+        for n in human:
+            shas = SHA.findall(n.get("body") or "")
+            if VERDICT_NOTE.match(n.get("body") or "") and shas:
+                reviews.append({"id": f"verdict-{n['id']}", "author": gl_user(n.get("author")), "submittedAt": n["created_at"],
+                                "state": "APPROVED", "body": n.get("body") or "", "commit": {"oid": shas[-1]}})
+            else:
+                comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
+    verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
+    for t in threads:
+        opener = t["comments"]["nodes"][0]["pullRequestReview"]
+        if opener["state"] == "APPROVED":
+            owner = next((r for r in verdict_notes if (r["author"] or {}).get("login") == t["_opened"]
+                          and ts(r["submittedAt"]) >= ts(t["_at"])), None)
+            opener["id"] = owner["id"] if owner else None
+        del t["_opened"], t["_at"]
     merge = "conflict" if mr.get("has_conflicts") else mr.get("detailed_merge_status")
+    pipeline = head_pipeline(mr)
+    contexts = []
+    if pipeline:
+        contexts.append({"__typename": "StatusContext", "context": f"pipeline {pipeline.get('id')}",
+                         "state": gl_pipeline_state(pipeline, merge),
+                         "createdAt": pipeline.get("finished_at") or pipeline.get("updated_at")})
     mergeable, status = GL_MERGE.get(merge, ("MERGEABLE", "BLOCKED"))
     return {
         "state": {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED"}.get(mr["state"], "CLOSED"),
@@ -435,6 +489,7 @@ def gl_mr_to_pr(mr, discussions, commit):
         "reviewThreads": {"totalCount": len(threads), "nodes": threads},
         "reviews": {"totalCount": len(reviews), "nodes": reviews},
         "comments": {"totalCount": len(comments), "nodes": comments},
+        "threadReplies": replies,
         "commits": {"nodes": [{"commit": {"oid": mr["sha"], "committedDate": (commit or {}).get("committed_date"),
                                           "statusCheckRollup": {"contexts": {"nodes": contexts}} if contexts else None}}]},
     }
@@ -494,8 +549,14 @@ def gl_workflow_count(host, project):
         return 0
 
 
-def gl_workflow_runs(host, project, sha):
-    return len(glab(host, f"{gl_project(project)}/pipelines?sha={sha}&per_page=1"))
+def gl_workflow_runs(host, project, iid, sha):
+    """Pipelines that may test this head: any on its sha, and any merged results or merge
+    train pipeline of the MR, whose sha is a merge commit's. Counting the MR's own too
+    errs toward waiting rather than taking a head for one CI never ran on."""
+    on_sha = len(glab(host, f"{gl_project(project)}/pipelines?sha={sha}&per_page=1"))
+    merge_refs = (f"refs/merge-requests/{iid}/merge", f"refs/merge-requests/{iid}/train")
+    of_mr = [p for p in glab(host, f"{gl_project(project)}/merge_requests/{iid}/pipelines?per_page=20") if p.get("ref") in merge_refs]
+    return on_sha + len(of_mr)
 
 
 def forge(url):
@@ -522,7 +583,7 @@ def forge(url):
             "merged_branch_tip": lambda branch: gl_merged_branch_tip(host, project, branch),
             "changed_hunks": lambda old, new: gl_changed_hunks(host, project, old, new),
             "workflow_count": lambda: gl_workflow_count(host, project),
-            "workflow_runs": lambda sha: gl_workflow_runs(host, project, sha),
+            "workflow_runs": lambda sha: gl_workflow_runs(host, project, iid, sha),
             # The head pipeline's own status covers what Actions runs add on GitHub.
             "head_runs": lambda sha: ([], [], None),
         }
@@ -786,7 +847,8 @@ def evaluate(pr, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
 
 
 def review_count(pr):
-    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "comments", "reviewThreads"))
+    # GitHub counts a thread reply as a review; a GitLab read counts its replies apart.
+    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "comments", "reviewThreads")) + pr.get("threadReplies", 0)
 
 
 def newest_review_time(pr):
