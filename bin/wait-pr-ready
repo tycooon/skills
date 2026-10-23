@@ -594,6 +594,29 @@ def forge(url):
     return None
 
 
+def base_sync_test(host):
+    """same_authored_lines(pr, old, new, at) for one forge() host, caching each read:
+    old's lines against the base its verdict was posted under, new's against today's."""
+    cache = {}
+
+    def lines(base, sha, current_base):
+        if (base, sha) not in cache:
+            found = host["authored_lines"](base, sha)
+            if found is None and base != current_base:
+                # A base branch deleted when its PR merged: read against that PR's last head.
+                tip = host["merged_branch_tip"](base)
+                found = host["authored_lines"](tip, sha) if tip else None
+            cache[base, sha] = found
+        return cache[base, sha]
+
+    def same_authored_lines(pr, old, new, at):
+        current = pr["baseRefName"]
+        before = lines(base_at(pr, at), old, current)
+        return before is not None and before == lines(current, new, current)
+
+    return same_authored_lines
+
+
 # Conclusions that mean the head's CI broke. A cancelled run is left out: a newer push
 # or a rerun cancels runs routinely, and the gates still hold the PR not ready.
 FAILED_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
@@ -809,6 +832,23 @@ def answers_findings(hunks, ranges):
     )
 
 
+def carries(pr, sha, head, at, reviewers, same_authored_lines, hunks_between=None):
+    """How an approval of `sha` posted at `at` still covers `head`, as the end of a reason
+    line, or None: `head` is a base-sync of `sha`, or the commits after it change only the
+    lines of the non-blocking findings that approval left. review-scan's settle applies
+    the same test to an earlier head a review run says still covers the current one."""
+    if same_authored_lines(sha, head, at):
+        return f", a base-sync of {head[:12]}"
+    # An approval with non-blocking findings carries to the author's fix: commits
+    # after it whose every changed line sits within those findings' lines.
+    ranges = finding_ranges(pr, sha, reviewers) if hunks_between else {}
+    if ranges:
+        hunks = hunks_between(sha, head)
+        if hunks is not None and answers_findings(hunks, ranges):
+            return "; later commits change only its findings' lines"
+    return None
+
+
 def approval_state(pr, reviewers, same_authored_lines, hunks_between=None):
     head = pr["headRefOid"]
     head_date = ts(pr["commits"]["nodes"][0]["commit"]["committedDate"]) if pr["commits"]["nodes"] else 0
@@ -818,15 +858,9 @@ def approval_state(pr, reviewers, same_authored_lines, hunks_between=None):
             continue
         if sha == head or (sha is None and ts(at) >= head_date):
             return True, f"approved by {login} on {head[:12]}"
-        if sha and same_authored_lines(sha, head, at):
-            return True, f"approved by {login} on {sha[:12]}, a base-sync of {head[:12]}"
-        # An approval with non-blocking findings carries to the author's fix: commits
-        # after it whose every changed line sits within those findings' lines.
-        ranges = finding_ranges(pr, sha, reviewers) if sha and hunks_between else {}
-        if ranges:
-            hunks = hunks_between(sha, head)
-            if hunks is not None and answers_findings(hunks, ranges):
-                return True, f"approved by {login} on {sha[:12]}; later commits change only its findings' lines"
+        how = sha and carries(pr, sha, head, at, reviewers, same_authored_lines, hunks_between)
+        if how:
+            return True, f"approved by {login} on {sha[:12]}{how}"
     reason = "no AI reviewer verdict yet" if not found else "no AI reviewer approval covering " + head[:12]
     unlisted = sorted({
         a["login"] for _, a, _, _, st, commit in posts(pr)
@@ -890,23 +924,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         return 2
     started = now()
     state = {"expected": args.head, "head_seen": args.head is None, "reviews": None, "seen_at": {}, "workflows": None}
-    lines_cache = {}
-
-    def lines(base, sha, current_base):
-        if (base, sha) not in lines_cache:
-            found = host["authored_lines"](base, sha)
-            if found is None and base != current_base:
-                # A base branch deleted when its PR merged: read against that PR's last head.
-                tip = host["merged_branch_tip"](base)
-                found = host["authored_lines"](tip, sha) if tip else None
-            lines_cache[base, sha] = found
-        return lines_cache[base, sha]
-
-    def same_authored_lines(pr, old, new, at):
-        """old's lines against the base its verdict was posted under, new's against today's."""
-        current = pr["baseRefName"]
-        before = lines(base_at(pr, at), old, current)
-        return before is not None and before == lines(current, new, current)
+    same_authored_lines = base_sync_test(host)
 
     def without_checks(pr, head):
         """Why the head has no checks to wait for, or False while some may still come."""
