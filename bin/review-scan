@@ -355,6 +355,11 @@ def owed_reason(rec, row, full):
 
 def cmd_tick(a, spawn=None):
     with Watch(a.watch).locked() as w:
+        # Checked under the lock, so a chained tick queued behind another one still sees an
+        # uninstall that landed while it waited: a stopped watch must not go on reviewing.
+        if getattr(a, "chained", False) and not is_scheduled(w.name):
+            w.log("chained tick skipped: the watch is not installed")
+            return 0
         return tick(w, a, spawn or spawn_run)
 
 
@@ -515,6 +520,15 @@ def claude_logged_in():
     return _logged_in
 
 
+CHAIN_AFTER = 60
+WRAPPER = """exe=$1 watch=$2 min=$3; shift 3
+start=$(date +%s)
+"$@"; rc=$?
+rm -f "$0"
+if [ $(( $(date +%s) - start )) -ge "$min" ]; then "$exe" tick --chained "$watch" >/dev/null 2>&1 & fi
+exit $rc"""
+
+
 def spawn_run(w, url, brief):
     slug = w.slug(url)
     (w.runs / f"{slug}.brief.md").write_text(brief)
@@ -526,8 +540,11 @@ def spawn_run(w, url, brief):
     if not claude_logged_in():
         raise PermissionError("the claude CLI is logged out; run `claude auth login`")
     pidfile = w.runs / f"{slug}.pid"
-    # The shell outlives the run only to remove its pidfile, so a finished run leaves none.
-    wrapper = ["/bin/sh", "-c", '"$@"; rc=$?; rm -f "$0"; exit $rc', str(pidfile), *cmd]
+    # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
+    # start the next tick at once: runs take a minute or two, so waiting for the schedule left
+    # the slots idle most of each interval. A run shorter than CHAIN_AFTER starts none, so a
+    # run that dies on start can't spin the watch; the schedule picks it up again.
+    wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
     with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
         p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
                              start_new_session=True)
@@ -810,6 +827,7 @@ def main(argv=None):
     t.add_argument("--full", action="store_true", help="treat every PR as owed (first pass, lost state)")
     t.add_argument("--only", help="consider just this PR")
     t.add_argument("--dry-run", action="store_true")
+    t.add_argument("--chained", action="store_true", help="started by a run that ended: do nothing unless the watch is installed")
     s = sub.add_parser("settle")
     s.add_argument("watch")
     s.add_argument("url")
@@ -830,7 +848,7 @@ def main(argv=None):
     sub.add_parser("uninstall").add_argument("watch")
     ins = sub.add_parser("install")
     ins.add_argument("watch")
-    ins.add_argument("--interval", type=int, default=300)
+    ins.add_argument("--interval", type=int, default=120, help="seconds between scheduled ticks (default: 120)")
     a = p.parse_args(argv)
     try:
         return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status, "list": cmd_list,
