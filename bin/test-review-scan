@@ -469,7 +469,8 @@ class ChainTick(unittest.TestCase):
         rs.subprocess.Popen, rs.proc_start = FakePopen, (lambda pid: "t")
         rs.claude_logged_in, rs.shutil.which = (lambda: True), (lambda name: "/bin/claude")
         try:
-            rs.main(["init", "chain", "--target", "acme/app", "--own", "x"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rs.main(["init", "chain", "--target", "acme/app", "--own", "x"])
             rs.spawn_run(rs.Watch("chain").load(), PR1, "brief")
         finally:
             rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which = real
