@@ -150,7 +150,7 @@ class GitLab(unittest.TestCase):
     def test_an_approval_with_non_blocking_findings_covers_the_fix_on_those_lines(self):
         verdict = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {OLD} — AI reviewer: Claude", at="2026-10-15T10:00:00Z")]}
         nit = gl_note(2, "review-bot", "P3 (non-blocking): rename", at="2026-10-15T09:59:00Z", resolvable=True)
-        nit["position"] = {"new_path": "src/a.rs", "new_line": 40}
+        nit["position"] = {"new_path": "src/a.rs", "new_line": 40, "head_sha": OLD}
         pr = gl_pr(discussions=[{"notes": [nit, gl_note(3, "dev", "Done", resolvable=True)]}, verdict])
         self.assertEqual(pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["pullRequestReview"]["id"], "verdict-1")
         def run(hunks):
@@ -160,6 +160,10 @@ class GitLab(unittest.TestCase):
         self.assertTrue(ready, reasons)
         self.assertIn("later commits change only its findings' lines", reasons[0])
         self.assertFalse(run({"src/a.rs": [(200, 200, 1)]})[0])
+        # Re-anchored to a later head, the note's lines are in that head's numbering: no carry.
+        nit["position"]["head_sha"] = HEAD
+        moved = gl_pr(discussions=[{"notes": [nit, gl_note(3, "dev", "Done", resolvable=True)]}, verdict])
+        self.assertIsNone(moved["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["pullRequestReview"]["id"])
 
     def test_a_pipeline_for_another_sha_is_no_check(self):
         pr = gl_pr()

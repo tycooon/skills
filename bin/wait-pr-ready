@@ -40,7 +40,8 @@ the same four conditions: an approval (a formal one, or a verdict note), every
 resolvable discussion resolved, the head pipeline green (one on the head sha, or a
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
 a conflict nor need_rebase. A discussion whose first note says "non-blocking"
-counts as a finding of the verdict its reviewer posted with or after it.
+counts as a finding of the verdict its reviewer posted with or after it, while the
+note is still anchored at that verdict's commit.
 
 Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
@@ -416,14 +417,15 @@ def head_pipeline(mr):
 
 
 def gl_position(note):
-    """(path, first, last, side) of a diff note's original anchor. GitLab moves `position`
-    to newer diff versions, so `original_position` wins when it is there."""
-    pos = note.get("original_position") or note.get("position") or {}
+    """(path, first, last, side, head_sha) of a diff note's anchor. GitLab moves `position`
+    to newer diff versions as the MR is pushed to, and its REST API returns no original
+    one, so the lines are in the numbering of `head_sha`, whatever commit that now is."""
+    pos = note.get("position") or {}
     rng = pos.get("line_range") or {}
     start, end = rng.get("start") or {}, rng.get("end") or {}
     last = pos.get("new_line") or end.get("new_line")
     first = start.get("new_line") or last
-    return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT"
+    return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT", pos.get("head_sha")
 
 
 def gl_mr_to_pr(mr, discussions, commit):
@@ -447,14 +449,14 @@ def gl_mr_to_pr(mr, discussions, commit):
         resolvable = [n for n in human if n.get("resolvable")]
         if resolvable:
             first, last = human[0], human[-1]
-            path, line_first, line_last, side = gl_position(first)
+            path, line_first, line_last, side, anchored_at = gl_position(first)
             threads.append({
                 "isResolved": all(n.get("resolved") for n in resolvable),
                 "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
                 "comments": {"nodes": [{"author": gl_user(first.get("author")), "pullRequestReview": {
                     "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
                 "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author"))}]},
-                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"],
+                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"], "_anchor": anchored_at,
             })
             # A reply lands inside its thread and moves no other count; review_count reads this.
             replies += len(human) - 1
@@ -472,8 +474,10 @@ def gl_mr_to_pr(mr, discussions, commit):
         if opener["state"] == "APPROVED":
             owner = next((r for r in verdict_notes if (r["author"] or {}).get("login") == t["_opened"]
                           and ts(r["submittedAt"]) >= ts(t["_at"])), None)
-            opener["id"] = owner["id"] if owner else None
-        del t["_opened"], t["_at"]
+            # Its lines match the verdict's hunks only while GitLab still anchors the note at the
+            # verdict's commit; once re-anchored to a later head, the carry is skipped: a stall.
+            opener["id"] = owner["id"] if owner and t["_anchor"] == owner["commit"]["oid"] else None
+        del t["_opened"], t["_at"], t["_anchor"]
     merge = "conflict" if mr.get("has_conflicts") else mr.get("detailed_merge_status")
     pipeline = head_pipeline(mr)
     contexts = []
