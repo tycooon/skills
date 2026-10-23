@@ -399,7 +399,7 @@ def tick(w, a, spawn):
             continue
         owed.append((url, r, reason))
     in_flight = sum(w.running(u) for u in listed)
-    started, not_started, waiting = 0, [], []
+    started, not_started, waiting, started_urls = 0, [], [], []
     for url, r, reason in owed:
         if in_flight + started >= cfg["max_parallel"]:
             accounting.append(f"{url}: owed ({reason}), waiting for a free slot")
@@ -421,6 +421,7 @@ def tick(w, a, spawn):
         rec.update(last_run={"started": iso(now), "head": r["head"], "reason": reason,
                              "recheck": list(rec.get("recheck", []))})
         started += 1
+        started_urls.append(url)
         accounting.append(f"{url}: started a run ({reason})")
     if not a.dry_run:
         for t in finished:
@@ -442,7 +443,8 @@ def tick(w, a, spawn):
         print(problem)
     if not a.dry_run:
         # The queue as this tick left it, for status: only the tick knows what is owed.
-        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "waiting": waiting}
+        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
+                          "waiting": waiting}
         alert = w.prs.setdefault("_alert", {})
         if problem and alert.get("problem") != problem:
             notify(problem)  # once per new problem, not on every tick
@@ -685,6 +687,17 @@ def cmd_status(a, limit=15):
     if tick:
         print(f"last tick {tick['at']} ({ago(tick['at'], now)}): {tick['kept']} PRs kept, {tick['started']} started, "
               f"{len(tick['waiting'])} waiting for a slot")
+        # What became of the runs it started: they often settle within minutes, before anyone looks.
+        for url in tick.get("started_urls", []):
+            rec = prs.get(url, {})
+            run, done = rec.get("last_run") or {}, rec.get("settled")
+            if w.running(url):
+                fate = f"running for {ago(run['started'], now)[:-4]}"
+            elif done and run.get("started") and done["at"] >= run["started"]:
+                fate = f"settled {done.get('verdict', '')} at {done['at']}".replace("  ", " ")
+            else:
+                fate = "ended without settling"
+            print(f"  started {url}: {fate}")
     running, ended, settled = [], [], []
     for url, rec in sorted(prs.items()):
         run, done = rec.get("last_run") or {}, rec.get("settled")

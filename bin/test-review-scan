@@ -397,6 +397,9 @@ class Status(Base):
         finally:
             rs.Watch.running, rs.is_scheduled = real_running, real_sched
         self.assertIn("3 started, 2 waiting for a slot", out)
+        self.assertIn(f"  started {PR1}: settled approved at", out)
+        self.assertIn("  started https://github.com/acme/app/pull/3: running for", out)
+        self.assertIn("  started https://github.com/acme/app/pull/2: ended without settling", out)
         self.assertIn("running (1):\n  https://github.com/acme/app/pull/3: started", out)
         self.assertIn("waiting for a slot (2):", out)
         self.assertIn("ended without settling (1):\n  https://github.com/acme/app/pull/2", out)
