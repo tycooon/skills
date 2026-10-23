@@ -284,8 +284,9 @@ class Spawn(Base):
             def __init__(self, cmd, **kw):
                 seen["cmd"], self.pid = cmd, 4242
 
-        real, real_start = rs.subprocess.Popen, rs.proc_start
+        real, real_start, real_login = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in
         rs.subprocess.Popen = FakePopen
+        rs.claude_logged_in = lambda: True
         rs.proc_start = lambda pid: "Fri Oct 23 12:00:00 2026" if pid == 4242 else None
         try:
             w = rs.Watch(self.watch).load()
@@ -297,7 +298,37 @@ class Spawn(Base):
             rs.proc_start = lambda pid: "Sat Oct 24 09:00:00 2026"  # pid reused by another process
             self.assertFalse(w.running(PR1))
         finally:
-            rs.subprocess.Popen, rs.proc_start = real, real_start
+            rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in = real, real_start, real_login
+
+    def test_a_logged_out_cli_fails_the_start_and_notifies(self):
+        real_login = rs.claude_logged_in
+        rs.claude_logged_in = lambda: False
+        try:
+            code, out = self.cli("tick", self.watch, spawn=rs.spawn_run)
+        finally:
+            rs.claude_logged_in = real_login
+        self.assertEqual(code, 5)
+        self.assertEqual(out.count("FAILED to start (the claude CLI is logged out"), 2)
+        self.assertNotIn("last_run", self.prs()[PR1])
+        self.assertEqual(len(self.notified), 1)
+
+    def test_login_status_is_read_once_and_unreadable_is_not_logged_out(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return rs.subprocess.CompletedProcess(cmd, 1, stdout=self.status_out, stderr="")
+
+        real_run = rs.subprocess.run
+        rs.subprocess.run = fake_run
+        try:
+            for out, expected in (('{"loggedIn": false}', False), ('{"loggedIn": true}', True), ("garbage", True)):
+                rs._logged_in, self.status_out = None, out
+                self.assertEqual(rs.claude_logged_in(), expected)
+                rs.claude_logged_in()
+            self.assertEqual(len(calls), 3)
+        finally:
+            rs.subprocess.run, rs._logged_in = real_run, None
 
 
 class Nudge(Base):

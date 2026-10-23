@@ -479,6 +479,23 @@ def build_brief(w, r, rec, reason, siblings, now):
     return "\n".join(lines) + "\n"
 
 
+_logged_in = None
+
+
+def claude_logged_in():
+    """Whether the claude CLI has a login, read once per process. Its login is separate from the
+    desktop app's, and a logged-out CLI fails every run in its first second, so the tick checks
+    before starting any. An unreadable status is not taken as logged out: the run's own log says why."""
+    global _logged_in
+    if _logged_in is None:
+        try:
+            p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30)
+            _logged_in = json.loads(p.stdout).get("loggedIn") is not False
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            _logged_in = True
+    return _logged_in
+
+
 def spawn_run(w, url, brief):
     slug = w.slug(url)
     (w.runs / f"{slug}.brief.md").write_text(brief)
@@ -487,6 +504,8 @@ def spawn_run(w, url, brief):
            "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
     if not shutil.which("claude"):  # inside the wrapper a missing CLI would fail unseen
         raise FileNotFoundError("claude is not on PATH")
+    if not claude_logged_in():
+        raise PermissionError("the claude CLI is logged out; run `claude auth login`")
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run only to remove its pidfile, so a finished run leaves none.
     wrapper = ["/bin/sh", "-c", '"$@"; rc=$?; rm -f "$0"; exit $rc', str(pidfile), *cmd]

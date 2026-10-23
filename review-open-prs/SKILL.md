@@ -40,7 +40,7 @@ A watch is not a long-running agent session. `~/.claude/bin/review-scan` (instal
 **When a watch has trouble.** The tick sends a desktop notification once when a new problem starts (on a Mac; elsewhere it writes the problem to `cron.log` in the watch's state directory, the file the printed crontab line appends to), and `status` shows it on its first line until it clears. Three problems qualify:
 
 - none of the targets could be read, usually an expired token or lost access;
-- a review run failed to start, such as `claude` missing from the login shell's PATH;
+- a review run failed to start, such as `claude` missing from the login shell's PATH, or its CLI logged out (its login is separate from the desktop app's; `claude auth login` restores it);
 - nothing is left to watch, because every named PR merged or closed.
 
 Transient trouble with one target is not a problem of the watch: the tick reports it as `UNREAD` and tries again next time.
