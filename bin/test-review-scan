@@ -337,17 +337,31 @@ class Init(unittest.TestCase):
 
 class List(Base):
     def test_list_and_bare_status_show_every_watch(self):
-        real, real_plist = rs.our_pid, rs.plist_path
+        real, real_sched = rs.our_pid, rs.is_scheduled
         rs.our_pid = lambda pidfile: None
-        rs.plist_path = lambda name: Path(TMP.name) / "no-such.plist"
+        rs.is_scheduled = lambda name: False
         try:
             _, out = self.cli("list")
             _, bare = self.cli("status")
         finally:
-            rs.our_pid, rs.plist_path = real, real_plist
+            rs.our_pid, rs.is_scheduled = real, real_sched
         self.assertIn(f"{self.watch}: reviewer sonnet, not scheduled, 0 run(s) in flight", out)
         self.assertIn("  acme/app", out)
         self.assertEqual(out, bare)
+
+
+class Scheduled(unittest.TestCase):
+    def test_off_macos_the_crontab_line_counts(self):
+        tab = "*/5 * * * * /bin/bash -lc 'exec /home/u/.claude/bin/review-scan tick work' >> /x/cron.log 2>&1\n"
+        real_platform, real_run = rs.sys.platform, rs.subprocess.run
+        rs.sys.platform = "linux"
+        rs.subprocess.run = lambda cmd, **kw: rs.subprocess.CompletedProcess(cmd, 0, stdout=tab, stderr="")
+        try:
+            self.assertTrue(rs.is_scheduled("work"))
+            self.assertFalse(rs.is_scheduled("wor"))
+            self.assertFalse(rs.is_scheduled("main"))
+        finally:
+            rs.sys.platform, rs.subprocess.run = real_platform, real_run
 
 
 class Covers(unittest.TestCase):

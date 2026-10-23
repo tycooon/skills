@@ -597,6 +597,17 @@ def cmd_nudge(a):
     return 0
 
 
+def is_scheduled(name):
+    """A launchd agent on a Mac; elsewhere a line in the user's crontab running this watch's tick."""
+    if sys.platform == "darwin":
+        return plist_path(name).exists()
+    try:
+        tab = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return re.search(rf"review-scan tick {re.escape(name)}(?![\w.-])", tab) is not None
+
+
 def cmd_list(a):
     """Every watch on this machine: its targets, reviewer, schedule, runs in flight and any problem."""
     watches = sorted(d.parent.name for d in HOME.glob("*/config.json"))
@@ -606,7 +617,7 @@ def cmd_list(a):
     for name in watches:
         w = Watch(name).load()
         cfg = w.config
-        scheduled = "scheduled" if plist_path(name).exists() else "not scheduled"
+        scheduled = "scheduled" if is_scheduled(name) else "not scheduled"
         running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
         print(f"{name}: reviewer {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight")
         for t in cfg["targets"]:
