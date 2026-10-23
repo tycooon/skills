@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Drive a review-open-prs watch without a long-running agent session.
 
-  review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--reviewer-model MODEL] [--effort LEVEL]
+  review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--token SPEC=ENV_VAR]...
+                   [--reviewer-model MODEL] [--effort LEVEL]
                    --own LOGIN... [--max-parallel N] [--dormant-days N]
   review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
@@ -304,19 +305,26 @@ class Watch:
 
 # --- commands ----------------------------------------------------------------------
 
+def per_target(a, option, what):
+    """--OPTION SPEC=VALUE pairs as {spec: value}, each spec one of --target."""
+    out = {}
+    for f in getattr(a, option) or []:
+        spec, sep, value = f.partition("=")
+        if not sep:
+            raise SystemExit(f"--{option} takes SPEC={what}, got {f!r}")
+        out[spec] = value
+    unknown = set(out) - set(a.target)
+    if unknown:
+        raise SystemExit(f"--{option} names a target not in --target: {', '.join(sorted(unknown))}")
+    return out
+
+
 def cmd_init(a):
     w = Watch(a.watch)
-    filters = {}
-    for f in a.filter or []:
-        spec, sep, text = f.partition("=")
-        if not sep:
-            raise SystemExit(f"--filter takes SPEC=TEXT, got {f!r}")
-        filters[spec] = text
-    unknown = set(filters) - set(a.target)
-    if unknown:
-        raise SystemExit(f"--filter names a target not in --target: {', '.join(sorted(unknown))}")
+    filters = per_target(a, "filter", "TEXT")
+    tokens = per_target(a, "token", "ENV_VAR")
     w.runs.mkdir(parents=True, exist_ok=True)
-    config = {"targets": [{"spec": t, "filter": filters.get(t)} for t in a.target],
+    config = {"targets": [{"spec": t, "filter": filters.get(t), "token": tokens.get(t)} for t in a.target],
               "reviewer_model": a.reviewer_model, "effort": a.effort, "own": a.own,
               "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
     write_json(w.dir / "config.json", config)
@@ -370,7 +378,7 @@ def tick(w, a, spawn):
             if parse_time(r["updated"]) < cutoff and not r["named"]:
                 dormant += 1
                 continue
-            r["target"], r["filter"] = t["spec"], t.get("filter")
+            r["target"], r["filter"], r["token"] = t["spec"], t.get("filter"), t.get("token")
             listed[r["url"]] = r
             kept += 1
         accounting.append(f"{t['spec']}: {len(rows)} listed, {kept} kept, {drafts} draft, {dormant} dormant")
@@ -458,6 +466,9 @@ def build_brief(w, r, rec, reason, siblings, now):
     ]
     if r.get("filter"):
         lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
+    if r.get("token"):
+        lines.append(f"- Post on this target with the token in `${r['token']}`, not the default reviewer-bot variable: "
+                     "export its value as the reviewer token for the posting commands.")
     settled = rec.get("settled")
     if settled:
         lines.append(f"- Last settled by this watch at head `{settled['head']}` on {settled['at']}; that is the head you last reviewed.")
@@ -602,7 +613,8 @@ def cmd_status(a):
     print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
           f"dormant after {cfg['dormant_days']} days")
     for t in cfg["targets"]:
-        print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
+        print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "")
+              + (f" (posts with ${t['token']})" if t.get("token") else ""))
     if w.prs.get("_alert", {}).get("problem"):
         print(f"PROBLEM since {w.prs['_alert']['since']}: {w.prs['_alert']['problem']}")
     for url, rec in sorted(w.prs.items()):
@@ -674,6 +686,8 @@ def main(argv=None):
     i.add_argument("watch")
     i.add_argument("--target", action="append", required=True)
     i.add_argument("--filter", action="append", help="SPEC=TEXT: a judgment-call filter the run applies")
+    i.add_argument("--token", action="append",
+                   help="SPEC=ENV_VAR: the variable holding this target's posting token, when the default reviewer-bot one can't post there")
     i.add_argument("--reviewer-model", default="opus", help="model for every review run (default: opus)")
     i.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     i.add_argument("--own", action="append", required=True,

@@ -335,6 +335,20 @@ class Init(unittest.TestCase):
             rs.main(["init", "noown", "--target", "acme/app"])
 
 
+class TargetToken(Base):
+    def test_a_target_token_reaches_the_brief_and_status(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot",
+                 "--token", "acme/app=PR_REVIEW_TOKEN_ACME")
+        self.cli("tick", self.watch)
+        self.assertIn("`$PR_REVIEW_TOKEN_ACME`", self.spawned[0][1])
+        _, out = self.cli("status", self.watch)
+        self.assertIn("posts with $PR_REVIEW_TOKEN_ACME", out)
+
+    def test_a_token_for_an_unknown_target_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            rs.main(["init", self.watch, "--target", "acme/app", "--own", "x", "--token", "other=VAR"])
+
+
 class Covers(unittest.TestCase):
     def test_specs(self):
         self.assertTrue(rs.covers("acme/app", PR1))
