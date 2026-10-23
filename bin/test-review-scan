@@ -414,6 +414,15 @@ class Status(Base):
         self.assertIn(f"ended without settling (1):\n  {PR1}: run started", out)
         self.assertNotIn(f"  {PR2}: run started", out)
 
+    def test_an_ended_run_stays_while_its_target_cannot_be_read(self):
+        self.cli("tick", self.watch)  # runs start for 1 and 2, and neither settles
+        def boom(spec):
+            raise rs.ScanError("403")
+        rs.list_target = boom
+        self.cli("tick", self.watch)
+        _, out = self.cli("status", self.watch)
+        self.assertIn(f"ended without settling (2):\n  {PR1}: run started", out)
+
 
 class Scheduled(unittest.TestCase):
     def test_off_macos_the_crontab_line_counts(self):

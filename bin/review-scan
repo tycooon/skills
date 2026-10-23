@@ -452,9 +452,12 @@ def tick(w, a, spawn):
     if problem:
         print(problem)
     if not a.dry_run:
-        # The queue as this tick left it, for status: only the tick knows what is owed.
+        # The queue as this tick left it, for status: only the tick knows what is owed. A target it
+        # could not read keeps the PRs the previous tick kept there, so their ended runs still show.
+        kept_urls = set(listed) | {u for u in (w.prs.get("_tick") or {}).get("kept_urls", [])
+                                   if any(covers(spec, u) for spec in failed)}
         w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
-                          "waiting": waiting, "kept_urls": sorted(listed)}
+                          "waiting": waiting, "kept_urls": sorted(kept_urls)}
         alert = w.prs.setdefault("_alert", {})
         if problem and alert.get("problem") != problem:
             notify(problem)  # once per new problem, not on every tick
