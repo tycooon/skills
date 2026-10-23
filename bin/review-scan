@@ -44,6 +44,8 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -503,7 +505,8 @@ def build_brief(w, r, rec, reason, siblings, now):
               f"  ~/.claude/bin/review-scan settle {w.name} {r['url']} --head <the head you reviewed> --since {iso(now)} \\",
               "    --verdict approved|findings|outside-filter [--covered-by <approved earlier head>] \\",
               "    [--weighed <thread url>]... [--recheck <sibling PR url>]...",
-              "If it exits 6, the PR does not show that verdict yet: post it, then settle again.",
+              "If it exits 6, the PR does not show that verdict yet: post it (for a refused --covered-by,",
+              "  a fresh formal approval naming the head), then settle again as the message says.",
               "If it exits 3 or 4, stop without settling: the next tick picks the PR up again."]
     return "\n".join(lines) + "\n"
 
@@ -574,7 +577,10 @@ def spawn_run(w, url, brief):
 
 def cmd_settle(a):
     since = parse_time(a.since)
-    pr = activity_since(a.url, since)  # outside the lock: a slow API call must not hold up ticks
+    # Outside the lock: a slow API call must not hold up ticks.
+    pr = activity_since(a.url, since)
+    if a.verdict == "approved" and a.covered_by and pr["head"] == a.head:
+        pr["carry"] = carry(a.url, a.covered_by, a.head, Watch(a.watch).load().config["own"])
     with Watch(a.watch).locked() as w:
         return settle(w, a, pr)
 
@@ -592,6 +598,11 @@ def settle(w, a, pr):
     if a.verdict == "approved" and not covered(pr, own, a.head) and not covered(pr, own, a.covered_by):
         print(f"refused: no approval of ours covers {a.head[:12]}"
               + (f" or {a.covered_by[:12]}" if a.covered_by else "") + "; post it, then settle again")
+        return 6
+    if a.verdict == "approved" and not covered(pr, own, a.head) and not pr.get("carry"):
+        print(f"refused: the commits since {a.covered_by[:12]} are no base-sync and reach past its findings' lines, "
+              f"so its approval does not cover {a.head[:12]}; post a fresh formal approval naming {a.head}, "
+              "then settle again without --covered-by")
         return 6
     if a.verdict == "findings" and not pr["threads"] & own:
         print("refused: no open thread of ours on the PR; post the findings, then settle again")
@@ -624,11 +635,9 @@ def settle(w, a, pr):
 
 def covered(pr, own, sha):
     """Whether an approval of ours exists at `sha`: the head itself, or the earlier head the run
-    says still covers this one.
+    says still covers this one, which `carry` then tests.
 
-    This is a gate against a run forgetting the verdict, not a check of the covering rule: whether
-    the changes since `sha` stay inside review-pr's *Only a formal approval covers a head* is the
-    run's judgement, and settle takes its word for it. Only a formal approval counts, except where
+    Only a formal approval counts, except where
     a formal one is impossible (GitLab, whose hosts may forbid it, and a GitHub PR authored by one
     of our accounts), where an APPROVED post naming the sha stands in for it."""
     if not sha:
@@ -638,6 +647,47 @@ def covered(pr, own, sha):
         entries |= set(pr.get("noted_at", ()))
     return any(who in own and oid and (oid.startswith(sha) or sha.startswith(oid)) and len(min(oid, sha, key=len)) >= 7
                for who, oid in entries)
+
+
+_wait_pr_ready = None
+
+
+def wait_pr_ready():
+    """bin/wait-pr-ready as a module, for its covering test. setup installs the two side by side."""
+    global _wait_pr_ready
+    if _wait_pr_ready is None:
+        sys.dont_write_bytecode = True  # loading it as a module would litter its directory
+        path = str(Path(__file__).resolve().parent / "wait-pr-ready")
+        loader = importlib.machinery.SourceFileLoader("wait_pr_ready", path)
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader("wait_pr_ready", loader))
+        loader.exec_module(module)
+        _wait_pr_ready = module
+    return _wait_pr_ready
+
+
+def carry(url, sha, head, own):
+    """Whether our newest approval of `sha` still covers `head` by wait-pr-ready's mechanical
+    test: a base-sync, or later commits that change only the lines of the findings it left.
+    The waiter reads nothing else, so a head settled as approved past that test would leave
+    the PR's author waiting on a verdict that never shows on GitHub."""
+    w = wait_pr_ready()
+    host = w.forge(url)
+    if not host:
+        raise ScanError(f"not a PR or MR URL: {url}")
+    reviewers = {w.login_key(o) for o in own}
+    try:
+        pr = host["read"]()
+        found = [(w.ts(at), named, at) for _, author, body, at, state, commit in w.posts(pr)
+                 if w.counts_as_verdict(author, body, reviewers) and not w.is_thread_reply(body, state)
+                 and w.is_go(body, state)
+                 for named in [(w.SHA.findall(body) or [commit])[-1]] if named and named.startswith(sha.lower())]
+        if not found:
+            return False
+        _, full, at = max(found)
+        same = w.base_sync_test(host)
+        return bool(w.carries(pr, full, head, at, reviewers, lambda o, n, t: same(pr, o, n, t), host["changed_hunks"]))
+    except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as e:
+        raise ScanError(f"could not test whether {sha[:12]} covers {head[:12]}: {e}")
 
 
 def covers(spec, url):
@@ -918,8 +968,8 @@ def main(argv=None):
     s.add_argument("--verdict", required=True, choices=["approved", "findings", "outside-filter"],
                    help="what the run left: an approval at the head, open threads of ours, or a PR outside the filter")
     s.add_argument("--covered-by", help="with --verdict approved: the earlier head whose approval of ours still "
-                   "covers this one under review-pr's covering rule; settle checks the approval exists, "
-                   "the covering judgement is the run's")
+                   "covers this one; settle refuses it unless the commits since are a base-sync or change only "
+                   "that approval's findings' lines, as wait-pr-ready reads them")
     s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
     s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
     n = sub.add_parser("nudge")

@@ -181,9 +181,29 @@ class Tick(Base):
         self.assertIn("never settled", self.spawned[0][1])
 
 
+def full_pr(threads=()):
+    """The PR as wait-pr-ready reads it: our formal approval of A, with a finding thread at each (path, line)."""
+    finding = {"author": {"login": "review-bot"}, "pullRequestReview": {"id": "r1", "state": "APPROVED"}}
+    return {"headRefOid": B, "baseRefName": "master", "timelineItems": {"nodes": []},
+            "reviews": {"nodes": [{"id": "r1", "author": {"login": "review-bot"}, "state": "APPROVED", "body": "",
+                                   "submittedAt": "2026-10-23T09:00:00Z", "commit": {"oid": A}}]},
+            "comments": {"nodes": []},
+            "reviewThreads": {"nodes": [{"isResolved": False, "path": path, "line": line, "originalLine": line,
+                                         "diffSide": "RIGHT", "comments": {"nodes": [finding]}}
+                                        for path, line in threads]}}
+
+
 class Settle(Base):
     def setUp(self):
         super().setUp()
+        # wait-pr-ready's reads, for the covering test settle runs on --covered-by: B a base-sync of A.
+        wpr = rs.wait_pr_ready()
+        self.full, self.lines, self.hunks = full_pr(), {A: ["f +x"], B: ["f +x"]}, {}
+        for name, fake in {"read_pr": lambda owner, name, number: self.full,
+                           "authored_lines": lambda owner, name, base, sha: self.lines[sha],
+                           "changed_hunks": lambda owner, name, old, new: self.hunks}.items():
+            self.addCleanup(setattr, wpr, name, getattr(wpr, name))
+            setattr(wpr, name, fake)
         self.cli("tick", self.watch)
 
     def test_refuses_when_head_moved(self):
@@ -237,6 +257,25 @@ class Settle(Base):
         self.assertEqual(code, 6)
         pr["author"] = "review-bot"  # GitHub refuses a self-approval
         code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)
+
+    def test_covered_by_settles_only_when_wait_pr_ready_would_see_it_cover(self):
+        self.activity[PR1] = act(head=B, approvers=(), approved_at={("review-bot", A)})
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)  # a base-sync
+        self.lines[B] = ["f +y"]
+        self.full = full_pr(threads=[("src/lib.rs", 40)])
+        self.hunks = {"src/lib.rs": [(41, 42, 2)]}
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)  # the later commit changes only the finding's lines
+        # The fix lands in another file the finding names: only a fresh approval covers it.
+        self.hunks = {"docs/notes.md": [(10, 10, 1)]}
+        code, out = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 6)
+        self.assertIn(f"post a fresh formal approval naming {B}", out)
+        self.assertIn("without --covered-by", out)
+        self.activity[PR1] = act(head=B, approvers=("review-bot",))
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE)
         self.assertEqual(code, 0)
 
     def test_sibling_recheck_registers_once_and_only_on_success(self):
