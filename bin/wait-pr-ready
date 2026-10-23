@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Wait until a GitHub PR is ready to merge, then exit with the reason.
+"""Wait until a GitHub PR or GitLab MR is ready to merge, then exit with the reason.
 
   wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]... [--after TIME] [--known-conflict]
   wait-pr-ready <pr-url> --until-review [--head SHA]
@@ -30,7 +30,18 @@ Exit codes:
   15 the watched head conflicts with the base: nothing else resolves it, so the
      session runs its fix round (address-pr, or the Codex resume that owns the PR).
      Not with --known-conflict
-  2  usage error, an unsupported host, or the PR could not be read for too long
+  16 a check or pipeline on the watched head failed, with activity newer than
+     --after: the session runs its fix round. Where Auto-fix also reports CI
+     failures, whichever wakes the session first runs it
+  2  usage error, an unsupported URL, or the PR could not be read for too long
+
+GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab and
+the same four conditions: an approval (a formal one, or a verdict note), every
+resolvable discussion resolved, the head pipeline green (one on the head sha, or a
+merged results pipeline on the MR's merge ref), and detailed_merge_status neither
+a conflict nor need_rebase. A discussion whose first note says "non-blocking"
+counts as a finding of the verdict its reviewer posted with or after it, while the
+note is still anchored at that verdict's commit.
 
 Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
@@ -48,8 +59,9 @@ Options:
                     Its formal approval on the head doesn't approve either, but
                     wakes with exit 14, naming the account, since it likely
                     means LOGIN is the wrong one.
-  --after TIME      report ready only once the PR has activity newer than TIME
-                    (ISO 8601), e.g. the mark of a ready that a recheck refused.
+  --after TIME      report ready, or a CI failure, only once the PR has activity
+                    newer than TIME (ISO 8601): the mark of a ready that a
+                    recheck refused, or of a failure the last round left as it was.
                     With --until-review: a review or comment posted after TIME
                     counts as new, even one the first read already sees.
   --until-review    don't wait for readiness: exit 14 on the first review,
@@ -159,6 +171,14 @@ GREEN_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 def parse_url(url):
     m = re.fullmatch(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?", url.strip())
     if not m:
+        return None
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def parse_gitlab_url(url):
+    """(host, project path, iid) of a GitLab MR URL, or None."""
+    m = re.fullmatch(r"https://([^/]+)/(.+?)/-/merge_requests/(\d+)/?", url.strip())
+    if not m or m.group(1) == "github.com":
         return None
     return m.group(1), m.group(2), int(m.group(3))
 
@@ -324,6 +344,272 @@ def head_runs(owner, name, sha):
     failed = [f"{run_name}={conclusion}" for _, run_name, status, conclusion in newest.values()
               if status == "completed" and conclusion not in GREEN_RUN_CONCLUSIONS]
     return active, failed, oldest
+
+
+# --- GitLab: each read is mapped onto the GitHub PR shape the gates read -----------
+
+def glab(host, path):
+    r = subprocess.run(["glab", "api", "--hostname", host, path], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"glab api {path} failed")
+    return json.loads(r.stdout or "null")
+
+
+def glab_paged(host, path):
+    out, page = [], 1
+    while True:
+        rows = glab(host, f"{path}{'&' if '?' in path else '?'}per_page=100&page={page}")
+        out += rows
+        if len(rows) < 100:
+            return out
+        page += 1
+
+
+def gl_project(project):
+    return "projects/" + project.replace("/", "%2F")
+
+
+# detailed_merge_status -> (mergeable, mergeStateStatus). The approval, discussion and
+# pipeline statuses are gates of their own here, so they don't block condition 4.
+GL_MERGE = {
+    "mergeable": ("MERGEABLE", "CLEAN"),
+    "conflict": ("CONFLICTING", "DIRTY"),
+    "need_rebase": ("MERGEABLE", "BEHIND"),
+    "checking": ("UNKNOWN", "UNKNOWN"),
+    "unchecked": ("UNKNOWN", "UNKNOWN"),
+    "preparing": ("UNKNOWN", "UNKNOWN"),
+    "approvals_syncing": ("UNKNOWN", "UNKNOWN"),
+    "ci_must_pass": ("MERGEABLE", "UNSTABLE"),
+    "ci_still_running": ("MERGEABLE", "UNSTABLE"),
+    "discussions_not_resolved": ("MERGEABLE", "UNSTABLE"),
+    "not_approved": ("MERGEABLE", "UNSTABLE"),
+}
+GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
+# The statuses with which GitLab says the pipeline still gates the merge.
+GL_CI_GATING = {"ci_must_pass", "ci_still_running"}
+NON_BLOCKING = re.compile(r"non[- ]blocking", re.I)
+VERDICT_NOTE = re.compile(r"^[\s*_#>`]*APPROVED\b")
+
+
+def gl_user(user):
+    return {"login": (user or {}).get("username")} if user else None
+
+
+def gl_pipeline_state(pipeline, merge):
+    """A pipeline's state as a status check. `manual` means a blocking manual job is still
+    pending (optional ones don't change the status), so it is green only when GitLab says
+    the pipeline doesn't gate the merge."""
+    status = pipeline.get("status")
+    if status == "manual":
+        return "PENDING" if merge in GL_CI_GATING else "SUCCESS"
+    return GL_PIPELINE.get(status, "PENDING")
+
+
+def head_pipeline(mr):
+    """The MR's head pipeline when it tests the current head: one on the head sha, or a
+    merged results (or merge train) pipeline on the MR's merge ref, whose sha is the merge
+    commit's. A push recreates that ref and its pipeline, so an older push's one doesn't stay."""
+    pipeline = mr.get("head_pipeline") or {}
+    merge_refs = {f"refs/merge-requests/{mr.get('iid')}/merge", f"refs/merge-requests/{mr.get('iid')}/train"}
+    if pipeline and (pipeline.get("sha") == mr["sha"] or pipeline.get("ref") in merge_refs):
+        return pipeline
+    return None
+
+
+def gl_position(note):
+    """(path, first, last, side, head_sha) of a diff note's anchor. GitLab moves `position`
+    to newer diff versions as the MR is pushed to, and its REST API returns no original
+    one, so the lines are in the numbering of `head_sha`, whatever commit that now is."""
+    pos = note.get("position") or {}
+    rng = pos.get("line_range") or {}
+    start, end = rng.get("start") or {}, rng.get("end") or {}
+    last = pos.get("new_line") or end.get("new_line")
+    first = start.get("new_line") or last
+    return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT", pos.get("head_sha")
+
+
+def gl_mr_to_pr(mr, discussions, commit):
+    """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
+    when) and APPROVED verdict notes as reviews, other top-level notes as comments,
+    resolvable discussions as review threads, the head pipeline as the one status check.
+    A non-blocking finding is tied to the verdict its reviewer posted with or after it, as a
+    GitHub finding belongs to the approving review that opened it."""
+    reviews, comments, threads, replies = [], [], [], 0
+    for d in discussions:
+        notes = d.get("notes") or []
+        human = [n for n in notes if not n.get("system")]
+        for n in notes:
+            body = (n.get("body") or "").strip()
+            if n.get("system") and body in ("approved this merge request", "unapproved this merge request"):
+                reviews.append({"id": f"note-{n['id']}", "author": gl_user(n.get("author")), "submittedAt": n["created_at"],
+                                "state": "APPROVED" if body.startswith("approved") else "DISMISSED",
+                                "body": "" if body.startswith("approved") else body, "commit": None})
+        if not human:
+            continue
+        resolvable = [n for n in human if n.get("resolvable")]
+        if resolvable:
+            first, last = human[0], human[-1]
+            path, line_first, line_last, side, anchored_at = gl_position(first)
+            threads.append({
+                "isResolved": all(n.get("resolved") for n in resolvable),
+                "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
+                "comments": {"nodes": [{"author": gl_user(first.get("author")), "pullRequestReview": {
+                    "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
+                "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author"))}]},
+                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"], "_anchor": anchored_at,
+            })
+            # A reply lands inside its thread and moves no other count; review_count reads this.
+            replies += len(human) - 1
+            continue
+        for n in human:
+            shas = SHA.findall(n.get("body") or "")
+            if VERDICT_NOTE.match(n.get("body") or "") and shas:
+                reviews.append({"id": f"verdict-{n['id']}", "author": gl_user(n.get("author")), "submittedAt": n["created_at"],
+                                "state": "APPROVED", "body": n.get("body") or "", "commit": {"oid": shas[-1]}})
+            else:
+                comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
+    verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
+    for t in threads:
+        opener = t["comments"]["nodes"][0]["pullRequestReview"]
+        if opener["state"] == "APPROVED":
+            owner = next((r for r in verdict_notes if (r["author"] or {}).get("login") == t["_opened"]
+                          and ts(r["submittedAt"]) >= ts(t["_at"])), None)
+            # Its lines match the verdict's hunks only while GitLab still anchors the note at the
+            # verdict's commit; once re-anchored to a later head, the carry is skipped: a stall.
+            opener["id"] = owner["id"] if owner and t["_anchor"] == owner["commit"]["oid"] else None
+        del t["_opened"], t["_at"], t["_anchor"]
+    merge = "conflict" if mr.get("has_conflicts") else mr.get("detailed_merge_status")
+    pipeline = head_pipeline(mr)
+    contexts = []
+    if pipeline:
+        contexts.append({"__typename": "StatusContext", "context": f"pipeline {pipeline.get('id')}",
+                         "state": gl_pipeline_state(pipeline, merge),
+                         "createdAt": pipeline.get("finished_at") or pipeline.get("updated_at")})
+    mergeable, status = GL_MERGE.get(merge, ("MERGEABLE", "BLOCKED"))
+    return {
+        "state": {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED"}.get(mr["state"], "CLOSED"),
+        "headRefOid": mr["sha"], "baseRefName": mr["target_branch"], "updatedAt": mr["updated_at"],
+        "mergeable": mergeable, "mergeStateStatus": status, "timelineItems": {"nodes": []},
+        "reviewThreads": {"totalCount": len(threads), "nodes": threads},
+        "reviews": {"totalCount": len(reviews), "nodes": reviews},
+        "comments": {"totalCount": len(comments), "nodes": comments},
+        "threadReplies": replies,
+        "commits": {"nodes": [{"commit": {"oid": mr["sha"], "committedDate": (commit or {}).get("committed_date"),
+                                          "statusCheckRollup": {"contexts": {"nodes": contexts}} if contexts else None}}]},
+    }
+
+
+def gl_read_mr(host, project, iid):
+    base = f"{gl_project(project)}/merge_requests/{iid}"
+    mr = glab(host, base)
+    discussions = glab_paged(host, f"{base}/discussions")
+    commit = glab(host, f"{gl_project(project)}/repository/commits/{mr['sha']}")
+    return gl_mr_to_pr(mr, discussions, commit)
+
+
+def gl_compare(host, project, old, new):
+    """The diffs between two refs from their merge base, or None when GitLab cut any short."""
+    try:
+        res = glab(host, f"{gl_project(project)}/repository/compare?from={old}&to={new}&straight=false")
+    except RuntimeError:
+        return None
+    diffs = res.get("diffs") or []
+    if any(d.get("too_large") or d.get("collapsed") for d in diffs):
+        return None
+    return diffs
+
+
+def gl_authored_lines(host, project, base, sha):
+    diffs = gl_compare(host, project, base, sha)
+    if diffs is None:
+        return None
+    return [f"{d['new_path']} {line}" for d in diffs for line in (d.get("diff") or "").splitlines()
+            if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+
+
+def gl_changed_hunks(host, project, old, new):
+    diffs = gl_compare(host, project, old, new)
+    if diffs is None:
+        return None
+    return {d["new_path"]: changed_spans(d.get("diff") or "") for d in diffs}
+
+
+def gl_merged_branch_tip(host, project, branch):
+    try:
+        mrs = glab(host, f"{gl_project(project)}/merge_requests?state=merged&source_branch={branch}&per_page=1")
+    except RuntimeError:
+        return None
+    return mrs[0]["sha"] if mrs else None
+
+
+def gl_workflow_count(host, project):
+    """1 when the project has CI configured, else 0."""
+    if (glab(host, gl_project(project)).get("ci_config_path") or ""):
+        return 1
+    try:
+        glab(host, f"{gl_project(project)}/repository/files/.gitlab-ci.yml?ref=HEAD")
+        return 1
+    except RuntimeError:
+        return 0
+
+
+def gl_workflow_runs(host, project, iid, sha):
+    """Pipelines that may test this head: any on its sha, and any merged results or merge
+    train pipeline of the MR, whose sha is a merge commit's. Counting the MR's own too
+    errs toward waiting rather than taking a head for one CI never ran on."""
+    on_sha = len(glab(host, f"{gl_project(project)}/pipelines?sha={sha}&per_page=1"))
+    merge_refs = (f"refs/merge-requests/{iid}/merge", f"refs/merge-requests/{iid}/train")
+    of_mr = [p for p in glab(host, f"{gl_project(project)}/merge_requests/{iid}/pipelines?per_page=20") if p.get("ref") in merge_refs]
+    return on_sha + len(of_mr)
+
+
+def forge(url):
+    """The host calls the waiter makes, bound to one PR or MR, or None for an unsupported URL.
+    The GitHub ones look the module's functions up at call time, so tests can replace them."""
+    gh_target = parse_url(url)
+    if gh_target:
+        owner, name, number = gh_target
+        return {
+            "read": lambda: read_pr(owner, name, number),
+            "authored_lines": lambda base, sha: authored_lines(owner, name, base, sha),
+            "merged_branch_tip": lambda branch: merged_branch_tip(owner, name, branch),
+            "changed_hunks": lambda old, new: changed_hunks(owner, name, old, new),
+            "workflow_count": lambda: workflow_count(owner, name),
+            "workflow_runs": lambda sha: workflow_runs(owner, name, sha),
+            "head_runs": lambda sha: head_runs(owner, name, sha),
+        }
+    gl_target = parse_gitlab_url(url)
+    if gl_target:
+        host, project, iid = gl_target
+        return {
+            "read": lambda: gl_read_mr(host, project, iid),
+            "authored_lines": lambda base, sha: gl_authored_lines(host, project, base, sha),
+            "merged_branch_tip": lambda branch: gl_merged_branch_tip(host, project, branch),
+            "changed_hunks": lambda old, new: gl_changed_hunks(host, project, old, new),
+            "workflow_count": lambda: gl_workflow_count(host, project),
+            "workflow_runs": lambda sha: gl_workflow_runs(host, project, iid, sha),
+            # The head pipeline's own status covers what Actions runs add on GitHub.
+            "head_runs": lambda sha: ([], [], None),
+        }
+    return None
+
+
+# Conclusions that mean the head's CI broke. A cancelled run is left out: a newer push
+# or a rerun cancels runs routinely, and the gates still hold the PR not ready.
+FAILED_CONCLUSIONS = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
+
+
+def hard_failures(pr, runs_failed):
+    """The checks and workflow runs on the head that failed outright, for exit 16."""
+    rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
+    failed = []
+    for c in (rollup["contexts"]["nodes"] if rollup else []):
+        if c["__typename"] == "CheckRun":
+            if c["status"] == "COMPLETED" and (c["conclusion"] or "") in FAILED_CONCLUSIONS:
+                failed.append(c["name"])
+        elif c["state"] in FAILED_CONCLUSIONS:
+            failed.append(c["context"])
+    return failed + [r for r in runs_failed if r.split("=")[-1].upper() in FAILED_CONCLUSIONS]
 
 
 def has_checks(pr):
@@ -565,7 +851,8 @@ def evaluate(pr, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
 
 
 def review_count(pr):
-    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "comments", "reviewThreads"))
+    # GitHub counts a thread reply as a review; a GitLab read counts its replies apart.
+    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "comments", "reviewThreads")) + pr.get("threadReplies", 0)
 
 
 def newest_review_time(pr):
@@ -597,22 +884,21 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     parser.add_argument("--known-conflict", action="store_true")
     args = parser.parse_args(argv)
 
-    target = parse_url(args.url)
-    if not target:
-        print(f"unsupported: {args.url} is not a GitHub PR URL; GitLab MRs are watched by babysit-pr's polling", file=sys.stderr)
+    host = forge(args.url)
+    if not host:
+        print(f"unsupported: {args.url} is neither a GitHub PR nor a GitLab MR URL", file=sys.stderr)
         return 2
-    owner, name, number = target
     started = now()
     state = {"expected": args.head, "head_seen": args.head is None, "reviews": None, "seen_at": {}, "workflows": None}
     lines_cache = {}
 
     def lines(base, sha, current_base):
         if (base, sha) not in lines_cache:
-            found = authored_lines(owner, name, base, sha)
+            found = host["authored_lines"](base, sha)
             if found is None and base != current_base:
                 # A base branch deleted when its PR merged: read against that PR's last head.
-                tip = merged_branch_tip(owner, name, base)
-                found = authored_lines(owner, name, tip, sha) if tip else None
+                tip = host["merged_branch_tip"](base)
+                found = host["authored_lines"](tip, sha) if tip else None
             lines_cache[base, sha] = found
         return lines_cache[base, sha]
 
@@ -633,16 +919,16 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         if now() - state["seen_at"].setdefault(head, now()) < CI_SETTLE:
             return False
         if state["workflows"] is None:
-            state["workflows"] = workflow_count(owner, name)
+            state["workflows"] = host["workflow_count"]()
         if state["workflows"] == 0:
             return f"no CI: the repository has no Actions workflow and no check came in {CI_SETTLE // 60} min"
-        if workflow_runs(owner, name, head) == 0:
+        if host["workflow_runs"](head) == 0:
             return f"no CI for this head: no workflow ran in {CI_SETTLE // 60} min (path filters)"
         return False
 
     def read_once():
         """One read: (exit code, line) to stop, or (None, waiting reason) and the activity mark."""
-        pr = read_pr(owner, name, number)
+        pr = host["read"]()
         head = pr["headRefOid"]
         if pr["state"] == "MERGED":
             return (10, f"merged: {args.url}"), 0
@@ -680,7 +966,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             "no_ci": without_checks(pr, head),
             "reviewers": {login_key(r) for r in args.reviewer},
             "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at),
-            "hunks_between": lambda o, n: changed_hunks(owner, name, o, n),
+            "hunks_between": host["changed_hunks"],
         }
         ready, reasons = evaluate(pr, **gates)
         state["checks_only"] = not ready and approval_state(
@@ -688,7 +974,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         )[0] and blocking_threads(pr) == 0 and has_checks(pr) and checks_still_running(pr)
         runs_failed = []
         if ready and not args.no_ci:
-            running, runs_failed, oldest = head_runs(owner, name, head)
+            running, runs_failed, oldest = host["head_runs"](head)
             if running:
                 ready = False
                 state["checks_only"] = True
@@ -707,6 +993,10 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         # A run that ended unsuccessfully clears by no one's hand, as a failed check doesn't.
         if new_reviews and (runs_failed or not only_approvals(pr, state["seen"], **gates)):
             return (14, f"review activity: a review, comment or thread landed on {args.url} at {head}, not ready: " + "; ".join(reasons)), mark
+        # A failure clears by no one's hand, and nothing reports it where Auto-fix is off.
+        failures = [] if gates["no_ci"] else hard_failures(pr, runs_failed)
+        if failures and mark > args.after:
+            return (16, f"ci failed: {args.url} at {head}: " + "; ".join(reasons) + f"; activity {iso(mark)}"), mark
         return (None, "; ".join(reasons)), mark
 
     mark, step, failures, waiting = 0.0, 0, 0, "nothing read yet"

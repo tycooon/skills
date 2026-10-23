@@ -75,6 +75,105 @@ def evaluate(pr, no_ci=False, reviewers=(), same=lambda old, new, at: False):
     return w.evaluate(pr, no_ci=no_ci, reviewers=set(reviewers), same_authored_lines=same)
 
 
+GL_URL = "https://gitlab.example.com/grp/app/-/merge_requests/7"
+
+
+def gl_note(nid, user, body, at="2026-10-15T10:00:00Z", system=False, resolvable=False, resolved=False):
+    return {"id": nid, "author": {"username": user}, "body": body, "created_at": at, "system": system,
+            "resolvable": resolvable, "resolved": resolved}
+
+
+def gl_pr(pipeline="success", merge="mergeable", discussions=None, sha=HEAD, pipeline_sha=None, ref="feature"):
+    mr = {"state": "opened", "iid": 7, "sha": sha, "target_branch": "master", "updated_at": "2026-10-15T10:00:00Z",
+          "detailed_merge_status": merge, "has_conflicts": merge == "conflict",
+          "head_pipeline": {"id": 1, "sha": pipeline_sha or sha, "ref": ref, "status": pipeline, "finished_at": "2026-10-15T09:30:00Z"}}
+    if discussions is None:
+        discussions = [{"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}]
+    return w.gl_mr_to_pr(mr, discussions, {"committed_date": "2026-10-15T09:00:00Z"})
+
+
+class GitLab(unittest.TestCase):
+    def test_a_verdict_note_and_green_pipeline_are_ready(self):
+        ready, reasons = evaluate(gl_pr(), reviewers=["review-bot"])
+        self.assertTrue(ready, reasons)
+
+    def test_a_system_approval_counts_for_a_listed_reviewer(self):
+        pr = gl_pr(discussions=[{"notes": [gl_note(1, "review-bot", "approved this merge request", system=True)]}])
+        self.assertEqual(pr["reviews"]["nodes"][0]["state"], "APPROVED")
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_pipeline_statuses(self):
+        self.assertFalse(evaluate(gl_pr(pipeline="running"), reviewers=["review-bot"])[0])
+        self.assertTrue(w.hard_failures(gl_pr(pipeline="failed"), []))
+        self.assertFalse(w.hard_failures(gl_pr(pipeline="canceled"), []))
+        self.assertTrue(evaluate(gl_pr(pipeline="manual"), reviewers=["review-bot"])[0])
+
+    def test_merge_statuses(self):
+        self.assertEqual(gl_pr(merge="conflict")["mergeable"], "CONFLICTING")
+        self.assertEqual(gl_pr(merge="need_rebase")["mergeStateStatus"], "BEHIND")
+        self.assertEqual(gl_pr(merge="checking")["mergeable"], "UNKNOWN")
+        self.assertTrue(evaluate(gl_pr(merge="not_approved"), reviewers=["review-bot"])[0])
+        self.assertFalse(evaluate(gl_pr(merge="draft_status"), reviewers=["review-bot"])[0])
+
+    def test_discussions_become_threads_without_system_notes(self):
+        approved = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}
+        open_finding = {"notes": [gl_note(2, "review-bot", "P1: broken", resolvable=True),
+                                  gl_note(3, "dev", "changed this line in version 2 of the diff", system=True, resolvable=False)]}
+        pr = gl_pr(discussions=[approved, open_finding])
+        self.assertEqual(pr["reviewThreads"]["totalCount"], 1)
+        self.assertEqual(pr["reviewThreads"]["nodes"][0]["replies"]["nodes"][0]["author"]["login"], "review-bot")
+        self.assertFalse(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_an_answered_non_blocking_finding_does_not_hold_the_mr(self):
+        approved = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}
+        nit = {"notes": [gl_note(2, "review-bot", "P3 (non-blocking): rename", resolvable=True),
+                         gl_note(3, "dev", "Done", resolvable=True)]}
+        self.assertTrue(evaluate(gl_pr(discussions=[approved, nit]), reviewers=["review-bot"])[0])
+
+    def test_a_merged_results_pipeline_tests_the_head(self):
+        merged = gl_pr(pipeline="failed", pipeline_sha="c" * 40, ref="refs/merge-requests/7/merge")
+        self.assertTrue(w.has_checks(merged))
+        self.assertTrue(w.hard_failures(merged, []))
+        other_branch = gl_pr(pipeline="failed", pipeline_sha="c" * 40, ref="refs/merge-requests/8/merge")
+        self.assertFalse(w.has_checks(other_branch))
+
+    def test_a_blocking_manual_job_holds_the_mr_where_the_pipeline_gates_it(self):
+        self.assertFalse(evaluate(gl_pr(pipeline="manual", merge="ci_still_running"), reviewers=["review-bot"])[0])
+        self.assertFalse(evaluate(gl_pr(pipeline="manual", merge="ci_must_pass"), reviewers=["review-bot"])[0])
+        self.assertFalse(w.hard_failures(gl_pr(pipeline="manual", merge="ci_must_pass"), []))
+
+    def test_a_reply_in_a_discussion_counts_as_review_activity(self):
+        opened = {"notes": [gl_note(2, "review-bot", "P1: broken", resolvable=True), gl_note(3, "dev", "It is fine", resolvable=True)]}
+        held = {"notes": opened["notes"] + [gl_note(4, "review-bot", "Still broken", resolvable=True)]}
+        self.assertGreater(w.review_count(gl_pr(discussions=[held])), w.review_count(gl_pr(discussions=[opened])))
+
+    def test_an_approval_with_non_blocking_findings_covers_the_fix_on_those_lines(self):
+        verdict = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {OLD} — AI reviewer: Claude", at="2026-10-15T10:00:00Z")]}
+        nit = gl_note(2, "review-bot", "P3 (non-blocking): rename", at="2026-10-15T09:59:00Z", resolvable=True)
+        nit["position"] = {"new_path": "src/a.rs", "new_line": 40, "head_sha": OLD}
+        pr = gl_pr(discussions=[{"notes": [nit, gl_note(3, "dev", "Done", resolvable=True)]}, verdict])
+        self.assertEqual(pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["pullRequestReview"]["id"], "verdict-1")
+        def run(hunks):
+            return w.evaluate(pr, no_ci=False, reviewers={"review-bot"}, same_authored_lines=lambda *_: False,
+                              hunks_between=lambda old, new: hunks)
+        ready, reasons = run({"src/a.rs": [(41, 41, 1)]})
+        self.assertTrue(ready, reasons)
+        self.assertIn("later commits change only its findings' lines", reasons[0])
+        self.assertFalse(run({"src/a.rs": [(200, 200, 1)]})[0])
+        # Re-anchored to a later head, the note's lines are in that head's numbering: no carry.
+        nit["position"]["head_sha"] = HEAD
+        moved = gl_pr(discussions=[{"notes": [nit, gl_note(3, "dev", "Done", resolvable=True)]}, verdict])
+        self.assertIsNone(moved["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["pullRequestReview"]["id"])
+
+    def test_a_pipeline_for_another_sha_is_no_check(self):
+        pr = gl_pr()
+        mr_sha_other = w.gl_mr_to_pr({"state": "opened", "sha": HEAD, "target_branch": "master", "updated_at": "2026-10-15T10:00:00Z",
+                                      "detailed_merge_status": "mergeable", "head_pipeline": {"id": 1, "sha": OLD, "status": "success"}},
+                                     [], {"committed_date": "2026-10-15T09:00:00Z"})
+        self.assertTrue(w.has_checks(pr))
+        self.assertFalse(w.has_checks(mr_sha_other))
+
+
 class Approval(unittest.TestCase):
     def test_formal_approval_naming_the_head(self):
         ready, reasons = evaluate(ready_pr())
@@ -511,7 +610,8 @@ class Loop(unittest.TestCase):
             original = w.authored_lines
             w.authored_lines = lambda *_: None
             try:
-                code, out, _ = self.run_main([waiting, landed])
+                # The red check was there before the wait began: the last round already handled it.
+                code, out, _ = self.run_main([waiting, landed], args=["--after", "2026-10-15T10:00:00Z"])
             finally:
                 w.authored_lines = original
             self.assertEqual(code, 14, f"{name}: {out}")
@@ -602,7 +702,7 @@ class Loop(unittest.TestCase):
             for pr in (waiting, landed):
                 if rollup:
                     pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = rollup
-            code, out, _ = self.run_main([waiting, landed], args=["--reviewer", "review-bot"])
+            code, out, _ = self.run_main([waiting, landed], args=["--reviewer", "review-bot", "--after", "2026-10-15T10:00:00Z"])
             self.assertEqual(code, 14, f"{name}: {out}")
 
     def test_an_approval_while_mergeability_is_computed_keeps_waiting(self):
@@ -642,9 +742,45 @@ class Loop(unittest.TestCase):
         moved = ready_pr(headRefOid="c" * 40)
         self.assertEqual(self.run_main([waiting, moved], args=["--head", HEAD[:7]])[0], 12)
 
-    def test_gitlab_url_is_unsupported(self):
+    def test_a_failed_check_wakes_with_16_unless_the_last_round_saw_it(self):
+        red = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        red["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        code, out, waits = self.run_main([red])
+        self.assertEqual(code, 16, out)
+        self.assertTrue(out.startswith("ci failed:"))
+        self.assertEqual(waits, [])
+        code, _, _ = self.run_main([red] * 60, args=["--after", "2026-10-15T10:00:00Z"])
+        self.assertEqual(code, 13)
+
+    def test_a_cancelled_check_is_no_ci_failure(self):
+        cancelled = ready_pr()
+        cancelled["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="CANCELLED")]}}
+        code, _, _ = self.run_main([cancelled, ready_pr()])
+        self.assertEqual(code, 0)
+
+    def test_no_ci_never_reports_a_ci_failure(self):
+        red = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        red["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        self.assertEqual(self.run_main([red] * 60, args=["--no-ci"])[0], 13)
+
+    def test_a_gitlab_mr_runs_through_the_same_gates(self):
+        reads = iter([gl_pr(pipeline="running"), gl_pr()])
+        original = w.gl_read_mr
+        w.gl_read_mr = lambda *_: next(reads)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                code = w.main([GL_URL, "--reviewer", "review-bot"], now=lambda: w.ts("2026-10-15T10:00:00Z"), sleep=lambda s: None)
+        finally:
+            w.gl_read_mr = original
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("approved by review-bot", out.getvalue())
+
+    def test_other_urls_are_unsupported(self):
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(w.main(["https://gitlab.com/acme/app/-/merge_requests/7"]), 2)
+            self.assertEqual(w.main(["https://bitbucket.org/acme/app/pull-requests/7"]), 2)
+        self.assertEqual(w.parse_gitlab_url("https://gitlab.example.com/grp/sub/app/-/merge_requests/7"),
+                         ("gitlab.example.com", "grp/sub/app", 7))
+        self.assertIsNone(w.parse_gitlab_url(URL))
 
 
 if __name__ == "__main__":
