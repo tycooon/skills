@@ -452,9 +452,12 @@ def tick(w, a, spawn):
     if problem:
         print(problem)
     if not a.dry_run:
-        # The queue as this tick left it, for status: only the tick knows what is owed.
+        # The queue as this tick left it, for status: only the tick knows what is owed. A target it
+        # could not read keeps the PRs the previous tick kept there, so their ended runs still show.
+        kept_urls = set(listed) | {u for u in (w.prs.get("_tick") or {}).get("kept_urls", [])
+                                   if any(covers(spec, u) for spec in failed)}
         w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
-                          "waiting": waiting}
+                          "waiting": waiting, "kept_urls": sorted(kept_urls)}
         alert = w.prs.setdefault("_alert", {})
         if problem and alert.get("problem") != problem:
             notify(problem)  # once per new problem, not on every tick
@@ -808,13 +811,16 @@ def cmd_status(a, limit=15):
             else:
                 fate = "ended without settling"
             print(f"  started {url}: {fate}")
+    # A PR that merged, closed or went dormant gets no more runs, so its unsettled run would stay
+    # "ended" forever. Ticks from before kept_urls existed don't say, so they keep every one.
+    kept = set(tick["kept_urls"]) if tick and "kept_urls" in tick else None
     running, ended, settled = [], [], []
     for url, rec in sorted(prs.items()):
         run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
         if fate == "running":
             running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
                            f"log runs/{w.slug(url)}.jsonl")
-        elif fate == "ended":
+        elif fate == "ended" and (kept is None or url in kept):
             ended.append(f"{url}: run started {run['started']} ended without settling; log runs/{w.slug(url)}.jsonl")
         elif fate == "settled":
             settled.append((done["at"], f"{url}: {done.get('verdict', 'settled')} at {done['head'][:12]}, {done['at']}"
