@@ -66,9 +66,10 @@ Options:
                     counts as new, even one the first read already sees.
   --until-review    don't wait for readiness: exit 14 on the first review,
                     comment or review thread the first read didn't have. With
-                    --reviewer, also as soon as a listed reviewer's verdict is
+                    --reviewer, also as soon as a listed reviewer's approval is
                     on the watched head, even one posted before the first read
-                    or before --after.
+                    or before --after. A findings verdict already there doesn't
+                    end the wait.
   --known-conflict  the session already ran a round on this head's conflict and
                     left it in place: don't exit 15 for it again, wait for the
                     head to move (12) or the PR to change otherwise.
@@ -962,14 +963,16 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             # A thread opens with a review, so the time test covers threads too.
             if new_reviews or (args.after and newest_review_time(pr) > args.after):
                 return (14, f"review activity: a review, comment or thread landed on {args.url} at {head}"), mark
-            # The verdict this wait is for may land before the first read, and an
+            # The approval this wait is for may land before the first read, and an
             # --after taken at arming time is already past it: a listed reviewer's
-            # verdict on the watched head is the event itself, whenever it was posted.
+            # approval of the watched head is the event itself, whenever it was posted.
+            # A findings verdict is not: a session that argued it back waits here for
+            # the answer, and exiting on it again would never wait at all.
             if state["head_seen"]:
                 reviewers = {login_key(r) for r in args.reviewer}
-                for login, _, sha, _ in verdicts(pr, reviewers) if reviewers else []:
-                    if sha == head:
-                        return (14, f"review activity: {login}'s verdict is already on {args.url} at {head}"), mark
+                for login, go, sha, _ in verdicts(pr, reviewers) if reviewers else []:
+                    if go and sha == head:
+                        return (14, f"review activity: {login}'s approval is already on {args.url} at {head}"), mark
             return (None, "no new review activity"), mark
         if not state["head_seen"]:
             return (None, f"head {state['expected'][:12]} not on the PR yet"), mark

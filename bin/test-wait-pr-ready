@@ -525,8 +525,18 @@ class Loop(unittest.TestCase):
         approved = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:05:00Z")]})
         code, out, waits = self.run_main([approved], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"])
         self.assertEqual(code, 14, out)
-        self.assertIn("review-bot's verdict is already on", out)
+        self.assertIn("review-bot's approval is already on", out)
         self.assertEqual(waits, [])
+
+    def test_until_review_keeps_waiting_on_a_listed_findings_verdict_already_on_the_head(self):
+        # The session argued the finding back without pushing; it waits for the answer.
+        findings = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "CHANGES_REQUESTED", "AI reviewer: Claude.", at="2026-10-15T10:05:00Z")]})
+        answer = copy.deepcopy(findings)
+        answer["reviews"]["totalCount"] = 2
+        answer["reviews"]["nodes"].append(review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z"))
+        code, _, waits = self.run_main([findings, findings, answer], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"])
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
 
     def test_until_review_keeps_waiting_on_a_listed_verdict_for_an_older_head(self):
         old = "d" * 40
