@@ -435,6 +435,49 @@ class TargetToken(Base):
             rs.main(["init", self.watch, "--target", "acme/app", "--own", "x", "--token", "other=VAR"])
 
 
+class ChainTick(unittest.TestCase):
+    def wrap(self, min_seconds, command):
+        """Runs the real wrapper with a stand-in review-scan that records the tick it was asked for."""
+        d = Path(tempfile.mkdtemp(dir=TMP.name))
+        marker, pidfile, exe = d / "ticked", d / "run.pid", d / "review-scan"
+        exe.write_text(f"#!/bin/sh\necho \"$@\" > {marker}\n")
+        exe.chmod(0o755)
+        pidfile.write_text("1 x")
+        rc = rs.subprocess.run(["/bin/sh", "-c", rs.WRAPPER, str(pidfile), str(exe), "work", str(min_seconds), *command]).returncode
+        for _ in range(50):  # the tick goes to the background
+            if marker.exists():
+                break
+            rs.time.sleep(0.02)
+        return rc, marker.read_text().strip() if marker.exists() else None, pidfile.exists()
+
+    def test_a_finished_run_starts_a_tick_and_keeps_its_exit_code(self):
+        rc, ticked, pidfile_left = self.wrap(0, ["sh", "-c", "exit 3"])
+        self.assertEqual((rc, ticked, pidfile_left), (3, "tick work", False))
+
+    def test_a_run_under_the_threshold_starts_none(self):
+        rc, ticked, pidfile_left = self.wrap(60, ["true"])
+        self.assertEqual((rc, ticked, pidfile_left), (0, None, False))
+
+    def test_spawn_passes_the_watch_and_threshold_to_the_wrapper(self):
+        seen = {}
+
+        class FakePopen:
+            def __init__(self, cmd, **kw):
+                seen["cmd"], self.pid = cmd, 4242
+
+        real = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which
+        rs.subprocess.Popen, rs.proc_start = FakePopen, (lambda pid: "t")
+        rs.claude_logged_in, rs.shutil.which = (lambda: True), (lambda name: "/bin/claude")
+        try:
+            rs.main(["init", "chain", "--target", "acme/app", "--own", "x"])
+            rs.spawn_run(rs.Watch("chain").load(), PR1, "brief")
+        finally:
+            rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which = real
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[:3], ["/bin/sh", "-c", rs.WRAPPER])
+        self.assertEqual(cmd[5:9], ["chain", str(rs.CHAIN_AFTER), "claude", "-p"])
+
+
 class Covers(unittest.TestCase):
     def test_specs(self):
         self.assertTrue(rs.covers("acme/app", PR1))
