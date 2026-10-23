@@ -85,10 +85,9 @@ import sys
 import time
 from datetime import datetime, timezone
 
-# Waits after a read that saw no new activity: 1, 1, 2, 2, then 5 minutes. A
-# reviewer or CI run usually lands within minutes; one GraphQL read per wait
+# A reviewer or CI run usually lands within minutes; one GraphQL read per wait
 # keeps even the 1-minute rungs far inside the API's hourly budget.
-BACKOFF = [60, 60, 120, 120, 300]
+BACKOFF = [60, 60, 120]
 # While the head is approved, no thread holds it and only its checks are left,
 # readiness is one CI finish away, so the wait stays at the first step.
 CHECKS_ONLY_WAIT = 60
