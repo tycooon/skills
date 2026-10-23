@@ -327,6 +327,8 @@ class VerdictNotes(unittest.TestCase):
         notes = rs.verdict_notes([("bot", f"APPROVED (formal approval refused: self-approval). AI reviewer: Claude. Reviewed {A}."),
                                   ("bot", f"P3: an APPROVED comment naming {B} is not a formal approval")])
         self.assertEqual(notes, {("bot", A)})
+        bold = rs.verdict_notes([("bot", f"**APPROVED** at {B} — AI reviewer: Claude")])
+        self.assertEqual(bold, {("bot", B)})
 
 
 class Init(unittest.TestCase):
@@ -348,6 +350,26 @@ class List(Base):
         self.assertIn(f"{self.watch}: reviewer sonnet, not scheduled, 0 run(s) in flight", out)
         self.assertIn("  acme/app", out)
         self.assertEqual(out, bare)
+
+
+class Status(Base):
+    def test_status_separates_running_waiting_ended_and_settled(self):
+        self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]
+        self.cli("tick", self.watch)  # 1-3 start, 4-5 wait
+        self.activity[PR1] = act()
+        self.cli("settle", self.watch, PR1, "--head", A, *SINCE)
+        real_running, real_sched = rs.Watch.running, rs.is_scheduled
+        rs.Watch.running = lambda w, url: url.endswith("/3")
+        rs.is_scheduled = lambda name: True
+        try:
+            _, out = self.cli("status", self.watch)
+        finally:
+            rs.Watch.running, rs.is_scheduled = real_running, real_sched
+        self.assertIn("3 started, 2 waiting for a slot", out)
+        self.assertIn("running (1):\n  https://github.com/acme/app/pull/3: started", out)
+        self.assertIn("waiting for a slot (2):", out)
+        self.assertIn("ended without settling (1):\n  https://github.com/acme/app/pull/2", out)
+        self.assertIn(f"settled, newest first (1):\n  {PR1}: approved at {A[:12]}", out)
 
 
 class Scheduled(unittest.TestCase):
