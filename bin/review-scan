@@ -399,7 +399,7 @@ def tick(w, a, spawn):
             continue
         owed.append((url, r, reason))
     in_flight = sum(w.running(u) for u in listed)
-    started, not_started, waiting = 0, [], []
+    started, not_started, waiting, started_urls = 0, [], [], []
     for url, r, reason in owed:
         if in_flight + started >= cfg["max_parallel"]:
             accounting.append(f"{url}: owed ({reason}), waiting for a free slot")
@@ -421,6 +421,7 @@ def tick(w, a, spawn):
         rec.update(last_run={"started": iso(now), "head": r["head"], "reason": reason,
                              "recheck": list(rec.get("recheck", []))})
         started += 1
+        started_urls.append(url)
         accounting.append(f"{url}: started a run ({reason})")
     if not a.dry_run:
         for t in finished:
@@ -442,7 +443,8 @@ def tick(w, a, spawn):
         print(problem)
     if not a.dry_run:
         # The queue as this tick left it, for status: only the tick knows what is owed.
-        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "waiting": waiting}
+        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
+                          "waiting": waiting}
         alert = w.prs.setdefault("_alert", {})
         if problem and alert.get("problem") != problem:
             notify(problem)  # once per new problem, not on every tick
@@ -663,6 +665,17 @@ def cmd_list(a):
     return 0
 
 
+def run_fate(w, url, rec):
+    """Where a PR's last run stands: "running", "ended" (it stopped without a settle after it
+    started), "settled", or None for a PR no run has touched. status reads it in both places."""
+    run, done = rec.get("last_run") or {}, rec.get("settled")
+    if w.running(url):
+        return "running"
+    if run.get("started") and not (done and done["at"] >= run["started"]):
+        return "ended"
+    return "settled" if done else None
+
+
 def ago(t, now):
     mins = int((now - parse_time(t)).total_seconds() // 60)
     return f"{mins}m ago" if mins < 120 else f"{mins // 60}h ago"
@@ -685,15 +698,26 @@ def cmd_status(a, limit=15):
     if tick:
         print(f"last tick {tick['at']} ({ago(tick['at'], now)}): {tick['kept']} PRs kept, {tick['started']} started, "
               f"{len(tick['waiting'])} waiting for a slot")
+        # What became of the runs it started: they often settle within minutes, before anyone looks.
+        for url in tick.get("started_urls", []):
+            rec = prs.get(url, {})
+            run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
+            if fate == "running":
+                fate = f"running for {ago(run['started'], now)[:-4]}"
+            elif fate == "settled":
+                fate = f"settled {done.get('verdict', '')} at {done['at']}".replace("  ", " ")
+            else:
+                fate = "ended without settling"
+            print(f"  started {url}: {fate}")
     running, ended, settled = [], [], []
     for url, rec in sorted(prs.items()):
-        run, done = rec.get("last_run") or {}, rec.get("settled")
-        if w.running(url):
+        run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
+        if fate == "running":
             running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
                            f"log runs/{w.slug(url)}.jsonl")
-        elif run.get("started") and not (done and done["at"] >= run["started"]):
+        elif fate == "ended":
             ended.append(f"{url}: run started {run['started']} ended without settling; log runs/{w.slug(url)}.jsonl")
-        elif done:
+        elif fate == "settled":
             settled.append((done["at"], f"{url}: {done.get('verdict', 'settled')} at {done['head'][:12]}, {done['at']}"
                             + (", recheck pending" if rec.get("recheck") else "")))
     busy = {u for u, r in prs.items() if w.running(u) or (r.get("settled") and tick and r["settled"]["at"] >= tick["at"])}
