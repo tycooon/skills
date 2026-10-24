@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for bin/claude-memory. Run: bin/test-claude-memory"""
+"""Tests for bin/claude-memory. Run: tests/test-claude-memory"""
 
 import base64
 import importlib.machinery
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # loading bin/claude-memory as a module would litter bin/
-SCRIPT = Path(__file__).resolve().parent / "claude-memory"
+SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "claude-memory"
 
 # Stands in for kubectl: keeps Secrets as JSON files in a directory and records every call.
 STUB_KUBECTL = r'''#!/usr/bin/env python3
