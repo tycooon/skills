@@ -878,6 +878,34 @@ class RunHistory(Base):
         log = rs.spawn_run(self.w, PR1, "brief")
         self.assertEqual((self.w.dir / log).read_text(), "log: brief")
 
+    def test_repeated_preflight_failures_leave_no_run_files(self):
+        for runner in ("claude", "codex"):
+            self.w.config["runner"] = runner
+            for failure in ("missing", "logged-out"):
+                with self.subTest(runner=runner, failure=failure), \
+                     patch.object(rs.shutil, "which", return_value=None if failure == "missing" else f"/bin/{runner}"), \
+                     patch.object(rs, f"{runner}_logged_in", return_value=False):
+                    for attempt in range(12):
+                        now = rs.parse_time("2026-10-23T12:00:00Z") + rs.dt.timedelta(minutes=2 * attempt)
+                        with patch.object(rs, "now_utc", return_value=now), self.assertRaises(OSError):
+                            rs.spawn_run(self.w, PR1, "failed brief")
+                    self.assertEqual(list(self.w.runs.rglob("*.*")), [])
+
+    def test_repeated_popen_failures_remove_only_the_failed_runs_files(self):
+        for runner in ("claude", "codex"):
+            with self.subTest(runner=runner):
+                self.w.config["runner"] = runner
+                url = PR1 if runner == "claude" else PR2
+                rs.spawn_run(self.w, url, "preserved brief")
+                before = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
+                with patch.object(rs.subprocess, "Popen", side_effect=OSError("cannot start")):
+                    for attempt in range(12):
+                        now = rs.parse_time("2026-10-23T12:02:00Z") + rs.dt.timedelta(minutes=2 * attempt)
+                        with patch.object(rs, "now_utc", return_value=now), self.assertRaisesRegex(OSError, "cannot start"):
+                            rs.spawn_run(self.w, url, "failed brief")
+                after = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
+                self.assertEqual(after, before)
+
     def test_spawning_keeps_ten_runs_and_preserves_legacy_files(self):
         self.w.config["runner"] = "codex"
         legacy = [self.w.runs / f"{self.w.slug(PR1)}.{ext}" for ext in ("brief.md", "jsonl", "last.md")]

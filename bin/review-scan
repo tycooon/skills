@@ -641,6 +641,18 @@ def prune_idle_runs(w, now):
 
 
 def spawn_run(w, url, brief):
+    cfg = w.config
+    runner = cfg.get("runner", "claude")
+    if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
+        raise FileNotFoundError(f"{runner} is not on PATH")
+    if runner == "codex":
+        if not codex_logged_in():
+            raise PermissionError("the codex CLI is logged out; run `codex login`")
+    else:
+        account = cfg.get("claude_config")
+        if not claude_logged_in(account):
+            login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
+            raise PermissionError(f"the claude CLI is logged out; run `{login}`")
     slug = w.slug(url)
     directory = w.runs / slug
     directory.mkdir(parents=True, exist_ok=True)
@@ -654,25 +666,15 @@ def spawn_run(w, url, brief):
     stem = stamp if suffix == 1 else f"{stamp}-{suffix}"
     run = directory / stem
     brief_path, log_path = run.with_suffix(".brief.md"), run.with_suffix(".jsonl")
-    brief_path.write_text(brief)
-    cfg = w.config
-    runner = cfg.get("runner", "claude")
-    if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
-        raise FileNotFoundError(f"{runner} is not on PATH")
+    last_path = run.with_suffix(".last.md")
     if runner == "codex":
-        if not codex_logged_in():
-            raise PermissionError("the codex CLI is logged out; run `codex login`")
         cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
                "-c", "sandbox_workspace_write.network_access=true",
-               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(run.with_suffix(".last.md")), "-"]
+               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"]
         env = claude_env(None)
     else:
         cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
                "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
-        account = cfg.get("claude_config")
-        if not claude_logged_in(account):
-            login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
-            raise PermissionError(f"the claude CLI is logged out; run `{login}`")
         env = claude_env(account)
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
@@ -680,9 +682,17 @@ def spawn_run(w, url, brief):
     # the slots idle most of each interval. A run shorter than CHAIN_AFTER starts none, so a
     # run that dies on start can't spin the watch; the schedule picks it up again.
     wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
-    with open(brief_path) as stdin, open(log_path, "w") as out:
-        p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
-                             start_new_session=True, env=env)
+    try:
+        brief_path.write_text(brief)
+        with open(brief_path) as stdin, open(log_path, "w") as out:
+            p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
+                                 start_new_session=True, env=env)
+    except Exception:
+        for path in (brief_path, log_path, last_path):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        prune_runs(directory)
+        raise
     pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
     prune_runs(directory)
     return str(log_path.relative_to(w.dir))
