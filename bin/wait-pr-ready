@@ -11,8 +11,7 @@ newest verdict approves the head (or a head it differs from only by a
 base-sync, read against the base the PR had when the verdict was posted), every check on the head is green and no
 Actions run for it is still queued or running (a rerun shortens the rollup to what already finished)
 or ended unsuccessfully in its workflow's newest attempt (GitHub drops a cancelled run's checks from the
-rollup), the head's oldest run is CI_SETTLE old (Actions can create a push run minutes after a quicker
-pull_request run), no review thread is unresolved,
+rollup), the head's oldest run is RUN_SETTLE old (to cover a run Actions creates late), no review thread is unresolved,
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
 
 Exit codes:
@@ -101,6 +100,9 @@ HEAD_SETTLE = 600
 # long after the waiter first saw it triggered none: its paths matched no
 # workflow's filters, and no check will ever report on it.
 CI_SETTLE = 600
+# Runs for a head start within seconds of each other; this only covers a run
+# Actions creates late.
+RUN_SETTLE = 120
 MAX_FAILED_READS = 6
 
 QUERY = """
@@ -1056,9 +1058,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             elif runs_failed:
                 ready = False
                 reasons.append("workflow runs not green: " + ", ".join(sorted(runs_failed)[:5]))
-            elif oldest is not None and now() - oldest < CI_SETTLE:
+            elif oldest is not None and now() - oldest < RUN_SETTLE:
                 ready = False
-                reasons.append(f"runs for this head are under {CI_SETTLE // 60} min old; another workflow may still start")
+                reasons.append(f"runs for this head are under {RUN_SETTLE // 60} min old; another workflow may still start")
         if ready and mark <= args.after:
             ready = False
             reasons.append(f"no activity since {iso(args.after)}")
