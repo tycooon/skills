@@ -23,5 +23,6 @@ Resolve these paths relative to this file's actual source directory (follow its 
 | Development, branches, commits, pushes, PR delivery or authorized merge/deploy | `references/agent-workflow.md` |
 | Code review | `references/agent-review.md` |
 | Repository prose/comments, issues, PR titles/descriptions or review replies | Relevant sections of `references/agent-writing.md` |
+| Building, reviewing or checking after deploy a user interface made from a mockup | `references/mockup-conformance.md` |
 
 On macOS, load relevant sections of `~/.claude/mac.md` for worktree creation, local tool/runtime work, production console access or file delivery. Load `~/.claude/cadolabs.md` only for Cadolabs projects on `gitlab.task4work.info`, and only the sections relevant to the task. Project bootstrap follows the repository's routing rules after these applicable global rules; no competing skill-first bootstrap is required.

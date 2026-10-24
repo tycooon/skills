@@ -21,6 +21,7 @@ So go the other way round. Turn the diff into a short list of surfaces before yo
 - **Outbound calls** — the services the new code talks to: timeouts, error responses, latency.
 - **Its own names** — the error classes it raises, and the files, classes and methods it adds, searched for by name in logs and stack traces. This is the sharpest signal you have that a failure belongs to this release rather than to the background.
 - **Its switches** — whether the feature flag, env var or setting the change depends on is really set the way you assume in production.
+- **Its screens** — for an interface built from a mockup, the side-by-side of mockup and production at both widths that [mockup conformance](../references/mockup-conformance.md) describes.
 
 And check that the change *works*, not only that nothing caught fire around it. A bugfix is verified by going and looking for the bug — the failing case should now succeed. A feature is verified by its own traffic: the new path being exercised, the rows being written, the metric moving. A new code path with no traffic at all is a finding, not a clean result — it usually means the deploy didn't take, the flag is off, or nothing can reach it.
 
