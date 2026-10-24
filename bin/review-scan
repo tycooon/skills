@@ -390,6 +390,8 @@ def cmd_tick(a, spawn=None):
 
 def tick(w, a, spawn):
     cfg, now = w.config, now_utc()
+    if not a.dry_run:
+        prune_idle_runs(w, now)
     cutoff = now - dt.timedelta(days=cfg["dormant_days"])
     listed, failed, accounting = {}, [], []
     for t in cfg["targets"]:
@@ -442,7 +444,7 @@ def tick(w, a, spawn):
         siblings = [s for s in listed.values() if s["url"] != url]
         brief = build_brief(w, r, rec, reason, siblings, now)
         try:
-            spawn(w, url, brief)
+            log = spawn(w, url, brief)
         except OSError as e:
             not_started.append(url)
             accounting.append(f"{url}: owed ({reason}), run FAILED to start ({e})")
@@ -450,6 +452,8 @@ def tick(w, a, spawn):
         # The rechecks stay until a settle clears the ones this run was started for.
         rec.update(last_run={"started": iso(now), "head": r["head"], "reason": reason,
                              "recheck": list(rec.get("recheck", []))})
+        if log is not None:
+            rec["last_run"]["log"] = log
         started += 1
         started_urls.append(url)
         accounting.append(f"{url}: started a run ({reason})")
@@ -590,6 +594,8 @@ def codex_logged_in():
 
 
 CHAIN_AFTER = 60
+RUNS_TO_KEEP = 10
+RUN_RETENTION_DAYS = 30
 WRAPPER = """exe=$1 watch=$2 min=$3; shift 3
 start=$(date +%s)
 "$@"; rc=$?
@@ -598,9 +604,43 @@ if [ $(( $(date +%s) - start )) -ge "$min" ]; then "$exe" tick --chained "$watch
 exit $rc"""
 
 
+def prune_runs(directory):
+    with contextlib.suppress(OSError):
+        if directory.is_symlink():
+            return
+        runs = {}
+        for path in directory.iterdir():
+            match = re.fullmatch(r"(\d{8}T\d{6}Z)(?:-(\d+))?\.(?:brief\.md|jsonl|last\.md)", path.name)
+            if match:
+                key = (match[1], int(match[2] or 1))
+                runs.setdefault(key, []).append(path)
+        for key in sorted(runs, reverse=True)[RUNS_TO_KEEP:]:
+            for path in runs[key]:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+
+def prune_idle_runs(w, now):
+    cutoff = (now - dt.timedelta(days=RUN_RETENTION_DAYS)).timestamp()
+    with contextlib.suppress(OSError):
+        for directory in w.runs.iterdir():
+            with contextlib.suppress(OSError):
+                if directory.is_symlink() or not directory.is_dir():
+                    continue
+                if our_pid(w.runs / f"{directory.name}.pid") is not None:
+                    continue
+                files = list(directory.iterdir())
+                if not files or max(path.lstat().st_mtime for path in files) >= cutoff:
+                    continue
+                for path in files:
+                    if path.name.endswith(".pid"):
+                        continue
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                directory.rmdir()
+
+
 def spawn_run(w, url, brief):
-    slug = w.slug(url)
-    (w.runs / f"{slug}.brief.md").write_text(brief)
     cfg = w.config
     runner = cfg.get("runner", "claude")
     if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
@@ -608,17 +648,33 @@ def spawn_run(w, url, brief):
     if runner == "codex":
         if not codex_logged_in():
             raise PermissionError("the codex CLI is logged out; run `codex login`")
-        cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
-               "-c", "sandbox_workspace_write.network_access=true",
-               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(w.runs / f"{slug}.last.md"), "-"]
-        env = claude_env(None)
     else:
-        cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
-               "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
         account = cfg.get("claude_config")
         if not claude_logged_in(account):
             login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
             raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+    slug = w.slug(url)
+    directory = w.runs / slug
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = now_utc().strftime("%Y%m%dT%H%M%SZ")
+    suffix = 1
+    # Pruning can free an earlier suffix; reusing it would sort this run among the oldest.
+    for path in directory.glob(f"{stamp}*"):
+        match = re.fullmatch(rf"{stamp}(?:-(\d+))?\..+", path.name)
+        if match:
+            suffix = max(suffix, int(match[1] or 1) + 1)
+    stem = stamp if suffix == 1 else f"{stamp}-{suffix}"
+    run = directory / stem
+    brief_path, log_path = run.with_suffix(".brief.md"), run.with_suffix(".jsonl")
+    last_path = run.with_suffix(".last.md")
+    if runner == "codex":
+        cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
+               "-c", "sandbox_workspace_write.network_access=true",
+               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"]
+        env = claude_env(None)
+    else:
+        cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+               "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
         env = claude_env(account)
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
@@ -626,10 +682,20 @@ def spawn_run(w, url, brief):
     # the slots idle most of each interval. A run shorter than CHAIN_AFTER starts none, so a
     # run that dies on start can't spin the watch; the schedule picks it up again.
     wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
-    with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
-        p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
-                             start_new_session=True, env=env)
+    try:
+        brief_path.write_text(brief)
+        with open(brief_path) as stdin, open(log_path, "w") as out:
+            p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
+                                 start_new_session=True, env=env)
+    except Exception:
+        for path in (brief_path, log_path, last_path):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        prune_runs(directory)
+        raise
     pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
+    prune_runs(directory)
+    return str(log_path.relative_to(w.dir))
 
 
 def cmd_settle(a):
@@ -932,11 +998,12 @@ def cmd_status(a, limit=15):
     running, ended, settled = [], [], []
     for url, rec in sorted(prs.items()):
         run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
+        log = run.get("log", f"runs/{w.slug(url)}.jsonl")
         if fate == "running":
             running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
-                           f"log runs/{w.slug(url)}.jsonl")
+                           f"log {log}")
         elif fate == "ended" and (kept is None or url in kept):
-            ended.append(f"{url}: run started {run['started']} ended without settling; log runs/{w.slug(url)}.jsonl")
+            ended.append(f"{url}: run started {run['started']} ended without settling; log {log}")
         elif fate == "settled":
             settled.append((done["at"], f"{url}: {done.get('verdict', 'settled')} at {done['head'][:12]}, {done['at']}"
                             + (", recheck pending" if rec.get("recheck") else "")))

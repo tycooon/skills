@@ -56,7 +56,7 @@ Transient trouble with one target is not a problem of the watch: the tick report
 - `review-scan model <watch> [MODEL] [--effort LEVEL] [--runner claude|codex]` changes the runner, model or effort in place, keeping its targets and state; `--runner` requires a model in the same call. Runs already going keep theirs. When the runner changes, later briefs tell runs that the earlier agent's posts from the `--own` accounts during its recorded time window are their own history, including model qualifiers but excluding separate reviewer roles such as `(Codex handoff)`.
 - `review-scan uninstall <watch>` stops the schedule and kills runs still in flight. The state stays on disk, so `install` later picks up where the watch left off. After a long gap, start with a `tick --full`.
 
-Each run's brief, its stream-json log and its pidfile sit in the watch's state directory under `runs/`. When the user asks how a review went, read the log there; don't rerun the review.
+Each run's brief and log sit in the watch's state directory under `runs/<slug>/`, named by the run's UTC start time: `YYYYMMDDTHHMMSSZ.brief.md` and `.jsonl`, plus `.last.md` for Codex. Starts in the same second get suffixes `-2`, `-3`, and so on. The pidfile stays at `runs/<slug>.pid`. `status` names the latest run's log; runs recorded before this layout still point to their flat log path. The newest 10 runs per PR are kept, and a PR's run directory is pruned on a tick 30 days after its newest file was modified, once no run is live. Existing flat brief, log and last-message files are left in place. When the user asks how a review went, read that run's log; don't rerun the review.
 
 ## What a PR still owes you
 

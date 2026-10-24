@@ -85,6 +85,15 @@ class Base(unittest.TestCase):
 
 
 class Tick(Base):
+    def test_records_the_log_returned_by_spawn(self):
+        log = "runs/github-com-acme-app-pull-1/20261023T120000Z.jsonl"
+        self.cli("tick", self.watch, "--only", PR1, spawn=lambda *_: log)
+        self.assertEqual(self.prs()[PR1]["last_run"]["log"], log)
+
+    def test_none_returning_spawn_leaves_log_out(self):
+        self.cli("tick", self.watch)
+        self.assertNotIn("log", self.prs()[PR1]["last_run"])
+
     def test_first_tick_starts_a_run_per_unreviewed_pr(self):
         code, out = self.cli("tick", self.watch)
         self.assertEqual(code, 0)
@@ -433,6 +442,18 @@ class List(Base):
 
 
 class Status(Base):
+    def test_status_prints_recorded_log_or_legacy_path(self):
+        log = "runs/github-com-acme-app-pull-1/20261023T120000Z.jsonl"
+        for recorded in (None, log):
+            for running in (False, True):
+                with self.subTest(recorded=recorded, running=running):
+                    self.cli("tick", self.watch, "--only", PR1, spawn=lambda *_: recorded)
+                    with patch.object(rs.Watch, "running", return_value=running), \
+                         patch.object(rs, "is_scheduled", return_value=False):
+                        _, out = self.cli("status", self.watch)
+                    expected = recorded or "runs/github-com-acme-app-pull-1.jsonl"
+                    self.assertIn(f"log {expected}", out)
+
     def test_status_separates_running_waiting_ended_and_settled(self):
         self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]
         self.cli("tick", self.watch)  # 1-3 start, 4-5 wait
@@ -749,19 +770,20 @@ class CodexRunner(Base):
                 contents.append(kwargs["stdin"].read())
                 return popen.return_value
             popen.side_effect = capture_stdin
-            rs.spawn_run(w, PR1, "codex brief")
+            log = rs.spawn_run(w, PR1, "codex brief")
             argv, kw = popen.call_args.args[0], popen.call_args.kwargs
             self.assertEqual(argv[7:], ["codex", "exec", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=high",
                              "-c", "sandbox_workspace_write.network_access=true",
                              "--approve-for-me", "--skip-git-repo-check", "--json", "-o",
-                             str(w.runs / f"{w.slug(PR1)}.last.md"), "-"])
+                             str(w.runs / w.slug(PR1) / "20261023T120000Z.last.md"), "-"])
             self.assertEqual(contents, ["codex brief"])
             self.assertEqual(kw["stderr"], rs.subprocess.STDOUT)
             self.assertNotIn("CLAUDE_CONFIG_DIR", kw["env"])
             self.assertEqual(kw["cwd"], str(w.dir))
             self.assertTrue(kw["start_new_session"])
-        self.assertEqual((w.runs / f"{w.slug(PR1)}.brief.md").read_text(), "codex brief")
-        self.assertTrue((w.runs / f"{w.slug(PR1)}.jsonl").exists())
+        self.assertEqual(log, f"runs/{w.slug(PR1)}/20261023T120000Z.jsonl")
+        self.assertEqual((w.runs / w.slug(PR1) / "20261023T120000Z.brief.md").read_text(), "codex brief")
+        self.assertTrue((w.dir / log).exists())
         self.assertEqual((w.runs / f"{w.slug(PR1)}.pid").read_text(), "4242 start")
 
     def test_logged_out_and_missing_codex_fail_and_notify(self):
@@ -795,6 +817,177 @@ class CodexRunner(Base):
                 run.assert_called_once()
                 self.assertEqual(run.call_args.args[0], ["codex", "login", "status"])
                 self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+
+class RunHistory(Base):
+    def setUp(self):
+        super().setUp()
+        self.w = rs.Watch(self.watch).load()
+        self.run_dir = self.w.runs / self.w.slug(PR1)
+        self.commands = []
+        for name, value in (("proc_start", "start"), ("claude_logged_in", True),
+                            ("codex_logged_in", True)):
+            self.enter_patch(patch.object(rs, name, return_value=value))
+        self.enter_patch(patch.object(rs.shutil, "which", side_effect=lambda name: f"/bin/{name}"))
+        self.enter_patch(patch.object(rs.subprocess, "Popen", side_effect=self.run_stub))
+
+    def enter_patch(self, patcher):
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def run_stub(self, argv, **kwargs):
+        self.commands.append(argv)
+        brief = kwargs["stdin"].read()
+        kwargs["stdout"].write(f"log: {brief}")
+        if "-o" in argv:
+            Path(argv[argv.index("-o") + 1]).write_text(f"last: {brief}")
+        return type("Process", (), {"pid": 4242})()
+
+    def test_repeated_spawns_preserve_each_runners_artifacts(self):
+        for runner in ("claude", "codex"):
+            with self.subTest(runner=runner):
+                url = PR1 if runner == "claude" else PR2
+                self.w.config["runner"] = runner
+                first = rs.spawn_run(self.w, url, "first brief")
+                second = rs.spawn_run(self.w, url, "second brief")
+                prefix = f"runs/{self.w.slug(url)}/20261023T120000Z"
+                self.assertEqual((first, second), (f"{prefix}.jsonl", f"{prefix}-2.jsonl"))
+                for log, brief in ((first, "first brief"), (second, "second brief")):
+                    path = self.w.dir / log
+                    self.assertEqual(path.read_text(), f"log: {brief}")
+                    self.assertEqual(path.with_suffix(".brief.md").read_text(), brief)
+                    if runner == "codex":
+                        self.assertEqual(path.with_suffix(".last.md").read_text(), f"last: {brief}")
+                if runner == "codex":
+                    for argv, log in zip(self.commands[-2:], (first, second)):
+                        self.assertEqual(argv[argv.index("-o") + 1],
+                                         str((self.w.dir / log).with_suffix(".last.md")))
+                self.assertEqual((self.w.runs / f"{self.w.slug(url)}.pid").read_text(), "4242 start")
+
+    def test_any_existing_artifact_reserves_its_stem(self):
+        self.run_dir.mkdir()
+        (self.run_dir / "20261023T120000Z.last.md").write_text("previous last")
+        (self.run_dir / "20261023T120000Z-2.jsonl").write_text("previous log")
+        log = rs.spawn_run(self.w, PR1, "new brief")
+        self.assertEqual(log, f"runs/{self.w.slug(PR1)}/20261023T120000Z-3.jsonl")
+        self.assertEqual((self.run_dir / "20261023T120000Z.last.md").read_text(), "previous last")
+        self.assertEqual((self.run_dir / "20261023T120000Z-2.jsonl").read_text(), "previous log")
+
+    def test_spawn_creates_missing_parent_directories(self):
+        self.w.runs.rmdir()
+        log = rs.spawn_run(self.w, PR1, "brief")
+        self.assertEqual((self.w.dir / log).read_text(), "log: brief")
+
+    def test_repeated_preflight_failures_leave_no_run_files(self):
+        for runner in ("claude", "codex"):
+            self.w.config["runner"] = runner
+            for failure in ("missing", "logged-out"):
+                with self.subTest(runner=runner, failure=failure), \
+                     patch.object(rs.shutil, "which", return_value=None if failure == "missing" else f"/bin/{runner}"), \
+                     patch.object(rs, f"{runner}_logged_in", return_value=False):
+                    for attempt in range(12):
+                        now = rs.parse_time("2026-10-23T12:00:00Z") + rs.dt.timedelta(minutes=2 * attempt)
+                        with patch.object(rs, "now_utc", return_value=now), self.assertRaises(OSError):
+                            rs.spawn_run(self.w, PR1, "failed brief")
+                    self.assertEqual(list(self.w.runs.rglob("*.*")), [])
+
+    def test_repeated_popen_failures_remove_only_the_failed_runs_files(self):
+        for runner in ("claude", "codex"):
+            with self.subTest(runner=runner):
+                self.w.config["runner"] = runner
+                url = PR1 if runner == "claude" else PR2
+                rs.spawn_run(self.w, url, "preserved brief")
+                before = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
+                with patch.object(rs.subprocess, "Popen", side_effect=OSError("cannot start")):
+                    for attempt in range(12):
+                        now = rs.parse_time("2026-10-23T12:02:00Z") + rs.dt.timedelta(minutes=2 * attempt)
+                        with patch.object(rs, "now_utc", return_value=now), self.assertRaisesRegex(OSError, "cannot start"):
+                            rs.spawn_run(self.w, url, "failed brief")
+                after = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
+                self.assertEqual(after, before)
+
+    def test_spawning_keeps_ten_runs_and_preserves_legacy_files(self):
+        self.w.config["runner"] = "codex"
+        legacy = [self.w.runs / f"{self.w.slug(PR1)}.{ext}" for ext in ("brief.md", "jsonl", "last.md")]
+        for path in legacy:
+            path.write_text("legacy")
+        other = self.w.runs / self.w.slug(PR2)
+        other.mkdir()
+        (other / "20261023T120000Z.jsonl").write_text("other PR")
+        for n in range(1, 13):
+            rs.spawn_run(self.w, PR1, f"brief {n}")
+            if n == 11:
+                self.assertFalse((self.run_dir / "20261023T120000Z.jsonl").exists())
+                self.assertTrue((self.run_dir / "20261023T120000Z-2.jsonl").exists())
+        expected = {f"20261023T120000Z-{n}.{ext}" for n in range(3, 13)
+                    for ext in ("brief.md", "jsonl", "last.md")}
+        self.assertEqual({p.name for p in self.run_dir.iterdir()}, expected)
+        for path in legacy:
+            self.assertEqual(path.read_text(), "legacy")
+        self.assertEqual((other / "20261023T120000Z.jsonl").read_text(), "other PR")
+
+    def age_directory(self, name, age):
+        directory = self.w.runs / name
+        directory.mkdir()
+        stamp = (rs.now_utc() - rs.dt.timedelta(days=age)).timestamp()
+        for ext in ("brief.md", "jsonl", "last.md"):
+            path = directory / f"20260901T120000Z.{ext}"
+            path.write_text("old run")
+            os.utime(path, (stamp, stamp))
+        return directory
+
+    def test_tick_prunes_only_old_idle_directories(self):
+        self.listing["acme/app"] = []
+        old = self.age_directory("old-idle", 31)
+        recent = self.age_directory("recent", 29)
+        boundary = self.age_directory("boundary", 30)
+        active = self.age_directory("old-active", 31)
+        stale = self.age_directory("old-stale", 31)
+        newest = self.age_directory("newest", 31)
+        fresh = newest / "20261023T120000Z.jsonl"
+        fresh.write_text("fresh log")
+        os.utime(fresh, (rs.now_utc().timestamp(), rs.now_utc().timestamp()))
+        live_pid = self.w.runs / "old-active.pid"
+        live_pid.write_text("4242 start")
+        stale_pid = self.w.runs / "old-stale.pid"
+        stale_pid.write_text("4242 different-start")
+        legacy = self.w.runs / "old-idle.jsonl"
+        legacy.write_text("legacy")
+        code, _ = self.cli("tick", self.watch)
+        self.assertEqual(code, 0)
+        self.assertFalse(old.exists())
+        self.assertFalse(stale.exists())
+        for path in (recent, boundary, active, newest, live_pid, stale_pid, legacy):
+            self.assertTrue(path.exists(), path)
+
+    def test_tick_does_not_follow_directory_symlinks(self):
+        self.listing["acme/app"] = []
+        outside = self.w.dir / "outside"
+        outside.mkdir()
+        path = outside / "20260901T120000Z.jsonl"
+        path.write_text("preserve")
+        os.utime(path, (0, 0))
+        (self.w.runs / "linked").symlink_to(outside, target_is_directory=True)
+        self.cli("tick", self.watch)
+        self.assertEqual(path.read_text(), "preserve")
+
+    def test_pruning_errors_do_not_fail_spawn_or_tick(self):
+        for n in range(10):
+            rs.spawn_run(self.w, PR1, f"brief {n}")
+        with patch.object(Path, "unlink", side_effect=PermissionError("denied")):
+            log = rs.spawn_run(self.w, PR1, "eleventh")
+        self.assertEqual((self.w.dir / log).read_text(), "log: eleventh")
+        self.listing["acme/app"] = []
+        self.age_directory("old-idle", 31)
+        for method in ("unlink", "iterdir", "stat", "rmdir"):
+            original = getattr(Path, method)
+            def fail_in_runs(path, *args, **kwargs):
+                if path == self.w.runs or self.w.runs in path.parents:
+                    raise OSError("unavailable")
+                return original(path, *args, **kwargs)
+            with self.subTest(method=method), patch.object(Path, method, fail_in_runs):
+                code, _ = self.cli("tick", self.watch)
+                self.assertEqual(code, 0)
 
 
 class Covers(unittest.TestCase):
