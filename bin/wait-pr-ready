@@ -41,7 +41,9 @@ GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab an
 the same four conditions: an approval (a formal one, or a verdict note), every
 resolvable discussion resolved, the head pipeline green (one on the head sha, or a
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
-a conflict nor need_rebase. A discussion whose first note says "non-blocking"
+a conflict nor need_rebase. Formal approval system notes inherit the signature
+and SHA of the nearest unpaired same-account verdict note; an unpaired system
+approval remains unsigned. A discussion whose first note says "non-blocking"
 counts as a finding of the verdict its reviewer posted with or after it, while the
 note is still anchored at that verdict's commit.
 
@@ -470,6 +472,25 @@ def gl_position(note):
     return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT", pos.get("head_sha")
 
 
+def gl_attribute_approvals(reviews, verdict_notes):
+    # GitLab stores the signature and formal approval in separate notes with no shared ID.
+    approvals = [r for r in reviews if r["id"].startswith("note-") and r["state"] == "APPROVED"]
+    pairs = sorted(
+        (abs(ts(a["submittedAt"]) - ts(v["submittedAt"])), i, j)
+        for i, a in enumerate(approvals) for j, v in enumerate(verdict_notes)
+        if (a["author"] or {}).get("login") and (v["author"] or {}).get("login")
+        and login_key(a["author"]["login"]) == login_key(v["author"]["login"])
+    )
+    used_approvals, used_verdicts = set(), set()
+    for _, i, j in pairs:
+        if i in used_approvals or j in used_verdicts:
+            continue
+        approvals[i]["body"] = verdict_notes[j]["body"]
+        approvals[i]["commit"] = verdict_notes[j]["commit"]
+        used_approvals.add(i)
+        used_verdicts.add(j)
+
+
 def gl_mr_to_pr(mr, discussions, commit):
     """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
     when) and APPROVED verdict notes as reviews, other top-level notes as comments,
@@ -512,6 +533,7 @@ def gl_mr_to_pr(mr, discussions, commit):
             else:
                 comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
     verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
+    gl_attribute_approvals(reviews, verdict_notes)
     for t in threads:
         opener = t["comments"]["nodes"][0]["pullRequestReview"]
         if opener["state"] == "APPROVED":

@@ -111,6 +111,57 @@ class GitLab(unittest.TestCase):
         self.assertEqual(pr["reviews"]["nodes"][0]["state"], "APPROVED")
         self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
 
+    def test_system_approvals_inherit_the_paired_verdicts_role_and_sha(self):
+        for qualifier in ("Codex handoff", "session reviewer", "Opus 5.5"):
+            for signed_at in ("2026-10-15T09:59:55Z", "2026-10-15T10:00:05Z"):
+                for reverse in (False, True):
+                    with self.subTest(qualifier=qualifier, signed_at=signed_at, reverse=reverse):
+                        body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}."
+                        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                                 gl_note(2, "Review-Bot", body, at=signed_at)]
+                        discussions = [{"notes": [n]} for n in notes]
+                        pr = gl_pr(discussions=discussions[::-1] if reverse else discussions)
+                        formal = next(r for r in pr["reviews"]["nodes"] if r["id"] == "note-1")
+                        self.assertEqual(formal["body"], body)
+                        self.assertEqual(formal["commit"], {"oid": HEAD})
+                        self.assertEqual(evaluate(pr, reviewers=["review-bot"])[0], qualifier == "Opus 5.5")
+                        self.assertTrue(evaluate(pr)[0])
+
+    def test_a_signed_old_sha_is_not_overridden_by_its_newer_system_note(self):
+        notes = [gl_note(1, "review-bot", f"APPROVED. AI reviewer: Claude. Reviewed {OLD}."),
+                 gl_note(2, "review-bot", "approved this merge request", at="2026-10-15T10:00:05Z", system=True)]
+        self.assertFalse(evaluate(gl_pr(discussions=[{"notes": notes}]), reviewers=["review-bot"])[0])
+
+    def test_a_role_verdict_does_not_relabel_another_accounts_unsigned_approval(self):
+        notes = [gl_note(1, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}."),
+                 gl_note(2, "another-bot", "approved this merge request", system=True)]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot", "another-bot"])[0])
+
+    def test_a_verdict_is_not_reused_for_a_later_unsigned_approval(self):
+        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                 gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.",
+                         at="2026-10-15T10:00:05Z"),
+                 gl_note(3, "review-bot", "unapproved this merge request", at="2026-10-15T10:10:00Z", system=True),
+                 gl_note(4, "review-bot", "approved this merge request", at="2026-10-15T10:20:00Z", system=True)]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        formal = next(r for r in pr["reviews"]["nodes"] if r["id"] == "note-4")
+        self.assertEqual(formal["body"], "")
+        self.assertIsNone(formal["commit"])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_paired_repo_and_role_approvals_keep_their_own_signatures(self):
+        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                 gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude (Opus 5.5). Reviewed {HEAD}.",
+                         at="2026-10-15T10:00:05Z"),
+                 gl_note(3, "review-bot", "approved this merge request", at="2026-10-15T10:10:00Z", system=True),
+                 gl_note(4, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.",
+                         at="2026-10-15T10:10:05Z")]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+        found = w.verdicts(pr, {"review-bot"})
+        self.assertEqual(found[0][3], "2026-10-15T10:00:05Z")
+
     def test_pipeline_statuses(self):
         self.assertFalse(evaluate(gl_pr(pipeline="running"), reviewers=["review-bot"])[0])
         self.assertTrue(w.hard_failures(gl_pr(pipeline="failed"), []))
@@ -502,6 +553,21 @@ class Loop(unittest.TestCase):
         self.assertIsNone(no_url["author"])
         self.assertIsNone(w.thread_last(no_url["reviewThreads"]["nodes"][0])["url"])
         self.assertEqual(self.run_main([no_url], url=GL_URL)[0], 14)
+
+    def test_a_gitlab_paired_role_approval_does_not_ready_or_end_the_initial_review_wait(self):
+        for qualifier in ("Codex handoff", "session reviewer"):
+            for signed_at in ("2026-10-15T09:59:55Z", "2026-10-15T10:00:05Z"):
+                notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                         gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}.", at=signed_at)]
+                pr = gl_pr(discussions=[{"notes": [n]} for n in notes])
+                moved = copy.deepcopy(pr)
+                moved["headRefOid"] = OLD
+                for mode in ([], ["--until-review"]):
+                    with self.subTest(qualifier=qualifier, signed_at=signed_at, mode=mode):
+                        code, out, waits = self.run_main([pr, pr, moved], url=GL_URL,
+                                                        args=[*mode, "--reviewer", "review-bot", "--after", "2026-10-15T10:01:00Z"])
+                        self.assertEqual(code, 12, out)
+                        self.assertEqual(len(waits), 2)
 
     def unchecked(self):
         return ready_pr(commits={"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-15T09:00:00Z", "statusCheckRollup": None}}]})
