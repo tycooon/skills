@@ -5,6 +5,8 @@
                    [--runner claude|codex] [--reviewer-model MODEL] [--effort LEVEL]
                    --own LOGIN... [--max-parallel N] [--dormant-days N]
   review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
+  review-scan pause <watch>
+  review-scan resume <watch>
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
                      [--covered-by SHA] [--weighed THREAD]... [--recheck PR_URL]...
   review-scan nudge <pr-url> --head SHA
@@ -22,6 +24,8 @@ A PR that has not changed costs nothing: no agent runs. The run follows review-o
 *One run reviews one PR* and ends with `settle`, which records the PR's state only when
 nothing but our own posts landed while the run was working, and only once the PR shows
 the verdict the run claims: an approval of ours at the head, or an open thread of ours.
+
+`pause` persists across configuration and schedule changes: every tick skips work, including manual and dry-run ticks, and nudges queue rechecks without starting a tick. Reviews already in flight can finish and settle. `resume` keeps the schedule unchanged and leaves scanning to the next tick; use `tick` for an immediate scan. An unscheduled watch stays unscheduled.
 
 A watch never stops on its own. A tick sends a desktop notification when it can read none
 of the targets, when a review run fails to start, and when nothing is left to watch;
@@ -297,6 +301,10 @@ class Watch:
     def save(self):
         write_json(self.dir / "prs.json", self.prs)
 
+    @property
+    def paused(self):
+        return bool(self.prs.get("_paused", False))
+
     def log(self, line):
         with open(self.dir / "scan.log", "a") as f:
             f.write(f"{iso(now_utc())} {line}\n")
@@ -378,8 +386,22 @@ def owed_reason(rec, row, full):
     return None
 
 
+def cmd_pause_resume(a):
+    with Watch(a.watch).locked() as w:
+        w.prs["_paused"] = a.cmd == "pause"
+        w.save()
+    if w.paused:
+        print(f"watch {w.name}: paused; reviews in flight can finish and settle")
+    else:
+        print(f"watch {w.name}: resumed; schedule unchanged; run `review-scan tick {w.name}` for an immediate scan")
+    return 0
+
+
 def cmd_tick(a, spawn=None):
     with Watch(a.watch).locked() as w:
+        if w.paused:
+            print(f"watch {w.name}: paused; tick skipped")
+            return 0
         # Checked under the lock, so a chained tick queued behind another one still sees an
         # uninstall that landed while it waited: a stopped watch must not go on reviewing.
         if getattr(a, "chained", False) and not is_scheduled(w.name):
@@ -828,7 +850,7 @@ def covers(spec, url):
 
 
 def cmd_nudge(a):
-    """address-pr's nudge: every watch covering the PR rechecks it on a tick started now."""
+    """Queue a recheck in every covering watch; start a tick unless that watch is paused."""
     hit = 0
     for d in sorted(HOME.glob("*/config.json")):
         with Watch(d.parent.name).locked() as w:
@@ -836,10 +858,14 @@ def cmd_nudge(a):
                 continue
             w.prs.setdefault(a.url, {}).setdefault("recheck", []).append(f"nudge after a push of {a.head[:12]}")
             w.save()
-        subprocess.Popen([str(Path(sys.argv[0]).resolve()), "tick", w.name, "--only", a.url], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            paused = w.paused
         hit += 1
-        print(f"nudged watch {w.name}")
+        if paused:
+            print(f"watch {w.name}: paused; recheck queued for the next tick after resume")
+        else:
+            subprocess.Popen([str(Path(sys.argv[0]).resolve()), "tick", w.name, "--only", a.url], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"nudged watch {w.name}")
     if not hit:
         print("no review watch covers this PR")
     return 0
@@ -856,6 +882,10 @@ def is_scheduled(name):
     return re.search(rf"review-scan tick {re.escape(name)}(?![\w.-])", tab) is not None
 
 
+def schedule_status(w):
+    return ("scheduled" if is_scheduled(w.name) else "not scheduled") + (", paused" if w.paused else "")
+
+
 def cmd_list(a):
     """Every watch on this machine: its targets, reviewer, schedule, runs in flight and any problem."""
     watches = sorted(d.parent.name for d in HOME.glob("*/config.json"))
@@ -865,7 +895,7 @@ def cmd_list(a):
     for name in watches:
         w = Watch(name).load()
         cfg = w.config
-        scheduled = "scheduled" if is_scheduled(name) else "not scheduled"
+        scheduled = schedule_status(w)
         running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
         print(f"{name}: reviewer {cfg.get('runner', 'claude')} {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
               + (f", account {cfg['claude_config']}" if cfg.get("claude_config") and cfg.get("runner", "claude") == "claude" else ""))
@@ -970,7 +1000,7 @@ def cmd_status(a, limit=15):
     account = "the codex CLI login" if cfg.get("runner", "claude") == "codex" else cfg.get("claude_config") or "the claude CLI default login"
     print(f"account: {account}")
     print(f"watch {w.name}: reviewer {cfg.get('runner', 'claude')} {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
-          f"dormant after {cfg['dormant_days']} days, {'scheduled' if is_scheduled(w.name) else 'not scheduled'}")
+          f"dormant after {cfg['dormant_days']} days, {schedule_status(w)}")
     for t in cfg["targets"]:
         print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "")
               + (f" (posts with ${t['token']})" if t.get("token") else ""))
@@ -1124,6 +1154,8 @@ def main(argv=None):
     acc.add_argument("watch")
     acc.add_argument("config", nargs="?", help="a claude config directory with its own login, or `default`")
     sub.add_parser("status").add_argument("watch", nargs="?", help="omit to list every watch")
+    sub.add_parser("pause", help="pause new reviews; runs in flight can finish").add_argument("watch")
+    sub.add_parser("resume", help="resume reviews on the next tick; schedule unchanged").add_argument("watch")
     sub.add_parser("uninstall").add_argument("watch")
     ins = sub.add_parser("install")
     ins.add_argument("watch")
@@ -1131,7 +1163,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     try:
         return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": cmd_status, "list": cmd_list, "account": cmd_account, "model": cmd_model,
-                "install": cmd_install, "uninstall": cmd_uninstall}[a.cmd](a)
+                "install": cmd_install, "uninstall": cmd_uninstall,
+                "pause": cmd_pause_resume, "resume": cmd_pause_resume}[a.cmd](a)
     except ScanError as e:
         print(f"error: {e}", file=sys.stderr)
         return 5
