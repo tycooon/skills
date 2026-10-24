@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # loading bin/review-scan as a module would litter bin/
@@ -338,6 +339,8 @@ class Spawn(Base):
             w = rs.Watch(self.watch).load()
             rs.spawn_run(w, PR1, "brief")
             cmd = seen["cmd"]
+            self.assertEqual(cmd[7:], ["claude", "-p", "--model", "sonnet", "--effort", "medium",
+                                       "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"])
             self.assertEqual(cmd[cmd.index("--model") + 1], "sonnet")
             self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "auto")
             self.assertTrue(w.running(PR1))
@@ -424,7 +427,7 @@ class List(Base):
             _, bare = self.cli("status")
         finally:
             rs.our_pid, rs.is_scheduled = real, real_sched
-        self.assertIn(f"{self.watch}: reviewer sonnet, not scheduled, 0 run(s) in flight", out)
+        self.assertIn(f"{self.watch}: reviewer claude sonnet, not scheduled, 0 run(s) in flight", out)
         self.assertIn("  acme/app", out)
         self.assertEqual(out, bare)
 
@@ -612,6 +615,152 @@ class Model(Base):
         self.assertEqual((cfg["reviewer_model"], cfg["effort"]), ("opus", "high"))
         self.cli("tick", self.watch)
         self.assertTrue(self.spawned)  # state and targets untouched
+
+
+class CodexRunner(Base):
+    def config(self):
+        return rs.Watch(self.watch).load().config
+
+    def switch(self, runner="codex", model="gpt-6-astra"):
+        return self.cli("model", self.watch, model, "--runner", runner, "--effort", "high")
+
+    def test_init_requires_model_and_preserves_runner_and_history(self):
+        args = ("init", self.watch, "--target", "acme/app", "--own", "review-bot")
+        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
+            self.cli(*args, "--runner", "codex")
+        self.assertEqual(self.config()["reviewer_model"], "sonnet")
+        _, out = self.cli(*args, "--runner", "codex", "--reviewer-model", "gpt-6-astra")
+        self.assertIn("reviewer codex gpt-6-astra", out)
+        history = self.config()["former_agents"]
+        self.cli(*args, "--reviewer-model", "gpt-6-astra")
+        self.assertEqual(self.config()["runner"], "codex")
+        self.assertEqual(self.config()["former_agents"], history)
+        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
+            self.cli(*args)
+
+    def test_new_codex_watch_has_no_former_agent(self):
+        name = self.watch + "-new"
+        args = ("init", name, "--target", "acme/app", "--own", "review-bot", "--runner", "codex")
+        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
+            self.cli(*args)
+        self.assertFalse((rs.HOME / name / "config.json").exists())
+        self.cli(*args, "--reviewer-model", "gpt-6-astra")
+        cfg = rs.Watch(name).load().config
+        self.assertEqual(cfg["runner"], "codex")
+        self.assertFalse(cfg.get("former_agents"))
+
+    def test_legacy_watch_defaults_to_claude(self):
+        w = rs.Watch(self.watch).load()
+        w.config.pop("runner", None)
+        rs.write_json(w.dir / "config.json", w.config)
+        _, out = self.cli("status", self.watch)
+        self.assertIn("reviewer claude sonnet", out)
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
+        self.assertEqual((self.config()["runner"], self.config()["reviewer_model"]), ("claude", "opus"))
+
+    def test_switch_records_history_only_on_change_and_brief_adopts_it(self):
+        self.switch()
+        self.assertEqual(self.config()["former_agents"], [{"agent": "Claude", "until": "2026-10-23T12:00:00Z"}])
+        self.switch()
+        self.assertEqual(len(self.config()["former_agents"]), 1)
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        for text in ("before 2026-10-23T12:00:00Z", "AI reviewer: Claude", "model qualifier",
+                     "last reviewed", "threads", "covering approval", "(Codex handoff)", "someone else's"):
+            self.assertIn(text, brief)
+        self.assertIn("review-scan settle", brief)
+        self.switch("claude", "opus")
+        self.assertEqual([a["agent"] for a in self.config()["former_agents"]], ["Claude", "Codex"])
+
+    def test_runner_option_requires_model_even_when_unchanged(self):
+        for runner in ("claude", "codex"):
+            with self.assertRaisesRegex(SystemExit, "model"):
+                self.cli("model", self.watch, "--runner", runner)
+        self.assertEqual(self.config()["reviewer_model"], "sonnet")
+
+    def test_account_cannot_set_codex_login_or_create_directory(self):
+        self.switch()
+        target = Path(TMP.name) / "must-not-exist"
+        for value in (str(target), "default"):
+            with self.assertRaisesRegex(SystemExit, "codex CLI.*login"):
+                self.cli("account", self.watch, value)
+        self.assertFalse(target.exists())
+        _, out = self.cli("account", self.watch)
+        self.assertIn("codex CLI", out)
+
+    def test_output_names_runner_and_account(self):
+        _, changed = self.switch()
+        self.assertIn("reviewer codex gpt-6-astra", changed)
+        with patch.object(rs, "is_scheduled", return_value=False), patch.object(rs, "our_pid", return_value=None):
+            for command in (("list",), ("status", self.watch), ("model", self.watch)):
+                _, out = self.cli(*command)
+                self.assertIn("reviewer codex gpt-6-astra", out)
+            _, out = self.cli("status", self.watch)
+            self.assertIn("account: the codex CLI login", out)
+
+    def test_codex_command_environment_and_artifacts(self):
+        self.switch()
+        w = rs.Watch(self.watch).load()
+        w.config["claude_config"] = "/unused-account"
+        self.addCleanup((w.runs / f"{w.slug(PR1)}.pid").unlink, missing_ok=True)
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/inherited-account"}), \
+             patch.object(rs.shutil, "which", return_value="/bin/codex"), \
+             patch.object(rs, "codex_logged_in", return_value=True), \
+             patch.object(rs, "claude_logged_in", side_effect=AssertionError("Claude login used")), \
+             patch.object(rs, "proc_start", return_value="start"), \
+             patch.object(rs.subprocess, "Popen") as popen:
+            popen.return_value.pid = 4242
+            contents = []
+            def capture_stdin(*args, **kwargs):
+                contents.append(kwargs["stdin"].read())
+                return popen.return_value
+            popen.side_effect = capture_stdin
+            rs.spawn_run(w, PR1, "codex brief")
+            argv, kw = popen.call_args.args[0], popen.call_args.kwargs
+            self.assertEqual(argv[7:], ["codex", "exec", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=high",
+                             "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+                             "--approve-for-me", "--skip-git-repo-check", "--json", "-o",
+                             str(w.runs / f"{w.slug(PR1)}.last.md"), "-"])
+            self.assertEqual(contents, ["codex brief"])
+            self.assertEqual(kw["stderr"], rs.subprocess.STDOUT)
+            self.assertNotIn("CLAUDE_CONFIG_DIR", kw["env"])
+            self.assertEqual(kw["cwd"], str(w.dir))
+            self.assertTrue(kw["start_new_session"])
+        self.assertEqual((w.runs / f"{w.slug(PR1)}.brief.md").read_text(), "codex brief")
+        self.assertTrue((w.runs / f"{w.slug(PR1)}.jsonl").exists())
+        self.assertEqual((w.runs / f"{w.slug(PR1)}.pid").read_text(), "4242 start")
+
+    def test_logged_out_and_missing_codex_fail_and_notify(self):
+        self.switch()
+        for found, logged_in, message in (("/bin/codex", False, "codex login"), (None, True, "codex is not on PATH")):
+            with self.subTest(message=message), patch.object(rs.shutil, "which", return_value=found), \
+                 patch.object(rs, "codex_logged_in", return_value=logged_in), \
+                 patch.object(rs.subprocess, "Popen") as popen:
+                self.notified.clear()
+                w = rs.Watch(self.watch).load()
+                w.prs.pop("_alert", None)
+                w.save()
+                code, out = self.cli("tick", self.watch, spawn=rs.spawn_run)
+                self.assertEqual(code, 5)
+                self.assertIn(message, out)
+                self.assertEqual(len(self.notified), 1)
+                self.assertNotIn("last_run", self.prs()[PR1])
+                popen.assert_not_called()
+
+    def test_login_status_cached_and_errors_allow_run(self):
+        for status, expected in ((0, True), (1, False), (OSError("unavailable"), True),
+                                 (rs.subprocess.TimeoutExpired("codex", 30), True)):
+            with self.subTest(status=status), patch.object(rs, "_codex_logged_in", None), \
+                 patch.object(rs.subprocess, "run") as run:
+                if isinstance(status, Exception):
+                    run.side_effect = status
+                else:
+                    run.return_value.returncode = status
+                self.assertEqual(rs.codex_logged_in(), expected)
+                self.assertEqual(rs.codex_logged_in(), expected)
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], ["codex", "login", "status"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
 
 class Covers(unittest.TestCase):

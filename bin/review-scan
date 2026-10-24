@@ -2,7 +2,7 @@
 """Drive a review-open-prs watch without a long-running agent session.
 
   review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--token SPEC=ENV_VAR]...
-                   [--reviewer-model MODEL] [--effort LEVEL]
+                   [--runner claude|codex] [--reviewer-model MODEL] [--effort LEVEL]
                    --own LOGIN... [--max-parallel N] [--dormant-days N]
   review-scan tick <watch> [--full] [--only PR_URL] [--dry-run]
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
@@ -11,12 +11,12 @@
   review-scan list
   review-scan status [<watch>]
   review-scan account <watch> [CONFIG_DIR | default]
-  review-scan model <watch> [MODEL] [--effort LEVEL]
+  review-scan model <watch> [MODEL] [--effort LEVEL] [--runner claude|codex]
   review-scan install <watch> [--interval SECONDS]
   review-scan uninstall <watch>
 
 A tick lists every open PR of the watch's targets in one cheap call per target and
-starts a fresh `claude -p` run, on the watch's reviewer model, for each PR that changed
+starts a fresh `claude -p` or `codex exec` run, on the watch's reviewer model, for each PR that changed
 since a run last settled it: a new head, new activity, or a recheck someone asked for.
 A PR that has not changed costs nothing: no agent runs. The run follows review-open-prs'
 *One run reviews one PR* and ends with `settle`, which records the PR's state only when
@@ -324,19 +324,36 @@ def per_target(a, option, what):
     return out
 
 
+def set_runner(config, runner):
+    if runner != config.get("runner", "claude"):
+        config.setdefault("former_agents", []).append({"agent": config.get("runner", "claude").title(),
+                                                       "until": iso(now_utc())})
+    config["runner"] = runner
+
+
 def cmd_init(a):
     w = Watch(a.watch)
     filters = per_target(a, "filter", "TEXT")
     tokens = per_target(a, "token", "ENV_VAR")
-    w.runs.mkdir(parents=True, exist_ok=True)
-    config = {"targets": [{"spec": t, "filter": filters.get(t), "token": tokens.get(t)} for t in a.target],
-              "reviewer_model": a.reviewer_model, "effort": a.effort, "own": a.own,
-              "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
     old = w.dir / "config.json"
-    if old.exists():  # re-running init redefines targets; the account stays as `account` set it
-        config["claude_config"] = json.loads(old.read_text()).get("claude_config")
+    previous = json.loads(old.read_text()) if old.exists() else {}
+    runner = a.runner or previous.get("runner", "claude")
+    if runner == "codex" and a.reviewer_model is None:
+        raise SystemExit("a codex watch requires an explicit --reviewer-model")
+    config = {"targets": [{"spec": t, "filter": filters.get(t), "token": tokens.get(t)} for t in a.target],
+              "reviewer_model": a.reviewer_model or "opus", "effort": a.effort, "own": a.own,
+              "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
+    if previous:
+        for key in ("claude_config", "former_agents"):
+            if key in previous:
+                config[key] = previous[key]
+        config["runner"] = previous.get("runner", "claude")
+        set_runner(config, runner)
+    else:
+        config["runner"] = runner
+    w.runs.mkdir(parents=True, exist_ok=True)
     write_json(w.dir / "config.json", config)
-    print(f"watch {a.watch}: {len(a.target)} target(s), reviewer {a.reviewer_model} at {a.effort} effort, state in {w.dir}")
+    print(f"watch {a.watch}: {len(a.target)} target(s), reviewer {runner} {config['reviewer_model']} at {a.effort} effort, state in {w.dir}")
     return 0
 
 
@@ -485,6 +502,12 @@ def build_brief(w, r, rec, reason, siblings, now):
         f"- Run start time, for `settle --since`: `{iso(now)}`.",
         f"- Accounts that post as you: {', '.join(cfg['own'])}.",
     ]
+    for former in cfg.get("former_agents", []):
+        lines.append(f"- For reviews before {former['until']}, this watch ran on {former['agent']}; "
+                     f"posts from the accounts above signed `AI reviewer: {former['agent']} …` with any model qualifier "
+                     "are this watch's own history: count them as yours when finding the head you last reviewed, "
+                     "your threads and your covering approval. A role-qualified identity such as "
+                     f"`{former['agent']} (Codex handoff)` stays someone else's, as review-pr's *Whose comment it is* says.")
     if r.get("filter"):
         lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
     if r.get("token"):
@@ -545,6 +568,22 @@ def claude_logged_in(config_dir=None):
     return _logged_in[config_dir]
 
 
+_codex_logged_in = None
+
+
+def codex_logged_in():
+    """Cache the CLI login per process; an unreadable status must not block reviews."""
+    global _codex_logged_in
+    if _codex_logged_in is None:
+        try:
+            p = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30,
+                               env=claude_env(None))
+            _codex_logged_in = p.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _codex_logged_in = True
+    return _codex_logged_in
+
+
 CHAIN_AFTER = 60
 WRAPPER = """exe=$1 watch=$2 min=$3; shift 3
 start=$(date +%s)
@@ -558,14 +597,24 @@ def spawn_run(w, url, brief):
     slug = w.slug(url)
     (w.runs / f"{slug}.brief.md").write_text(brief)
     cfg = w.config
-    cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
-           "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
-    if not shutil.which("claude"):  # inside the wrapper a missing CLI would fail unseen
-        raise FileNotFoundError("claude is not on PATH")
-    account = cfg.get("claude_config")
-    if not claude_logged_in(account):
-        login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
-        raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+    runner = cfg.get("runner", "claude")
+    if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
+        raise FileNotFoundError(f"{runner} is not on PATH")
+    if runner == "codex":
+        if not codex_logged_in():
+            raise PermissionError("the codex CLI is logged out; run `codex login`")
+        cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
+               "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(w.runs / f"{slug}.last.md"), "-"]
+        env = claude_env(None)
+    else:
+        cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+               "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+        account = cfg.get("claude_config")
+        if not claude_logged_in(account):
+            login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
+            raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+        env = claude_env(account)
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
     # start the next tick at once: runs take a minute or two, so waiting for the schedule left
@@ -574,7 +623,7 @@ def spawn_run(w, url, brief):
     wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
     with open(w.runs / f"{slug}.brief.md") as stdin, open(w.runs / f"{slug}.jsonl", "w") as out:
         p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=str(w.dir),
-                             start_new_session=True, env=claude_env(account))
+                             start_new_session=True, env=env)
     pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
 
 
@@ -747,8 +796,8 @@ def cmd_list(a):
         cfg = w.config
         scheduled = "scheduled" if is_scheduled(name) else "not scheduled"
         running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
-        print(f"{name}: reviewer {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
-              + (f", account {cfg['claude_config']}" if cfg.get("claude_config") else ""))
+        print(f"{name}: reviewer {cfg.get('runner', 'claude')} {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
+              + (f", account {cfg['claude_config']}" if cfg.get("claude_config") and cfg.get("runner", "claude") == "claude" else ""))
         for t in cfg["targets"]:
             print(f"  {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else ""))
         problem = w.prs.get("_alert", {}).get("problem")
@@ -767,8 +816,14 @@ def cmd_account(a):
     login (`claude auth login` under CLAUDE_CONFIG_DIR), or `default`, the CLI's own login.
     Runs already going finish on the account they started with."""
     w = Watch(a.watch)
+    cfg = w.load().config
+    if cfg.get("runner", "claude") == "codex":
+        if a.config is not None:
+            raise SystemExit("Codex runs use the codex CLI's own login; run `codex login`")
+        print(f"watch {a.watch}: the codex CLI login")
+        return 0
     if a.config is None:
-        print(f"watch {a.watch}: {w.load().config.get('claude_config') or 'default'}")
+        print(f"watch {a.watch}: {cfg.get('claude_config') or 'default'}")
         return 0
     target = None
     if a.config != "default":
@@ -802,17 +857,21 @@ def cmd_account(a):
 def cmd_model(a):
     """Show or change the model and effort a watch's runs use. Runs already going keep theirs."""
     w = Watch(a.watch)
+    if a.runner is not None and a.model is None:
+        raise SystemExit("--runner requires a model in the same call")
     if a.model is None and a.effort is None:
         cfg = w.load().config
-        print(f"watch {a.watch}: {cfg['reviewer_model']} at {cfg['effort']} effort")
+        print(f"watch {a.watch}: reviewer {cfg.get('runner', 'claude')} {cfg['reviewer_model']} at {cfg['effort']} effort")
         return 0
     with w.locked() as w:
+        if a.runner is not None:
+            set_runner(w.config, a.runner)
         if a.model:
             w.config["reviewer_model"] = a.model
         if a.effort:
             w.config["effort"] = a.effort
         write_json(w.dir / "config.json", w.config)
-    print(f"watch {a.watch}: runs from now on use {w.config['reviewer_model']} at {w.config['effort']} effort")
+    print(f"watch {a.watch}: runs from now on use reviewer {w.config.get('runner', 'claude')} {w.config['reviewer_model']} at {w.config['effort']} effort")
     return 0
 
 
@@ -837,8 +896,9 @@ def cmd_status(a, limit=15):
         return cmd_list(a)
     w = Watch(a.watch).load()
     cfg, now = w.config, now_utc()
-    print(f"account: {cfg.get('claude_config') or 'the claude CLI default login'}")
-    print(f"watch {w.name}: reviewer {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
+    account = "the codex CLI login" if cfg.get("runner", "claude") == "codex" else cfg.get("claude_config") or "the claude CLI default login"
+    print(f"account: {account}")
+    print(f"watch {w.name}: reviewer {cfg.get('runner', 'claude')} {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
           f"dormant after {cfg['dormant_days']} days, {'scheduled' if is_scheduled(w.name) else 'not scheduled'}")
     for t in cfg["targets"]:
         print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "")
@@ -954,7 +1014,8 @@ def main(argv=None):
     i.add_argument("--filter", action="append", help="SPEC=TEXT: a judgment-call filter the run applies")
     i.add_argument("--token", action="append",
                    help="SPEC=ENV_VAR: the variable holding this target's posting token, when the default reviewer-bot one can't post there")
-    i.add_argument("--reviewer-model", default="opus", help="model for every review run (default: opus)")
+    i.add_argument("--reviewer-model", help="model for every review run (Claude default: opus; required for Codex)")
+    i.add_argument("--runner", choices=["claude", "codex"], help="review runner (default: claude; existing watches keep theirs)")
     i.add_argument("--effort", default="medium", choices=["low", "medium", "high", "xhigh", "max"])
     i.add_argument("--own", action="append", required=True,
                    help="an account that posts as you: your default account and the reviewer bot (repeat)")
@@ -985,6 +1046,7 @@ def main(argv=None):
     mod = sub.add_parser("model", help="show or change the model and effort the watch's runs use")
     mod.add_argument("watch")
     mod.add_argument("model", nargs="?", help="e.g. opus, sonnet, or a full model id")
+    mod.add_argument("--runner", choices=["claude", "codex"], help="change runner; requires MODEL in the same call")
     mod.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     acc = sub.add_parser("account", help="show or switch the Claude account the watch's runs use")
     acc.add_argument("watch")
