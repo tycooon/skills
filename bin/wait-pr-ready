@@ -20,7 +20,9 @@ Exit codes:
   11 closed without merging
   12 the head moved away from the one being watched
   13 about 4 hours passed with no activity on the PR
-  14 a review, comment or review thread landed. With --until-review, any; while
+  14 an unresolved thread awaits the PR author's answer, even on the first read,
+     with a last comment newer than --after; its line ends with an activity mark.
+     Or a review, comment or review thread landed. With --until-review, any; while
      waiting for readiness, one that leaves the PR not ready (findings), so a
      session wakes for them even where nothing else relays them. An AI
      reviewer's approval covering the head, with no thread open, is no finding
@@ -38,7 +40,9 @@ GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab an
 the same four conditions: an approval (a formal one, or a verdict note), every
 resolvable discussion resolved, the head pipeline green (one on the head sha, or a
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
-a conflict nor need_rebase. A discussion whose first note says "non-blocking"
+a conflict nor need_rebase. Formal approval system notes inherit the signature
+and SHA of the nearest unpaired same-account verdict note; an unpaired system
+approval remains unsigned. A discussion whose first note says "non-blocking"
 counts as a finding of the verdict its reviewer posted with or after it, while the
 note is still anchored at that verdict's commit.
 
@@ -55,19 +59,27 @@ Options:
                     nothing, as far as the timeout can tell).
   --reviewer LOGIN  the AI reviewer's account; its reviews count even
                     without an identity line. Repeatable. Given, only listed
-                    accounts' verdicts count toward the approval: another
-                    account's identity-line go post neither approves nor wakes.
-                    Its formal approval on the head doesn't approve either, but
+                    accounts' verdicts without a role-qualified identity count.
+                    A role such as (Codex handoff) or (session reviewer) is a
+                    separate reviewer; a model or version such as (Opus 5.5)
+                    still counts. Without --reviewer, role verdicts count too.
+                    A role's or another account's identity-line go post alone
+                    neither approves nor wakes a readiness wait. An unlisted
+                    account's formal approval on the head doesn't approve, but
                     wakes with exit 14, naming the account, since it likely
                     means LOGIN is the wrong one.
   --after TIME      report ready, or a CI failure, only once the PR has activity
                     newer than TIME (ISO 8601): the mark of a ready that a
                     recheck refused, or of a failure the last round left as it was.
+                    In both modes, an open thread awaits the author only when
+                    its last comment is newer than TIME. Re-arm with the printed
+                    activity mark when a thread is left open on purpose.
                     With --until-review: a review or comment posted after TIME
                     counts as new, even one the first read already sees.
-  --until-review    don't wait for readiness: exit 14 on the first review,
-                    comment or review thread the first read didn't have. With
-                    --reviewer, also as soon as a listed reviewer's approval is
+  --until-review    don't wait for readiness: exit 14 on an open thread awaiting
+                    the author, or the first review, comment or review thread
+                    the first read didn't have. With --reviewer, also as soon as
+                    a listed reviewer's approval is
                     on the watched head, even one posted before the first read
                     or before --after. A findings verdict already there doesn't
                     end the wait.
@@ -110,6 +122,7 @@ query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       state
+      author { login }
       headRefOid
       baseRefName
       updatedAt
@@ -132,7 +145,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           originalStartLine
           diffSide
           comments(first: 1) { nodes { author { login } pullRequestReview { id state } } }
-          replies: comments(last: 1) { totalCount nodes { author { login } } }
+          replies: comments(last: 1) { totalCount nodes { author { login } createdAt url } }
         }
       }
       reviews(last: 50) {
@@ -168,6 +181,8 @@ query($owner: String!, $name: String!, $number: Int!) {
 # review-pr's verdicts carry an identity line ("AI reviewer: Claude."); a teammate's
 # Approve, or a person merely naming an agent, does not.
 IDENTITY = re.compile(r"\bAI reviewer\b", re.I)
+QUALIFIED_IDENTITY = re.compile(r"\bAI reviewer[ \t]*:[ \t]*[\w-]+(?:\.\w+)*(?:[ \t]+[\w-]+(?:\.\w+)*)*[ \t]*\(([^()\r\n]+)\)", re.I)
+MODEL_QUALIFIER = re.compile(r"\d|\b(?:Opus|Sonnet|Haiku|Fable|Sol|Astra|GPT)\b", re.I)
 MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 GO_SIGNAL = re.compile(r"^\W*(approved|lgtm|ship it)\b|\bAPPROVED\b|\bLGTM\b", re.I)
 NO_GO = re.compile(r"\bnot (yet )?(approv|lgtm)|\bunapprov|\bwithout approv", re.I)
@@ -459,6 +474,25 @@ def gl_position(note):
     return pos.get("new_path"), first, last, "RIGHT" if last else "LEFT", pos.get("head_sha")
 
 
+def gl_attribute_approvals(reviews, verdict_notes):
+    # GitLab stores the signature and formal approval in separate notes with no shared ID.
+    approvals = [r for r in reviews if r["id"].startswith("note-") and r["state"] == "APPROVED"]
+    pairs = sorted(
+        (abs(ts(a["submittedAt"]) - ts(v["submittedAt"])), i, j)
+        for i, a in enumerate(approvals) for j, v in enumerate(verdict_notes)
+        if (a["author"] or {}).get("login") and (v["author"] or {}).get("login")
+        and login_key(a["author"]["login"]) == login_key(v["author"]["login"])
+    )
+    used_approvals, used_verdicts = set(), set()
+    for _, i, j in pairs:
+        if i in used_approvals or j in used_verdicts:
+            continue
+        approvals[i]["body"] = verdict_notes[j]["body"]
+        approvals[i]["commit"] = verdict_notes[j]["commit"]
+        used_approvals.add(i)
+        used_verdicts.add(j)
+
+
 def gl_mr_to_pr(mr, discussions, commit):
     """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
     when) and APPROVED verdict notes as reviews, other top-level notes as comments,
@@ -486,7 +520,8 @@ def gl_mr_to_pr(mr, discussions, commit):
                 "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
                 "comments": {"nodes": [{"author": gl_user(first.get("author")), "pullRequestReview": {
                     "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
-                "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author"))}]},
+                "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author")),
+                    "createdAt": last["created_at"], "url": f"{mr['web_url']}#note_{last['id']}" if mr.get("web_url") else None}]},
                 "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"], "_anchor": anchored_at,
             })
             # A reply lands inside its thread and moves no other count; review_count reads this.
@@ -500,6 +535,7 @@ def gl_mr_to_pr(mr, discussions, commit):
             else:
                 comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
     verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
+    gl_attribute_approvals(reviews, verdict_notes)
     for t in threads:
         opener = t["comments"]["nodes"][0]["pullRequestReview"]
         if opener["state"] == "APPROVED":
@@ -519,6 +555,7 @@ def gl_mr_to_pr(mr, discussions, commit):
     mergeable, status = GL_MERGE.get(merge, ("MERGEABLE", "BLOCKED"))
     return {
         "state": {"opened": "OPEN", "locked": "OPEN", "merged": "MERGED"}.get(mr["state"], "CLOSED"),
+        "author": gl_user(mr.get("author")),
         "headRefOid": mr["sha"], "baseRefName": mr["target_branch"], "updatedAt": mr["updated_at"],
         "mergeable": mergeable, "mergeStateStatus": status, "timelineItems": {"nodes": []},
         "reviewThreads": {"totalCount": len(threads), "nodes": threads},
@@ -725,9 +762,17 @@ def posts(pr):
     return out
 
 
+def thread_comment(t, connection):
+    nodes = (t.get(connection) or {}).get("nodes") or [{}]
+    return nodes[0] or {}
+
+
 def thread_opener(t):
-    first = (t.get("comments") or {}).get("nodes") or [{}]
-    return first[0] or {}
+    return thread_comment(t, "comments")
+
+
+def thread_last(t):
+    return thread_comment(t, "replies")
 
 
 def non_blocking(t):
@@ -738,7 +783,7 @@ def non_blocking(t):
 def answered(t):
     """Someone other than the thread's opener has replied to it."""
     replies = t.get("replies") or {}
-    last = (replies.get("nodes") or [{}])[0] or {}
+    last = thread_last(t)
     opener = (thread_opener(t).get("author") or {}).get("login")
     return replies.get("totalCount", 0) > 1 and (last.get("author") or {}).get("login") != opener
 
@@ -747,6 +792,22 @@ def blocking_threads(pr):
     """Unresolved threads that hold the merge. A non-blocking finding stops holding it
     once the author has answered it, by a fix or by declining."""
     return sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"] and not (non_blocking(t) and answered(t)))
+
+
+def owed_threads(pr, after):
+    """Unresolved threads whose last comment leaves the PR author an answer to give."""
+    author = (pr.get("author") or {}).get("login")
+    owed = []
+    for t in pr["reviewThreads"]["nodes"]:
+        last = thread_last(t)
+        at = last.get("createdAt")
+        login = (last.get("author") or {}).get("login")
+        if t["isResolved"] or not at or (after and ts(at) <= after):
+            continue
+        if author and login and login_key(author) == login_key(login):
+            continue
+        owed.append(t)
+    return owed
 
 
 def is_thread_reply(body, state):
@@ -773,12 +834,17 @@ def is_reviewer(author, body, reviewers):
     return listed(author, reviewers) or (bool(author) and bool(IDENTITY.search(body)))
 
 
+def has_role_identity(body):
+    # review-pr's "Whose comment it is" treats roles as separate reviewers, models as the same.
+    return any(not MODEL_QUALIFIER.search(m.group(1)) for m in QUALIFIED_IDENTITY.finditer(body))
+
+
 def counts_as_verdict(author, body, reviewers):
     """Whose verdict the approval gate reads. Listed reviewers, when any are given,
-    are the only ones: another account's identity line (a session reviewer posting
-    from the author's account, say) must not stand in for the repo's AI reviewer."""
+    are the only ones, with role-qualified identities kept separate even on those
+    accounts: a session reviewer must not stand in for the repo's AI reviewer."""
     if reviewers:
-        return listed(author, reviewers)
+        return listed(author, reviewers) and not has_role_identity(body)
     return is_reviewer(author, body, reviewers)
 
 
@@ -804,8 +870,8 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, hunks_bet
     back clears on its own: checks still running, or mergeability GitHub is
     still computing. A failed check, a BEHIND or BLOCKED base, or a verdict the
     approval gate doesn't count still wakes the session, as nothing else may.
-    With listed reviewers, another account's identity-line go is no verdict of
-    the gate's: when such posts are all that is new, only an open thread, a
+    With listed reviewers, a role's or another account's identity-line go is no
+    verdict of the gate's: when such posts are all that is new, only an open thread, a
     failed check or a blocked base wakes the session. A formal approval from an
     unlisted account still wakes it: a session reviewer posts plain comments, so
     such an approval more likely means `--reviewer` names the wrong account.
@@ -818,11 +884,11 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, hunks_bet
         return False
     if not (pr["mergeStateStatus"] in MERGEABLE_STATES and pr["mergeable"] == "MERGEABLE") and pr["mergeable"] != "UNKNOWN":
         return False
-    # Another account's go verdict, with listed reviewers, is not the gate's: it neither
+    # A role's or another account's go verdict, with listed reviewers, is not the gate's: it neither
     # satisfies the approval nor counts as a finding, so it alone wakes nobody.
     if fresh and all(
         reviewers and not counts_as_verdict(a, b, reviewers) and is_reviewer(a, b, reviewers) and is_go(b, st)
-        and st != "APPROVED"
+        and (st != "APPROVED" or listed(a, reviewers))
         for _, a, b, _, st, _ in fresh
     ):
         return True
@@ -945,7 +1011,7 @@ def activity_mark(pr):
 
 
 def iso(t):
-    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(t, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def main(argv=None, now=time.time, sleep=time.sleep):
@@ -1017,6 +1083,13 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         # is final for that head.
         if state["head_seen"] and pr["mergeable"] == "CONFLICTING" and not args.known_conflict:
             return (15, f"conflict: {args.url} at {head} conflicts with {pr['baseRefName']}"), mark
+        if args.until_review or state["head_seen"]:
+            owed = owed_threads(pr, args.after)
+            if owed:
+                mark = max(mark, *(ts(thread_last(t).get("createdAt")) for t in owed))
+                url = thread_last(owed[0]).get("url") or args.url
+                count = f" ({len(owed)} threads)" if len(owed) > 1 else ""
+                return (14, f"review activity: an open thread awaits the author on {args.url} at {head}: {url}{count}; activity {iso(mark)}"), mark
         if state["reviews"] is None:
             state["reviews"] = review_count(pr)
             state["seen"] = {key for key, *_ in posts(pr)}
