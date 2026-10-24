@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -81,7 +82,135 @@ class Base(unittest.TestCase):
         self.spawned.append((url, brief))
 
     def prs(self):
-        return json.loads((Path(TMP.name) / self.watch / "prs.json").read_text())
+        return json.loads((rs.HOME / self.watch / "prs.json").read_text())
+
+
+class Pause(Base):
+    def test_paused_ticks_skip_reads_cleanup_and_launches(self):
+        with rs.Watch(self.watch).locked() as w:
+            w.prs.update(_paused=True, _tick={"kept_urls": [PR1]})
+            w.save()
+        before = self.prs()
+        old = w.runs / "old-idle"
+        old.mkdir()
+        log = old / "old.jsonl"
+        log.write_text("keep while paused")
+        stamp = (rs.now_utc() - rs.dt.timedelta(days=31)).timestamp()
+        os.utime(log, (stamp, stamp))
+        flags = [(), ("--chained",), ("--full",), ("--only", PR1), ("--dry-run",),
+                 ("--chained", "--full", "--only", PR1, "--dry-run")]
+        for scheduled in (False, True):
+            with patch.object(rs, "is_scheduled", return_value=scheduled), \
+                    patch.object(rs, "list_target", wraps=rs.list_target) as listing:
+                for variant in flags:
+                    with self.subTest(scheduled=scheduled, flags=variant):
+                        code, out = self.cli("tick", self.watch, *variant)
+                        self.assertEqual(code, 0)
+                        self.assertIn(": paused;", out)
+                        self.assertEqual(listing.call_count, 0)
+                        self.assertEqual(self.spawned, [])
+                        self.assertEqual(self.prs(), before)
+                        self.assertTrue(log.exists())
+        self.assertEqual(self.notified, [])
+
+    def test_controls_are_idempotent_and_preserve_existing_state(self):
+        self.cli("tick", self.watch)
+        w = rs.Watch(self.watch).load()
+        before = self.prs()
+        config = (w.dir / "config.json").read_bytes()
+        pid = w.runs / f"{w.slug(PR1)}.pid"
+        pid.write_text("4242 start")
+        with patch.object(rs.os, "killpg", side_effect=AssertionError("signalled a run")), \
+                patch.object(rs.subprocess, "run", side_effect=AssertionError("changed schedule")), \
+                patch.object(rs.subprocess, "Popen", side_effect=AssertionError("started a run")):
+            for command in ("pause", "resume"):
+                code, out = self.cli(command, self.watch)
+                self.assertEqual(code, 0)
+                state = self.prs()
+                self.assertEqual(self.cli(command, self.watch)[0], 0)
+                self.assertEqual(self.prs(), state)
+                self.assertEqual({k: v for k, v in state.items() if k != "_paused"}, before)
+                self.assertEqual((w.dir / "config.json").read_bytes(), config)
+                self.assertEqual(pid.read_text(), "4242 start")
+                if command == "resume":
+                    self.assertIn(f"review-scan tick {self.watch}", out)
+        self.spawned.clear()
+        self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR1, PR2])
+
+    def test_pause_persists_after_module_reload(self):
+        self.cli("pause", self.watch)
+        reloaded = load_module()
+        with patch.object(reloaded, "list_target", side_effect=AssertionError("read while paused")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(reloaded.main(["tick", self.watch]), 0)
+        self.assertIn(": paused;", out.getvalue())
+
+    def test_legacy_state_and_other_watches_still_run(self):
+        other = self.watch + "-other"
+        self.cli("init", other, "--target", "acme/app", "--own", "review-bot")
+        self.cli("pause", self.watch)
+        self.assertEqual(self.cli("tick", other)[0], 0)
+        self.assertEqual([u for u, _ in self.spawned], [PR1, PR2])
+        self.assertNotIn("_paused", rs.Watch(other).load().prs)
+        self.spawned.clear()
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(self.spawned, [])
+
+    def test_missing_watch_controls_fail_without_creating_state(self):
+        name = self.watch + "-missing"
+        for command in ("pause", "resume"):
+            with self.subTest(command=command), self.assertRaisesRegex(SystemExit, f"no watch '{name}'"):
+                self.cli(command, name)
+            self.assertFalse((Path(TMP.name) / name).exists())
+
+    def test_pause_survives_configuration_changes_and_reinit(self):
+        self.cli("pause", self.watch)
+        before = self.prs()
+        with patch.object(rs, "claude_auth_status", return_value={"loggedIn": False}):
+            self.cli("account", self.watch, "default")
+        self.cli("model", self.watch, "opus", "--effort", "high")
+        for _ in range(2):
+            self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
+        self.assertEqual(self.prs(), before)
+        self.cli("tick", self.watch)
+        self.assertEqual(self.spawned, [])
+
+    def test_pause_survives_install_and_uninstall_still_terminates_runs(self):
+        self.cli("pause", self.watch)
+        before = self.prs()
+        w = rs.Watch(self.watch).load()
+        pid = w.runs / f"{w.slug(PR1)}.pid"
+        pid.write_text("4242 start")
+        plist = w.dir / "watch.plist"
+        with patch.object(rs.sys, "platform", "darwin"), \
+                patch.object(rs, "plist_path", return_value=plist), \
+                patch.object(rs.subprocess, "run"), \
+                patch.object(rs, "our_pid", return_value=4242), \
+                patch.object(rs.os, "killpg") as kill:
+            self.cli("install", self.watch)
+            self.assertTrue(plist.exists())
+            self.assertEqual(self.cli("tick", self.watch, "--chained")[0], 0)
+            self.cli("uninstall", self.watch)
+            self.assertFalse(plist.exists())
+            kill.assert_called_once_with(4242, rs.signal.SIGTERM)
+            self.cli("install", self.watch)
+            self.assertEqual(self.prs(), before)
+        self.assertEqual(self.spawned, [])
+
+    def test_status_shows_pause_independently_of_schedule(self):
+        for scheduled in (False, True):
+            with patch.object(rs, "is_scheduled", return_value=scheduled):
+                for command in ("pause", "resume"):
+                    self.cli(command, self.watch)
+                    for args in (("list",), ("status",), ("status", self.watch)):
+                        with self.subTest(scheduled=scheduled, command=command, args=args):
+                            code, out = self.cli(*args)
+                            self.assertEqual(code, 0)
+                            prefix = f"watch {self.watch}:" if len(args) == 2 else f"{self.watch}:"
+                            line = next(line for line in out.splitlines() if line.startswith(prefix))
+                            self.assertIn(", scheduled" if scheduled else ", not scheduled", line)
+                            self.assertEqual(", paused" in line, command == "pause")
 
 
 class Tick(Base):
@@ -409,6 +538,178 @@ class Nudge(Base):
         self.assertIn(["tick", self.watch, "--only", PR1], [c[1:] for c in started])
         self.assertIn("nudge after a push", self.prs()[PR1]["recheck"][0])
         self.assertNotIn(self.watch, miss)
+
+
+class PausedNudge(Base):
+    def setUp(self):
+        home = patch.object(rs, "HOME", Path(TMP.name) / self.id().split(".")[-1])
+        home.start()
+        self.addCleanup(home.stop)
+        super().setUp()
+
+    def test_paused_nudge_queues_then_resume_processes_the_recheck(self):
+        self.cli("tick", self.watch)
+        for url in (PR1, PR2):
+            self.activity[url] = act()
+            self.cli("settle", self.watch, url, "--head", A, *SINCE)
+        settled = self.prs()[PR1]["settled"]
+        self.cli("pause", self.watch)
+        self.spawned.clear()
+        with patch.object(rs.subprocess, "Popen") as popen:
+            code, out = self.cli("nudge", PR1, "--head", B)
+            self.assertEqual(code, 0)
+            self.assertIn(": paused;", out)
+            self.assertIn("queued", out)
+            popen.assert_not_called()
+            self.cli("resume", self.watch)
+            popen.assert_not_called()
+        self.assertEqual(self.prs()[PR1]["recheck"], [f"nudge after a push of {B[:12]}"])
+        self.assertEqual(self.prs()[PR1]["settled"], settled)
+        self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR1])
+        self.assertIn("recheck:", self.spawned[0][1])
+        self.cli("settle", self.watch, PR1, "--head", A, *SINCE)
+        self.assertNotIn("recheck", self.prs()[PR1])
+
+    def test_mixed_watches_only_start_ticks_for_unpaused_matches(self):
+        other, unrelated = self.watch + "-other", self.watch + "-unrelated"
+        self.cli("init", other, "--target", "acme", "--own", "review-bot")
+        self.cli("init", unrelated, "--target", "other/repo", "--own", "review-bot")
+        self.cli("pause", self.watch)
+        started = []
+        with patch.object(rs.subprocess, "Popen", side_effect=lambda cmd, **kw: started.append(cmd[1:])):
+            code, out = self.cli("nudge", PR1, "--head", B)
+        self.assertEqual(code, 0)
+        self.assertEqual(started, [["tick", other, "--only", PR1]])
+        self.assertIn(f"nudged watch {other}", out)
+        self.assertIn("queued", out)
+        for name in (self.watch, other):
+            self.assertEqual(rs.Watch(name).load().prs[PR1]["recheck"],
+                             [f"nudge after a push of {B[:12]}"])
+        self.assertNotIn(PR1, rs.Watch(unrelated).load().prs)
+
+    def test_pause_after_nudge_unlock_still_blocks_the_spawned_tick(self):
+        def launch(cmd, **kw):
+            self.cli("pause", self.watch)
+            self.assertEqual(cmd[1:], ["tick", self.watch, "--only", PR1])
+            self.assertEqual(self.cli(*cmd[1:])[0], 0)
+
+        with patch.object(rs.subprocess, "Popen", side_effect=launch), \
+                patch.object(rs, "list_target", side_effect=AssertionError("read while paused")):
+            self.assertEqual(self.cli("nudge", PR1, "--head", B)[0], 0)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.prs()[PR1]["recheck"], [f"nudge after a push of {B[:12]}"])
+
+    def test_active_reviews_settle_while_paused_and_stay_quiet_after_resume(self):
+        self.cli("tick", self.watch)
+        self.cli("pause", self.watch)
+        for url in (PR1, PR2):
+            self.activity[url] = act()
+            self.assertEqual(self.cli("settle", self.watch, url, "--head", A, *SINCE)[0], 0)
+        before = self.prs()
+        self.cli("resume", self.watch)
+        for url in (PR1, PR2):
+            self.assertEqual(self.prs()[url], before[url])
+        self.spawned.clear()
+        self.cli("tick", self.watch)
+        self.assertEqual(self.spawned, [])
+
+    def test_nudge_during_pause_survives_an_older_active_run_settling(self):
+        with patch.object(rs.subprocess, "Popen"):
+            self.cli("nudge", PR1, "--head", A)
+        self.cli("tick", self.watch, "--only", PR1)
+        self.cli("pause", self.watch)
+        with patch.object(rs.subprocess, "Popen"):
+            self.cli("nudge", PR1, "--head", A)
+        self.activity[PR1] = act()
+        self.assertEqual(self.cli("settle", self.watch, PR1, "--head", A, *SINCE)[0], 0)
+        self.assertEqual(self.prs()[PR1]["recheck"], [f"nudge after a push of {A[:12]}"])
+        self.assertEqual(self.cli("tick", self.watch, "--only", PR1)[0], 0)
+        self.cli("resume", self.watch)
+        self.spawned.clear()
+        self.cli("tick", self.watch, "--only", PR1)
+        self.assertEqual([u for u, _ in self.spawned], [PR1])
+        self.assertIn("recheck:", self.spawned[0][1])
+
+    def test_commands_wait_for_the_same_watch_lock(self):
+        self.activity[PR1] = act()
+        commands = [("pause", self.watch), ("resume", self.watch), ("tick", self.watch, "--dry-run"),
+                    ("settle", self.watch, PR1, "--head", A, *SINCE), ("nudge", PR1, "--head", B)]
+        for args in commands:
+            with self.subTest(command=args[0]):
+                self.cli("pause", self.watch)
+                attempted, done = threading.Event(), threading.Event()
+                results, errors = [], []
+                real_flock = rs.fcntl.flock
+
+                def flock(fd, operation):
+                    attempted.set()
+                    return real_flock(fd, operation)
+
+                def run():
+                    try:
+                        results.append(rs.main(list(args)))
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        done.set()
+
+                worker = threading.Thread(target=run, daemon=True)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        with rs.Watch(self.watch).locked():
+                            before = self.prs()
+                            with patch.object(rs.fcntl, "flock", side_effect=flock):
+                                worker.start()
+                                self.assertTrue(attempted.wait(2), "command did not take the watch lock")
+                                self.assertFalse(done.is_set(), "command bypassed the held lock")
+                                self.assertEqual(self.prs(), before)
+                    finally:
+                        worker.join(2)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(results, [0])
+
+    def test_tick_already_holding_lock_finishes_before_pause_returns(self):
+        attempted, done = threading.Event(), threading.Event()
+        errors = []
+        real_flock = rs.fcntl.flock
+
+        def pause():
+            try:
+                rs.main(["pause", self.watch])
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=pause, daemon=True)
+
+        def flock(fd, operation):
+            if threading.current_thread() is worker:
+                attempted.set()
+            return real_flock(fd, operation)
+
+        def spawn(w, url, brief):
+            self.spawn(w, url, brief)
+            if url == PR1:
+                worker.start()
+                self.assertTrue(attempted.wait(2))
+                self.assertFalse(done.is_set())
+
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(rs.fcntl, "flock", side_effect=flock):
+            try:
+                self.assertEqual(rs.cmd_tick(self.tick_args(self.watch), spawn=spawn), 0)
+            finally:
+                if worker.ident is not None:
+                    worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(done.is_set())
+        self.assertEqual([u for u, _ in self.spawned], [PR1, PR2])
+        self.spawned.clear()
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(self.spawned, [])
 
 
 class VerdictNotes(unittest.TestCase):
