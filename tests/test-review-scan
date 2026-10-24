@@ -317,6 +317,12 @@ class NamedPr(Base):
 
 
 class Spawn(Base):
+    def setUp(self):
+        super().setUp()
+        real_which = rs.shutil.which
+        self.addCleanup(setattr, rs.shutil, "which", real_which)
+        rs.shutil.which = lambda name: "/bin/claude"
+
     def test_run_uses_the_configured_reviewer_model(self):
         seen = {}
 
