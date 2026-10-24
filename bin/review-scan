@@ -326,8 +326,9 @@ def per_target(a, option, what):
 
 def set_runner(config, runner):
     if runner != config.get("runner", "claude"):
-        config.setdefault("former_agents", []).append({"agent": config.get("runner", "claude").title(),
-                                                       "until": iso(now_utc())})
+        history = config.setdefault("former_agents", [])
+        since = history[-1]["until"] if history else config["created"]
+        history.append({"agent": config.get("runner", "claude").title(), "since": since, "until": iso(now_utc())})
     config["runner"] = runner
 
 
@@ -344,7 +345,7 @@ def cmd_init(a):
               "reviewer_model": a.reviewer_model or "opus", "effort": a.effort, "own": a.own,
               "max_parallel": a.max_parallel, "dormant_days": a.dormant_days, "created": iso(now_utc())}
     if previous:
-        for key in ("claude_config", "former_agents"):
+        for key in ("claude_config", "former_agents", "created"):
             if key in previous:
                 config[key] = previous[key]
         config["runner"] = previous.get("runner", "claude")
@@ -502,8 +503,12 @@ def build_brief(w, r, rec, reason, siblings, now):
         f"- Run start time, for `settle --since`: `{iso(now)}`.",
         f"- Accounts that post as you: {', '.join(cfg['own'])}.",
     ]
+    if cfg.get("runner", "claude") == "codex":
+        lines.append("- This run is in Codex's workspace-write sandbox: a fetch into a shared clone is refused; "
+                     "rerun that fetch with escalated permissions so the automatic approval reviewer can approve it.")
     for former in cfg.get("former_agents", []):
-        lines.append(f"- For reviews before {former['until']}, this watch ran on {former['agent']}; "
+        since = former.get("since", cfg["created"])
+        lines.append(f"- For reviews between {since} and {former['until']}, this watch ran on {former['agent']}; "
                      f"posts from the accounts above signed `AI reviewer: {former['agent']} …` with any model qualifier "
                      "are this watch's own history: count them as yours when finding the head you last reviewed, "
                      "your threads and your covering approval. A role-qualified identity such as "
@@ -604,7 +609,7 @@ def spawn_run(w, url, brief):
         if not codex_logged_in():
             raise PermissionError("the codex CLI is logged out; run `codex login`")
         cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
-               "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+               "-c", "sandbox_workspace_write.network_access=true",
                "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(w.runs / f"{slug}.last.md"), "-"]
         env = claude_env(None)
     else:

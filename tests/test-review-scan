@@ -659,18 +659,52 @@ class CodexRunner(Base):
         self.assertEqual((self.config()["runner"], self.config()["reviewer_model"]), ("claude", "opus"))
 
     def test_switch_records_history_only_on_change_and_brief_adopts_it(self):
-        self.switch()
-        self.assertEqual(self.config()["former_agents"], [{"agent": "Claude", "until": "2026-10-23T12:00:00Z"}])
+        created = self.config()["created"]
+        first, second = "2026-10-23T13:00:00Z", "2026-10-23T14:00:00Z"
+        with patch.object(rs, "now_utc", return_value=rs.parse_time(first)):
+            self.switch()
+        self.assertEqual(self.config()["former_agents"], [{"agent": "Claude", "since": created, "until": first}])
         self.switch()
         self.assertEqual(len(self.config()["former_agents"]), 1)
         self.cli("tick", self.watch)
         brief = self.spawned[0][1]
-        for text in ("before 2026-10-23T12:00:00Z", "AI reviewer: Claude", "model qualifier",
+        for text in (f"between {created} and {first}, this watch ran on Claude", "AI reviewer: Claude", "model qualifier",
                      "last reviewed", "threads", "covering approval", "(Codex handoff)", "someone else's"):
             self.assertIn(text, brief)
         self.assertIn("review-scan settle", brief)
-        self.switch("claude", "opus")
-        self.assertEqual([a["agent"] for a in self.config()["former_agents"]], ["Claude", "Codex"])
+        with patch.object(rs, "now_utc", return_value=rs.parse_time(second)):
+            self.switch("claude", "opus")
+        self.assertEqual(self.config()["former_agents"], [
+            {"agent": "Claude", "since": created, "until": first},
+            {"agent": "Codex", "since": first, "until": second},
+        ])
+        self.spawned.clear()
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        self.assertIn(f"between {first} and {second}, this watch ran on Codex", brief)
+        self.assertNotIn(f"between {created} and {second}, this watch ran on Codex", brief)
+
+    def test_legacy_history_uses_created_and_init_preserves_it(self):
+        w = rs.Watch(self.watch).load()
+        created = w.config["created"]
+        w.config["former_agents"] = [{"agent": "Codex", "until": "2026-10-23T13:00:00Z"}]
+        rs.write_json(w.dir / "config.json", w.config)
+        with patch.object(rs, "now_utc", return_value=rs.parse_time("2026-10-23T14:00:00Z")):
+            self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
+        self.assertEqual(self.config()["created"], created)
+        self.cli("tick", self.watch)
+        self.assertIn(f"between {created} and 2026-10-23T13:00:00Z, this watch ran on Codex", self.spawned[0][1])
+
+    def test_fetch_escalation_guidance_is_codex_only(self):
+        self.cli("tick", self.watch)
+        self.assertNotIn("escalated permissions", self.spawned[0][1])
+        self.switch()
+        self.spawned.clear()
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        self.assertIn("Codex's workspace-write sandbox", brief)
+        self.assertIn("fetch into a shared clone", brief)
+        self.assertIn("rerun that fetch with escalated permissions", brief)
 
     def test_runner_option_requires_model_even_when_unchanged(self):
         for runner in ("claude", "codex"):
@@ -718,7 +752,7 @@ class CodexRunner(Base):
             rs.spawn_run(w, PR1, "codex brief")
             argv, kw = popen.call_args.args[0], popen.call_args.kwargs
             self.assertEqual(argv[7:], ["codex", "exec", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=high",
-                             "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true",
+                             "-c", "sandbox_workspace_write.network_access=true",
                              "--approve-for-me", "--skip-git-repo-check", "--json", "-o",
                              str(w.runs / f"{w.slug(PR1)}.last.md"), "-"])
             self.assertEqual(contents, ["codex brief"])
