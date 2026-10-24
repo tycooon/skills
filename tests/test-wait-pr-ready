@@ -634,10 +634,18 @@ class Loop(unittest.TestCase):
 
     def test_young_runs_wait_for_a_push_run_actions_creates_late(self):
         # A quick pull_request run finished green; the push CI run is not created yet.
-        young = ([], [], w.ts("2026-10-15T09:58:00Z"))
+        young = ([], [], w.ts("2026-10-15T10:00:00Z"))
         code, out, waits = self.run_main([ready_pr()] * 30, head=[young] * 30)
         self.assertEqual(code, 0)
-        self.assertGreaterEqual(sum(waits), w.CI_SETTLE - 120)
+        self.assertEqual(sum(waits), w.RUN_SETTLE)
+
+    def test_runs_older_than_run_settle_but_younger_than_ci_settle_are_ready(self):
+        age = (w.RUN_SETTLE + w.CI_SETTLE) // 2
+        settled = ([], [], w.ts("2026-10-15T10:00:00Z") - age)
+        code, out, waits = self.run_main([ready_pr()], head=[settled])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("ready:"))
+        self.assertEqual(waits, [])
 
     def test_head_runs_judges_each_workflow_by_its_newest_run(self):
         rows = "\n".join([
