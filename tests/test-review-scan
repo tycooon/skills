@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for bin/review-scan. Run: bin/test-review-scan"""
+"""Tests for bin/review-scan. Run: tests/test-review-scan"""
 
 import contextlib
 import importlib.machinery
@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # loading bin/review-scan as a module would litter bin/
-SCRIPT = Path(__file__).resolve().parent / "review-scan"
+SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "review-scan"
 TMP = tempfile.TemporaryDirectory()
 os.environ["REVIEW_SCAN_HOME"] = TMP.name
 
@@ -317,6 +317,12 @@ class NamedPr(Base):
 
 
 class Spawn(Base):
+    def setUp(self):
+        super().setUp()
+        real_which = rs.shutil.which
+        self.addCleanup(setattr, rs.shutil, "which", real_which)
+        rs.shutil.which = lambda name: "/bin/claude"
+
     def test_run_uses_the_configured_reviewer_model(self):
         seen = {}
 
