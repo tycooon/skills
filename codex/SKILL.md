@@ -39,7 +39,13 @@ When the user asks for the session on another machine, or your machine rules sen
   ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST 'cd WORKTREE && mkdir -p .plans && echo $$ > .plans/NAME.pid && G=$(git rev-parse --absolute-git-dir) && C=$(git rev-parse --path-format=absolute --git-common-dir) && exec codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --add-dir "$G" --add-dir "$C/objects" --add-dir "$C/refs" --add-dir "$C/logs" --approve-for-me --color never -o .plans/NAME-last.md - > .plans/NAME.log 2>&1' < BRIEF
   ```
 
-  A resume is the same command with step 4's `resume SESSION_ID`, its follow-up on stdin, and the next numbered `-o` file, log and pidfile (`NAME-2.pid`, …), so a watch can never read the previous run's pid. Read both files with `ssh HOST cat` (or `tail` for the log) wherever this skill reads the `-o` file or the log.
+  A resume is the same command with `resume SESSION_ID` added after every flag, right before the `-`, its follow-up on stdin, and the next numbered `-o` file, log and pidfile (`NAME-2.pid`, …), so a watch can never read the previous run's pid. The flags stay in front of `resume`, as step 4 says: `codex exec resume SESSION_ID -C …` exits 2 with `unexpected argument '-C'` before the run starts.
+
+  ```bash
+  ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=6 HOST 'cd WORKTREE && echo $$ > .plans/NAME-2.pid && G=$(git rev-parse --absolute-git-dir) && C=$(git rev-parse --path-format=absolute --git-common-dir) && exec codex exec -m MODEL -c model_reasoning_effort=EFFORT -c service_tier=SPEED -C WORKTREE --add-dir "$G" --add-dir "$C/objects" --add-dir "$C/refs" --add-dir "$C/logs" --approve-for-me --color never -o .plans/NAME-last-2.md resume SESSION_ID - > .plans/NAME-2.log 2>&1' < FOLLOW_UP
+  ```
+
+  Read both files with `ssh HOST cat` (or `tail` for the log) wherever this skill reads the `-o` file or the log.
 - **A dropped connection or the timeout doesn't stop the run.** It ends only the local `ssh`, and Codex carries on in the worktree. Before reading the run as cut off, and before every resume, check it with the latest run's pidfile: `ssh HOST 'kill -0 $(cat WORKTREE/.plans/NAME.pid) 2>/dev/null && echo running'`. While it runs, it is still working: wait for it rather than starting a second run on the same session and worktree. Stop it with `kill` only when the user asks to stop.
 - **Watch the process, not the connection.** The local `ssh` ending is not the run ending, so on a remote host it is not what re-invokes you. Right after every launch and resume, arm one background command on that run's own pidfile, with `timeout: 7200000`. It exits on its own only when that process has exited; failed reads are retried, and a pidfile the launch has not written yet counts as not started, not as exited:
 
