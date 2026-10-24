@@ -8,7 +8,9 @@
 # skill directories. Safe to re-run: copies are re-synced in place, any
 # pre-existing symlink (e.g. from an earlier version of this script) is replaced
 # with a real copy, and unrelated skills already in the target dirs are left
-# untouched. Re-run after editing a skill to propagate the changes.
+# untouched. Re-run after editing a skill to propagate the changes. The shared
+# references/ directory is mirrored beside the skills the same way, so a skill's
+# ../references/ links resolve in every runtime.
 #
 # It also installs bin/claude-memory into ~/.claude/bin and registers its hook:
 # on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
@@ -76,6 +78,10 @@ for target in "${targets[@]}"; do
   for skill in "${skills[@]}"; do
     sync_skill "$skill" "$target/$(basename "$skill")"
   done
+  # Skills link shared procedures as ../references/<file>; a sibling copy keeps
+  # those links resolving in the installed layout. No SKILL.md, so no runtime
+  # loads it as a skill.
+  sync_skill "$repo_root/references" "$target/references"
 done
 
 echo
