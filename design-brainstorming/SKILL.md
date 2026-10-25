@@ -5,7 +5,7 @@ description: "Unapproved new behavior; skip routine fixes, audits or mechanical 
 
 # Brainstorming Ideas Into Designs
 
-Use this workflow when a design still needs to be agreed. If the conversation already contains a concrete design that the user approved, proceed with that design using `design-implementation`; do not repeat intake or approval.
+Use this workflow when a design still needs to be agreed. If the conversation already contains a concrete design that the user approved, proceed with that design using `design-implementation`, or `rfc` when it is to be published as an RFC; do not repeat intake or approval.
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
 
@@ -24,10 +24,10 @@ Create a task for each of these items and complete them in order:
 3. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
 4. **Propose 2-3 approaches** — with trade-offs and your recommendation, written into the spec file and handed over (see *The spec file is how you present* below)
 5. **Present design** — in sections scaled to their complexity, each added to the spec file and handed over, with user approval after each section
-6. **Finalize the spec** — fold in the answers you got and drop the options not taken; it lives at `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md` (a git-ignored directory inside the working directory, see below), and is never committed
+6. **Finalize the spec** — fold in the answers you got and drop the options not taken (for an RFC, also list the user's answers under Decisions, see *After the Design*); it lives at `<working-dir>/.plans/YYYY-MM-DD-<topic>-design.md` (a git-ignored directory inside the working directory, see below), and is never committed
 7. **Spec self-review** — quick inline check for placeholders, contradictions, ambiguity, scope (see below)
 8. **User reviews written spec** — hand the file over again and ask the user to review it before proceeding
-9. **Transition to implementation** — invoke design-implementation skill, which plans and then implements in one flow
+9. **Transition** — invoke design-implementation skill, which plans and then implements in one flow; or, when the design is to be published as an RFC, invoke the rfc skill with the spec's path
 
 ## Process Flow
 
@@ -41,7 +41,9 @@ digraph brainstorming {
     "Finalize spec" [shape=box];
     "Spec self-review\n(fix inline)" [shape=box];
     "User reviews spec?" [shape=diamond];
+    "Publish as an RFC?" [shape=diamond];
     "Invoke design-implementation skill" [shape=doublecircle];
+    "Invoke rfc skill\nwith the spec path" [shape=doublecircle];
 
     "Explore project context" -> "Ask clarifying questions";
     "Ask clarifying questions" -> "Propose 2-3 approaches\n(in the spec file)";
@@ -52,11 +54,13 @@ digraph brainstorming {
     "Finalize spec" -> "Spec self-review\n(fix inline)";
     "Spec self-review\n(fix inline)" -> "User reviews spec?";
     "User reviews spec?" -> "Finalize spec" [label="changes requested"];
-    "User reviews spec?" -> "Invoke design-implementation skill" [label="approved"];
+    "User reviews spec?" -> "Publish as an RFC?" [label="approved"];
+    "Publish as an RFC?" -> "Invoke design-implementation skill" [label="no"];
+    "Publish as an RFC?" -> "Invoke rfc skill\nwith the spec path" [label="yes"];
 }
 ```
 
-**The terminal state is invoking design-implementation.** Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skill you invoke after brainstorming is design-implementation.
+**There are two terminal states: invoking design-implementation, or invoking rfc when the design is to be published as an RFC.** A design is published as an RFC when the user asked for one (`/rfc <topic>` starts here) or the repo's rules require one before implementation. Do NOT invoke frontend-design, mcp-builder, or any other implementation skill. The ONLY skills you invoke after brainstorming are design-implementation and rfc.
 
 ## The Process
 
@@ -113,7 +117,8 @@ digraph brainstorming {
   - Inside the working directory on purpose: the desktop app can only open files under it, and a spec the user cannot click open is not reviewable. That rules out `~/.claude/plans/`, which the app refuses to open.
   - Before the first write, make sure `.plans/` is ignored: `git check-ignore -q .plans || echo '.plans/' >> "$(git rev-parse --git-path info/exclude)"`. The exclude file is per repo, never committed, and shared by every worktree of that repo, so it cannot leak into a PR the way a `.gitignore` edit would.
 - Once the design is approved, finalize the spec: fold in the answers you got and drop the options not taken.
-- **Never commit the spec.** It is a working document, not a deliverable. It sits in the working directory only so it can be opened; `.plans/` is excluded so it can't dirty the tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, and do not commit it "just to keep it safe."
+- When the design is headed for an RFC, also give the spec a Decisions section listing each question the user answered, with their answer. The rfc skill records those as the owner's decisions, and folding alone would lose which choices were theirs.
+- **Never commit the spec.** It is a working document, not a deliverable. It sits in the working directory only so it can be opened; `.plans/` is excluded so it can't dirty the tree or leak into a PR diff. Do not add it to `.gitignore`, do not `git add` it, and do not commit it "just to keep it safe." An RFC carries the design into the repo as a doc of its own, written by the rfc skill; the `.plans/` file still stays out.
 
 **Spec Self-Review:**
 After finalizing the spec, look at it with fresh eyes:
@@ -130,12 +135,15 @@ After the spec review loop passes, hand the file over again and ask the user to 
 
 > "Spec finalized at `<path>` (uncommitted). Please review it and let me know if you want to make any changes before we start writing out the implementation plan."
 
+For an RFC, the last words read "before I write it up as an RFC."
+
 Wait for the user's response. If they request changes, make them and re-run the spec review loop. Only proceed once the user approves.
 
-**Implementation:**
+**Implementation or RFC:**
 
 - Invoke the design-implementation skill. It writes the detailed plan and then implements it, without coming back for plan approval.
-- Do NOT invoke any other skill. design-implementation is the next step.
+- When the design is to be published as an RFC, invoke the rfc skill with the spec's path instead. It re-checks the spec against today's code and opens the RFC PR; implementation waits until the RFC has merged.
+- Do NOT invoke any other skill. design-implementation or rfc is the next step.
 
 ## Key Principles
 

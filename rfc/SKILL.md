@@ -1,24 +1,23 @@
 ---
 name: rfc
-description: "Write a design/spec as a docs-only RFC PR or MR and settle review questions before implementation."
+description: "Agree a design with the user, write it as a docs-only RFC PR or MR, and settle review questions before implementation."
 ---
 
 # Write an RFC
 
-Put a design up for review as a docs-only pull request (GitHub) or merge request (GitLab) before any of it is built. The PR is the RFC. Its spec docs say what today's code does, what should change and how it ships, and they list the questions the evidence could not settle, each with your recommendation. The review settles those questions — the reviewer takes a position on each, and the two of you agree or argue it out — and the PR is approved only once none is left. The user hears only about the questions you and the reviewer could not settle, or that only they can decide.
+Put a design up for review as a docs-only pull request (GitHub) or merge request (GitLab) before any of it is built. The design is worked out with the user first, and the RFC publishes what they approved. The PR is the RFC. Its spec docs say what today's code does, what should change and how it ships, and they list the questions the evidence could not settle, each with your recommendation. The review settles those questions — the reviewer takes a position on each, and the two of you agree or argue it out — and the PR is approved only once none is left. Once the PR is open, the user hears only about the questions you and the reviewer could not settle, or that only they can decide.
 
-You are the author. The AI reviewer that covers the repo reviews the RFC with the review-pr skill, and your address-pr passes settle its questions with that reviewer. The user is the owner: they make the calls neither of you can, and they merge.
+You are the author. The AI reviewer that covers the repo reviews the RFC with the review-pr skill, and your address-pr passes settle its questions with that reviewer. The user is the owner: they shape the design with you before it is written, they make the calls neither of you can, and they merge.
 
-## 1. Read the request
+## 1. Agree the design with the user
 
-`/rfc <topic>` starts from scratch. `/rfc <path>` publishes a spec that already exists — typically a `.plans/` doc from the design-brainstorming skill.
+`/rfc <topic>` starts with the design-brainstorming skill, never with the spec: its intake, clarifying questions one at a time, 2-3 approaches with your recommendation, design sections the user approves, and the finalized spec in `.plans/`. Brainstorming then hands that spec back here, and the RFC goes on as `/rfc <path>` with it. A review settles the questions a spec lists, but it cannot raise a requirement that only the owner knows, so a spec written without them ships with gaps that nobody asks about. Brainstorm in the repo the design is for, reading its code at `origin/master`, fetched now.
 
-- **A topic.** Ask the user before writing anything only when the request reads two ways that lead to different designs. Short of that, write your reading into the spec's Goal and let the review challenge it: a question asked now is one the review could have settled without them.
-- **An existing spec.** Treat it as your draft and take it through the steps below, in the repo it designs for, which may not be the one its `.plans/` sits in. From then on the RFC doc is the spec; don't keep editing the old copy. The survey re-checks its claims against today's code, since the spec may predate recent changes. The questions the user answered while it was written are theirs: record each as the owner's decision, with an ID from the same sequence as the open questions. The rest of it is your draft, for the review to challenge. Where the survey contradicts one of the owner's decisions, don't change it quietly: reopen it as an open question, with the evidence. The points the spec left open go through step 3 like any other.
+`/rfc <path>` publishes a spec that already exists — typically a `.plans/` doc from design-brainstorming — and skips brainstorming. Treat it as your draft and take it through the steps below, in the repo it designs for, which may not be the one its `.plans/` sits in. From then on the RFC doc is the spec; don't keep editing the old copy. The questions the user answered while it was written are theirs: record each as the owner's decision, with an ID from the same sequence as the open questions. The rest of it is your draft, for the review to challenge. Where the survey contradicts one of the owner's decisions, don't change it quietly: reopen it as an open question, with the evidence. The points the spec left open go through step 3 like any other.
 
 ## 2. Survey
 
-The design stands on what the code and the data say today, so read them first:
+The survey re-checks the agreed spec against what the code and the data say today, since the spec may predate recent changes; it doesn't design from scratch. Read:
 
 - the code at `origin/master`, fetched now, noting the sha you read;
 - the repo's earlier RFCs, specs, ADRs and TODO, and the PRs that built them, which can hold an answer the owner already gave;
