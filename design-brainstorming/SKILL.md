@@ -142,7 +142,7 @@ Wait for the user's response. If they request changes, make them and re-run the 
 **Implementation or RFC:**
 
 - Invoke the design-implementation skill. It writes the detailed plan and then implements it, without coming back for plan approval.
-- When the design is to be published as an RFC, invoke the rfc skill with the spec's path instead. It re-checks the spec against today's code and opens the RFC PR; implementation waits until the RFC has merged.
+- When the design is to be published as an RFC, invoke the rfc skill with the spec's path instead. It re-checks the spec against today's code, shows the user a short plan of the RFC, and opens the RFC PR on their go; implementation waits until the RFC has merged.
 - Do NOT invoke any other skill. design-implementation or rfc is the next step.
 
 ## Key Principles
