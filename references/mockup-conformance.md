@@ -41,7 +41,7 @@ A row height off by more than about 20 %, an extra line of text, or a figure in 
 Screenshots show none of these, so each one gets a browser check in the change's tests, not a look:
 
 - **Hit area equals highlight.** Every clickable element accepts a click anywhere on its hover or focus highlight. Click near each corner of the highlighted box and assert the click reached the control.
-- **Keys.** Enter in a form submits it; an ordinary confirmation dialog focuses its primary action, so Enter confirms and Escape cancels, while a destructive one keeps focus on Cancel so a stray Enter dismisses it.
+- **Keys.** Enter in a form submits it; an ordinary confirmation dialog focuses its primary action, so Enter confirms and Escape cancels, while a destructive one keeps focus on Cancel so a stray Enter dismisses it. The check presses Enter in both kinds of dialog.
 - **Jumps and pinned elements.** An in-page jump lands at once, and its target isn't hidden under a pinned header or bar.
 - **Phone width.** Nothing from the desktop layout, such as a pinned table header, shows over the phone layout.
 - **Mounted hidden.** Behaviour that measures the page still works for an element mounted while its tab or panel was hidden.
