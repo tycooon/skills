@@ -49,7 +49,7 @@ Screenshots show none of these, so each one gets a browser check in the change's
 
 ### Review
 
-The reviewer renders the pairs and takes the measurements again rather than reading the implementer's screenshots, which show what the implementer chose to show. Walk the table against the pairs, then the pairs against the mockup for anything the table left out. Look at every pair, phone width included. The verdict names the pairs the reviewer rendered and the row heights it measured; a verdict that doesn't is not a conformance review, and nobody writes "matches the mockup" without such a pair behind it.
+The reviewer renders the pairs and takes the measurements again rather than reading the implementer's screenshots, which show what the implementer chose to show. Walk the table against the pairs, then the pairs against the mockup for anything the table left out. Look at every pair, phone width included. Record the evidence in one top-level PR or MR comment of its own, posted before the verdict: the pairs rendered (view and width) and the measured values next to the table's. The verdict keeps the one-line format review-pr sets, and a review with no such comment at its head is not a conformance review. Nobody writes "matches the mockup" without such a pair behind it.
 
 - A missing table on a change built from a mockup is a finding.
 - A visible difference with no row, or a reason that doesn't hold, is a finding: P2 when a user would notice it (layout, hierarchy, density, wording, a selected or loading state that doesn't read, an interaction that fails), P3 when it is cosmetic (spacing, a shade).
