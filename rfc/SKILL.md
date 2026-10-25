@@ -13,7 +13,7 @@ You are the author. The AI reviewer that covers the repo reviews the RFC with th
 
 `/rfc <topic>` starts with the design-brainstorming skill, never with the spec: its intake, clarifying questions one at a time, 2-3 approaches with your recommendation, design sections the user approves, and the finalized spec in `.plans/`. Brainstorming then hands that spec back here, and the RFC goes on as `/rfc <path>` with it. A review settles the questions a spec lists, but it cannot raise a requirement that only the owner knows, so a spec written without them ships with gaps that nobody asks about. Brainstorm in the repo the design is for, reading its code at `origin/master`, fetched now.
 
-`/rfc <path>` publishes a spec that already exists — typically a `.plans/` doc from design-brainstorming — and skips brainstorming. Treat it as your draft and take it through the steps below, in the repo it designs for, which may not be the one its `.plans/` sits in. From then on the RFC doc is the spec; don't keep editing the old copy. The questions the user answered while it was written are theirs: record each as the owner's decision, with an ID from the same sequence as the open questions. The rest of it is your draft, for the review to challenge. Where the survey contradicts one of the owner's decisions, don't change it quietly: reopen it as an open question, with the evidence. The points the spec left open go through step 3 like any other.
+`/rfc <path>` publishes a spec that already exists — typically a `.plans/` doc from design-brainstorming — and skips brainstorming. Treat it as your draft and take it through the steps below, in the repo it designs for, which may not be the one its `.plans/` sits in. From then on the RFC doc is the spec; don't keep editing the old copy. The questions the user answered while it was written are theirs: record each as the owner's decision, with an ID from the same sequence as the open questions. The rest of it is your draft, for the review to challenge. Where the survey contradicts one of the owner's decisions, don't change it quietly: put it to the user in the plan (step 4), with the evidence. The points the spec left open go through step 3 like any other.
 
 ## 2. Survey
 
@@ -34,7 +34,18 @@ A choice the evidence settles is not a question. Make it in the design and give 
 
 Number them `Q1`, `Q2`… across all of the RFC's docs, and never renumber. Threads, decisions and the PR description refer to a question by its ID, so renumbering points every one of those references at the wrong question.
 
-## 4. Write the docs
+## 4. Show the plan
+
+The user last saw the spec before the survey, so they haven't seen what it changed or how the RFC will be laid out. Before writing a doc, give them a short plan in chat and wait for their go:
+
+- the docs, one per implementation PR (step 5), each with a line on what it delivers;
+- the owner's decisions by ID, and any the survey contradicts, with the evidence;
+- the open questions by ID, each with your recommendation;
+- what the survey found on the way.
+
+Keep it to a screen: the spec they approved holds the detail. A change they ask for goes into the plan, and you show it again. A contradicted decision or an open question they settle here is theirs: record it as the owner's decision. A contradicted decision they leave open is reopened as an open question, with the evidence. Write nothing until they say go.
+
+## 5. Write the docs
 
 Put them where the repo's design docs already live — where its newest ones are, if they're spread out — and follow that directory's file naming. With no such directory, use `docs/rfcs/YYYY-MM-DD-<topic>.md`, dated the day you open the PR. Write one doc per implementation PR, so a design too big for one PR splits along its delivery. Write in the language the repo's rules set for docs.
 
@@ -90,7 +101,7 @@ The Status moves from `RFC: open questions under review` to `RFC: questions sett
 
 **Superseding.** When the design replaces an accepted RFC — one already merged — the same PR sets the old doc's Status to `Superseded by <new doc>`, or to `Partly superseded by <new doc> (§n)` when it replaces only some sections, and the new doc names the old one in Related. Two docs that each read as current leave a later reader building the wrong one.
 
-## 5. Open the PR
+## 6. Open the PR
 
 Commit the docs, plus whatever pointers the repo keeps to its designs (TODO, an index), and nothing else: an RFC changes no code. Open it as a non-draft PR. Review sweeps skip drafts, so a draft RFC never gets its questions settled.
 
@@ -121,7 +132,7 @@ Where the host has a description template of its own, fill that and carry these 
 - A question goes to the owner only when the author and the reviewers can't settle it between them, or when only the owner can make the call.
 ```
 
-## 6. See it through
+## 7. See it through
 
 Watch the PR with the babysit-pr skill, unless the rules for your machine hand a PR's follow-up to something else. Either way address-pr passes settle the questions with the reviewer; address-pr's step 2 says how, and when a question goes to the user. A watch ends once the reviewer approves the settled text. If it ends without any review, because no AI reviewer covers the repo, nothing will settle the questions: put them to the user in the final report, each with your recommendation. Without a watch nothing tells you that no review came, so say when you report the opened PR that its questions wait on a reviewer.
 
