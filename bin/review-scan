@@ -27,9 +27,7 @@ the verdict the run claims: an approval of ours at the head, or an open thread o
 
 `pause` persists across configuration and schedule changes: every tick skips work, including manual and dry-run ticks, and nudges queue rechecks without starting a tick. Reviews already in flight can finish and settle. `resume` keeps the schedule unchanged and leaves scanning to the next tick; use `tick` for an immediate scan. An unscheduled watch stays unscheduled.
 
-A watch never stops on its own. A tick sends a desktop notification when it can read none
-of the targets, when a review run fails to start, and when nothing is left to watch;
-`status` shows the same problem until it clears.
+A watch never stops on its own. A single tick that cannot read any target is logged but not alerted; the second consecutive unreadable tick sends a desktop notification. A review run failing to start or nothing being left to watch alerts immediately. `status` shows the same problem until it clears.
 
 Targets: GitHub `owner/repo`, `owner` (every repo of an org or user) or a PR URL;
 GitLab `gitlab:HOST/group[/subgroup]`, `gitlab:HOST/group/project!` (a single project:
@@ -64,6 +62,7 @@ import urllib.parse
 from pathlib import Path
 
 HOME = Path(os.environ.get("REVIEW_SCAN_HOME", "~/.local/state/review-open-prs")).expanduser()
+UNREAD_TICKS_BEFORE_ALERT = 2
 GH_PR = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
 GL_MR = re.compile(r"^https://([^/]+)/(.+?)/-/merge_requests/(\d+)/?$")
 SEARCH = """query($q: String!, $after: String) {
@@ -479,6 +478,7 @@ def tick(w, a, spawn):
         started += 1
         started_urls.append(url)
         accounting.append(f"{url}: started a run ({reason})")
+    all_unread = bool(failed) and len(failed) == len(cfg["targets"])
     if not a.dry_run:
         for t in finished:
             cfg["targets"].remove(t)
@@ -488,10 +488,17 @@ def tick(w, a, spawn):
     for line in accounting:
         w.log(line)
         print(line)
+    unread = w.prs.get("_unread", {})
+    if not a.dry_run:
+        if all_unread:
+            unread = {"ticks": unread.get("ticks", 0) + 1, "since": unread.get("since") or iso(now)}
+            w.prs["_unread"] = unread
+        else:
+            w.prs.pop("_unread", None)
     problem = None
     if not cfg["targets"]:
         problem = f"watch {w.name}: nothing left to watch; run `review-scan uninstall {w.name}`"
-    elif failed and len(failed) == len(cfg["targets"]):
+    elif all_unread and unread.get("ticks", 0) >= UNREAD_TICKS_BEFORE_ALERT:
         problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `review-scan status {w.name}`"
     elif not_started:
         problem = f"watch {w.name}: {len(not_started)} review run(s) failed to start; see `review-scan status {w.name}`"
@@ -505,11 +512,15 @@ def tick(w, a, spawn):
         w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
                           "waiting": waiting, "kept_urls": sorted(kept_urls)}
         alert = w.prs.setdefault("_alert", {})
-        if problem and alert.get("problem") != problem:
+        same_problem = problem and alert.get("problem") == problem
+        since = (alert.get("since") or iso(now)) if same_problem else iso(now)
+        if all_unread and problem:
+            since = unread["since"]
+        if problem and not same_problem:
             notify(problem)  # once per new problem, not on every tick
         alert.clear()
         if problem:
-            alert.update(problem=problem, since=alert.get("since") or iso(now))
+            alert.update(problem=problem, since=since)
         w.save()
     return 5 if failed or not_started else 0
 
