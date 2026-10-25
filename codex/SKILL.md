@@ -89,7 +89,9 @@ The brief then:
 - tells Codex to match their structure, wording and hierarchy while using the project's own styles and components;
 - says the brief's text wins where it and a mockup differ;
 - says the mockups are never committed;
-- asks for the side-by-side renders and the conformance table that [mockup conformance](../references/mockup-conformance.md) describes, the table in the PR description.
+- has an **Interactions** section: what each click, key and scroll does in the new interface (whole-row toggles, Enter in forms and dialogs, pinned elements, expandable long text), copied from the mockup's behaviour notes and the project's interface defaults, since none of it shows in a mockup's markup;
+- names the project components each mockup cell uses, and which ones need a compact variant to fit the mockup's density;
+- asks for the side-by-side renders, the measured rows and the interaction checks that [mockup conformance](../references/mockup-conformance.md) describes, the table in the PR description.
 
 A follow-up that adds UI work does the same before the resume.
 
