@@ -293,18 +293,136 @@ class Tick(Base):
         self.assertEqual(len(self.notified), 1)
 
     def test_every_target_unread_notifies_once(self):
-        def boom(spec):
-            raise rs.ScanError("401")
-        rs.list_target = boom
-        self.cli("tick", self.watch)
-        self.cli("tick", self.watch)
-        self.assertEqual(len(self.notified), 1)
-        _, out = self.cli("status", self.watch)
-        self.assertIn("PROBLEM", out)
+        first = rs.iso(rs.now_utc())
+        self.assertNotIn("_unread", rs.Watch(self.watch).load().prs)
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("net/http: TLS handshake timeout")):
+            for n in range(1, 4):
+                with self.subTest(tick=n):
+                    rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * (n - 1))
+                    code, out = self.cli("tick", self.watch)
+                    self.assertEqual(code, 5)
+                    self.assertIn("UNREAD (net/http: TLS handshake timeout)", out)
+                    self.assertEqual(self.prs()["_unread"], {"ticks": n, "since": first})
+                    self.assertEqual(len(self.notified), int(n >= 2))
+                    _, status = self.cli("status", self.watch)
+                    if n == 1:
+                        self.assertNotIn("PROBLEM", status)
+                        self.assertNotIn("could not read any target", out)
+                    else:
+                        self.assertIn(f"PROBLEM since {first}:", status)
+                        self.assertIn("could not read any target (acme/app)", out)
+        log = (rs.HOME / self.watch / "scan.log").read_text()
+        self.assertEqual(log.count("UNREAD (net/http: TLS handshake timeout)"), 3)
         rs.list_target = lambda spec: self.listing[spec]
         self.cli("tick", self.watch)
         _, out = self.cli("status", self.watch)
         self.assertNotIn("PROBLEM", out)
+        self.assertNotIn("_unread", self.prs())
+
+    def test_success_breaks_the_unread_streak(self):
+        for unread in (True, False, True):
+            with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout") if unread else None,
+                              return_value=[]):
+                code, _ = self.cli("tick", self.watch)
+            self.assertEqual(code, 5 if unread else 0)
+            if unread:
+                self.assertEqual(self.prs()["_unread"]["ticks"], 1)
+            else:
+                self.assertNotIn("_unread", self.prs())
+            self.assertEqual(self.notified, [])
+
+    def test_partial_read_breaks_the_unread_streak(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--target", "acme/lib", "--own", "review-bot")
+        for results in ((rs.ScanError("timeout"), rs.ScanError("timeout")),
+                        (rs.ScanError("timeout"), []),
+                        (rs.ScanError("timeout"), rs.ScanError("timeout"))):
+            with patch.object(rs, "list_target", side_effect=results):
+                code, out = self.cli("tick", self.watch)
+            self.assertEqual(code, 5)
+            self.assertIn("UNREAD", out)
+            if isinstance(results[1], list):
+                self.assertNotIn("_unread", self.prs())
+            else:
+                self.assertEqual(self.prs()["_unread"]["ticks"], 1)
+            self.assertEqual(self.notified, [])
+
+    def test_dry_run_neither_extends_nor_resets_the_unread_streak(self):
+        first = rs.iso(rs.now_utc())
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
+            self.assertEqual(self.cli("tick", self.watch)[0], 5)
+        before = self.prs()
+        for unread in (True, False):
+            rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2)
+            with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout") if unread else None,
+                              return_value=[]):
+                self.assertEqual(self.cli("tick", self.watch, "--dry-run")[0], 5 if unread else 0)
+            self.assertEqual(self.prs(), before)
+            self.assertEqual(self.notified, [])
+        rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=4)
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
+            self.assertEqual(self.cli("tick", self.watch)[0], 5)
+        self.assertEqual(self.prs()["_unread"], {"ticks": 2, "since": first})
+        self.assertEqual(self.prs()["_alert"]["since"], first)
+        self.assertEqual(len(self.notified), 1)
+
+    def test_pause_leaves_the_unread_streak_alone(self):
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
+            self.cli("tick", self.watch)
+            self.cli("pause", self.watch)
+            before = self.prs()
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+            self.assertEqual(self.prs(), before)
+            self.assertEqual(self.notified, [])
+            self.cli("resume", self.watch)
+            self.cli("tick", self.watch)
+        self.assertEqual(self.prs()["_unread"]["ticks"], 2)
+        self.assertEqual(len(self.notified), 1)
+
+    def test_failed_start_problem_keeps_since_until_the_problem_changes(self):
+        first = rs.iso(rs.now_utc())
+        with patch.object(self, "spawn", side_effect=FileNotFoundError("claude")):
+            for n in range(2):
+                rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
+                self.assertEqual(self.cli("tick", self.watch)[0], 5)
+                _, status = self.cli("status", self.watch)
+                self.assertIn(f"PROBLEM since {first}:", status)
+                self.assertIn("2 review run(s) failed to start", status)
+                self.assertEqual(len(self.notified), 1)
+            changed = "2026-10-23T12:04:00Z"
+            rs.now_utc = lambda: rs.parse_time(changed)
+            self.listing["acme/app"] = [row(PR1)]
+            self.cli("tick", self.watch)
+            _, status = self.cli("status", self.watch)
+            self.assertIn(f"PROBLEM since {changed}:", status)
+            self.assertIn("1 review run(s) failed to start", status)
+            self.assertEqual(len(self.notified), 2)
+
+    def test_empty_watch_alerts_immediately_and_resets_the_unread_streak(self):
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
+            self.cli("tick", self.watch)
+        with rs.Watch(self.watch).locked() as w:
+            w.config["targets"] = []
+            rs.write_json(w.dir / "config.json", w.config)
+        first = rs.iso(rs.now_utc())
+        for n in range(2):
+            rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+            self.assertNotIn("_unread", self.prs())
+            _, status = self.cli("status", self.watch)
+            self.assertIn(f"PROBLEM since {first}:", status)
+            self.assertIn("nothing left to watch", status)
+            self.assertEqual(len(self.notified), 1)
+
+    def test_closed_named_target_counts_as_a_read_before_it_leaves(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--target", PR2, "--own", "review-bot")
+        with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
+            self.cli("tick", self.watch)
+        with patch.object(rs, "list_target", side_effect=[rs.ScanError("timeout"),
+                                                         [row(PR2, state="closed", named=True)]]):
+            self.assertEqual(self.cli("tick", self.watch)[0], 5)
+        self.assertEqual([t["spec"] for t in rs.Watch(self.watch).load().config["targets"]], ["acme/app"])
+        self.assertNotIn("_unread", self.prs())
+        self.assertEqual(self.notified, [])
 
     def test_brief_carries_the_settle_command_and_the_reviewed_head(self):
         self.cli("tick", self.watch)
