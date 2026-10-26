@@ -1061,29 +1061,24 @@ class CodexRunner(Base):
     def config(self):
         return rs.Watch(self.watch).load().config
 
-    def switch(self, runner="codex", model="gpt-6-astra"):
-        return self.cli("model", self.watch, model, "--runner", runner, "--effort", "high")
+    def switch(self, model="gpt-6-astra"):
+        return self.cli("model", self.watch, model, "--effort", "high")
 
-    def test_init_requires_model_and_preserves_runner_and_history(self):
+    def test_init_infers_runner_and_preserves_model_and_history(self):
         args = ("init", self.watch, "--target", "acme/app", "--own", "review-bot")
-        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
-            self.cli(*args, "--runner", "codex")
-        self.assertEqual(self.config()["reviewer_model"], "sonnet")
-        _, out = self.cli(*args, "--runner", "codex", "--reviewer-model", "gpt-6-astra")
+        _, out = self.cli(*args, "--reviewer-model", "gpt-6-astra")
         self.assertIn("reviewer codex gpt-6-astra", out)
         history = self.config()["former_agents"]
         self.cli(*args, "--reviewer-model", "gpt-6-astra")
         self.assertEqual(self.config()["runner"], "codex")
         self.assertEqual(self.config()["former_agents"], history)
-        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
-            self.cli(*args)
+        self.cli(*args)
+        self.assertEqual(self.config()["reviewer_model"], "gpt-6-astra")
+        self.assertEqual(self.config()["former_agents"], history)
 
     def test_new_codex_watch_has_no_former_agent(self):
         name = self.watch + "-new"
-        args = ("init", name, "--target", "acme/app", "--own", "review-bot", "--runner", "codex")
-        with self.assertRaisesRegex(SystemExit, "--reviewer-model"):
-            self.cli(*args)
-        self.assertFalse((rs.HOME / name / "config.json").exists())
+        args = ("init", name, "--target", "acme/app", "--own", "review-bot")
         self.cli(*args, "--reviewer-model", "gpt-6-astra")
         cfg = rs.Watch(name).load().config
         self.assertEqual(cfg["runner"], "codex")
@@ -1096,7 +1091,61 @@ class CodexRunner(Base):
         _, out = self.cli("status", self.watch)
         self.assertIn("reviewer claude sonnet", out)
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
-        self.assertEqual((self.config()["runner"], self.config()["reviewer_model"]), ("claude", "opus"))
+        self.assertEqual((self.config()["runner"], self.config()["reviewer_model"]), ("claude", "sonnet"))
+
+    def test_model_names_select_the_runner(self):
+        cases = [("gpt-6-astra", "codex"), ("gpt-5.3-codex", "codex"),
+                 ("codex-mini-latest", "codex"), ("o3", "codex"), ("o4-mini", "codex"),
+                 ("opus", "claude"), ("sonnet", "claude"), ("haiku", "claude"),
+                 ("sonnet[1m]", "claude"), ("claude-sonnet-4-6", "claude")]
+        for model, runner in cases:
+            with self.subTest(model=model):
+                _, out = self.switch(model)
+                self.assertIn(f"reviewer {runner} {model}", out)
+                self.assertEqual(self.config()["runner"], runner)
+
+    def test_unknown_models_are_rejected_before_saving(self):
+        before = (rs.HOME / self.watch / "config.json").read_bytes()
+        for model in ("unknown-model", "", "gpt", "oyster", "sonnett"):
+            with self.subTest(model=model), self.assertRaisesRegex(SystemExit, "cannot infer.*runner"):
+                self.switch(model)
+            self.assertEqual((rs.HOME / self.watch / "config.json").read_bytes(), before)
+        name = self.watch + "-new"
+        with self.assertRaisesRegex(SystemExit, "cannot infer.*runner"):
+            self.cli("init", name, "--target", "acme/app", "--own", "review-bot",
+                     "--reviewer-model", "unknown-model")
+        self.assertFalse((rs.HOME / name).exists())
+
+    def test_model_change_can_repair_an_unsupported_saved_model(self):
+        w = rs.Watch(self.watch).load()
+        w.config["reviewer_model"] = "old-custom-alias"
+        rs.write_json(w.dir / "config.json", w.config)
+        self.switch()
+        self.assertEqual(self.config()["reviewer_model"], "gpt-6-astra")
+        self.assertEqual(self.config()["runner"], "codex")
+
+    def test_stale_or_missing_runner_metadata_is_reconciled_once(self):
+        for saved_runner in (None, "claude"):
+            with self.subTest(saved_runner=saved_runner):
+                w = rs.Watch(self.watch).load()
+                w.config["reviewer_model"] = "gpt-6-astra"
+                w.config.pop("former_agents", None)
+                w.config.pop("runner", None)
+                if saved_runner:
+                    w.config["runner"] = saved_runner
+                rs.write_json(w.dir / "config.json", w.config)
+                before = (w.dir / "config.json").read_bytes()
+                _, out = self.cli("status", self.watch)
+                self.assertIn("reviewer codex gpt-6-astra", out)
+                self.assertEqual((w.dir / "config.json").read_bytes(), before)
+                self.cli("tick", self.watch)
+                history = self.config()["former_agents"]
+                self.assertEqual(history, [{"agent": "Claude", "since": w.config["created"],
+                                            "until": "2026-10-23T12:00:00Z"}])
+                self.assertEqual(self.config()["runner"], "codex")
+                self.assertIn("Codex's workspace-write sandbox", self.spawned[-1][1])
+                self.cli("model", self.watch, "--effort", "high")
+                self.assertEqual(self.config()["former_agents"], history)
 
     def test_switch_records_history_only_on_change_and_brief_adopts_it(self):
         created = self.config()["created"]
@@ -1113,7 +1162,7 @@ class CodexRunner(Base):
             self.assertIn(text, brief)
         self.assertIn("review-scan settle", brief)
         with patch.object(rs, "now_utc", return_value=rs.parse_time(second)):
-            self.switch("claude", "opus")
+            self.switch("opus")
         self.assertEqual(self.config()["former_agents"], [
             {"agent": "Claude", "since": created, "until": first},
             {"agent": "Codex", "since": first, "until": second},
@@ -1146,10 +1195,14 @@ class CodexRunner(Base):
         self.assertIn("fetch into a shared clone", brief)
         self.assertIn("rerun that fetch with escalated permissions", brief)
 
-    def test_runner_option_requires_model_even_when_unchanged(self):
-        for runner in ("claude", "codex"):
-            with self.assertRaisesRegex(SystemExit, "model"):
-                self.cli("model", self.watch, "--runner", runner)
+    def test_runner_option_is_removed(self):
+        commands = [("model", self.watch, "gpt-6-astra"),
+                    ("init", self.watch, "--target", "acme/app", "--own", "review-bot")]
+        for command in commands:
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as error:
+                self.cli(*command, "--runner", "codex")
+            self.assertEqual(error.exception.code, 2)
         self.assertEqual(self.config()["reviewer_model"], "sonnet")
 
     def test_account_cannot_set_codex_login_or_create_directory(self):
@@ -1175,6 +1228,7 @@ class CodexRunner(Base):
     def test_codex_command_environment_and_artifacts(self):
         self.switch()
         w = rs.Watch(self.watch).load()
+        w.config["runner"] = "claude"
         w.config["claude_config"] = "/unused-account"
         self.addCleanup((w.runs / f"{w.slug(PR1)}.pid").unlink, missing_ok=True)
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/inherited-account"}), \
@@ -1267,6 +1321,7 @@ class RunHistory(Base):
             with self.subTest(runner=runner):
                 url = PR1 if runner == "claude" else PR2
                 self.w.config["runner"] = runner
+                self.w.config["reviewer_model"] = "sonnet" if runner == "claude" else "gpt-6-astra"
                 first = rs.spawn_run(self.w, url, "first brief")
                 second = rs.spawn_run(self.w, url, "second brief")
                 prefix = f"runs/{self.w.slug(url)}/20261023T120000Z"
@@ -1300,6 +1355,7 @@ class RunHistory(Base):
     def test_repeated_preflight_failures_leave_no_run_files(self):
         for runner in ("claude", "codex"):
             self.w.config["runner"] = runner
+            self.w.config["reviewer_model"] = "sonnet" if runner == "claude" else "gpt-6-astra"
             for failure in ("missing", "logged-out"):
                 with self.subTest(runner=runner, failure=failure), \
                      patch.object(rs.shutil, "which", return_value=None if failure == "missing" else f"/bin/{runner}"), \
@@ -1314,6 +1370,7 @@ class RunHistory(Base):
         for runner in ("claude", "codex"):
             with self.subTest(runner=runner):
                 self.w.config["runner"] = runner
+                self.w.config["reviewer_model"] = "sonnet" if runner == "claude" else "gpt-6-astra"
                 url = PR1 if runner == "claude" else PR2
                 rs.spawn_run(self.w, url, "preserved brief")
                 before = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
@@ -1327,6 +1384,7 @@ class RunHistory(Base):
 
     def test_spawning_keeps_ten_runs_and_preserves_legacy_files(self):
         self.w.config["runner"] = "codex"
+        self.w.config["reviewer_model"] = "gpt-6-astra"
         legacy = [self.w.runs / f"{self.w.slug(PR1)}.{ext}" for ext in ("brief.md", "jsonl", "last.md")]
         for path in legacy:
             path.write_text("legacy")
