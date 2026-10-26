@@ -62,6 +62,8 @@ The host app must be running and the machine awake. Native watches persist throu
 
 Use this transport when `WatchPullRequest` is unavailable and the runtime can run a background command that resumes the session when it exits (Claude Code's `run_in_background`), for a GitHub PR or a GitLab MR, with Auto-fix on or off. It reads the PR without a model and wakes the session only for something a round acts on: readiness, findings, a conflict, a CI failure, a new head. Where Auto-fix is on, it also wakes the session with a `<ci-monitor-event>` for a CI failure, a merge conflict or review comments, and each such event runs one address-pr pass as a round. Green CI and an approval produce no event, which is the gap the waiter fills there. Keep `transport: waiter` in the state file.
 
+Choose `--after` only from an activity mark printed by a previous waiter exit or the time of your own PR read, never a typed future time. A later mark hides activity you have not read. The waiter rejects a mark more than 60 seconds ahead of startup UTC before reading the PR; the allowance covers small clock differences.
+
 The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed by this repo's `bin/setup`. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff: 1 minute, 1 minute, then every 2 minutes, and exits with a one-line reason:
 
 | Exit | Reason | Next |
