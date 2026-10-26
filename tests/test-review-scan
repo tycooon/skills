@@ -890,21 +890,50 @@ class List(Base):
         self.assertIn(f"{self.watch}: reviewer claude sonnet, not scheduled, 0 run(s) in flight", out)
         self.assertIn("  acme/app", out)
         self.assertEqual(out, bare)
+        self.assertNotIn("logs root:", out)
 
 
 class Status(Base):
-    def test_status_prints_absolute_recorded_or_legacy_log_paths(self):
+    def test_status_durations_show_total_minutes_and_seconds(self):
+        started = rs.now_utc()
+        stamp = rs.iso(started)
+        self.cli("tick", self.watch, "--only", PR1)
+        cases = ((0, "0m 0s"), (0.9, "0m 0s"), (59, "0m 59s"), (59.9, "0m 59s"),
+                 (60, "1m 0s"), (65, "1m 5s"), (65.9, "1m 5s"), (127, "2m 7s"),
+                 (7265, "121m 5s"), (7265.9, "121m 5s"))
+        for seconds, duration in cases:
+            with self.subTest(seconds=seconds), \
+                 patch.object(rs, "now_utc", return_value=started + rs.dt.timedelta(seconds=seconds)), \
+                 patch.object(rs.Watch, "running", return_value=True), \
+                 patch.object(rs, "is_scheduled", return_value=False):
+                code, out = self.cli("status", self.watch)
+                self.assertEqual(code, 0)
+                self.assertIn(f"last tick {stamp} ({duration} ago):", out)
+                self.assertIn(f"  started {PR1}: running for {duration}\n", out)
+                self.assertIn(f"running (1):\n  {PR1}: started {stamp} ({duration} ago) for ", out)
+
+    def test_status_prints_log_paths_relative_to_one_logs_root(self):
         watch_dir = (rs.HOME / self.watch).resolve()
-        log = "runs/github-com-acme-app-pull-1/20261023T120000Z.jsonl"
-        for recorded in (None, log, str(watch_dir / "external.jsonl")):
+        logs_root = watch_dir / "runs"
+        log = "github-com-acme-app-pull-1/20261023T120000Z.jsonl"
+        cases = ((None, "github-com-acme-app-pull-1.jsonl"), (f"runs/{log}", log),
+                 (str(logs_root / log), log), (str(watch_dir / "external.jsonl"), "../external.jsonl"))
+        for recorded, expected in cases:
             for running in (False, True):
                 with self.subTest(recorded=recorded, running=running):
                     self.cli("tick", self.watch, "--only", PR1, spawn=lambda *_: recorded)
+                    before = self.prs()
                     with patch.object(rs.Watch, "running", return_value=running), \
                          patch.object(rs, "is_scheduled", return_value=False):
-                        _, out = self.cli("status", self.watch)
-                    expected = recorded or "runs/github-com-acme-app-pull-1.jsonl"
-                    self.assertIn(f"log {watch_dir / expected}", out)
+                        code, out = self.cli("status", self.watch)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(out.count("logs root:"), 1)
+                    self.assertIn(f"  target acme/app\nlogs root: {logs_root}\n", out)
+                    section = "running" if running else "ended without settling"
+                    row = out.split(f"{section} (1):\n", 1)[1].splitlines()[0]
+                    self.assertTrue(row.startswith(f"  {PR1}: "), row)
+                    self.assertTrue(row.endswith(f"; log {expected}"), row)
+                    self.assertEqual(self.prs(), before)
 
     def test_status_separates_running_waiting_ended_and_settled(self):
         self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]

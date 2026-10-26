@@ -1014,8 +1014,9 @@ def run_fate(w, url, rec):
 
 
 def ago(t, now):
-    mins = int((now - parse_time(t)).total_seconds() // 60)
-    return f"{mins}m ago" if mins < 120 else f"{mins // 60}h ago"
+    seconds = int((now - parse_time(t)).total_seconds() // 1)
+    mins, secs = divmod(seconds, 60)
+    return f"{mins}m {secs}s ago"
 
 
 def cmd_status(a, limit=15):
@@ -1030,6 +1031,8 @@ def cmd_status(a, limit=15):
     for t in cfg["targets"]:
         print(f"  target {t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "")
               + (f" (posts with ${t['token']})" if t.get("token") else ""))
+    logs_root = w.runs.resolve()
+    print(f"logs root: {logs_root}")
     if w.prs.get("_alert", {}).get("problem"):
         print(f"PROBLEM since {w.prs['_alert']['since']}: {w.prs['_alert']['problem']}")
     prs = {u: r for u, r in w.prs.items() if not u.startswith("_")}
@@ -1055,6 +1058,7 @@ def cmd_status(a, limit=15):
     for url, rec in sorted(prs.items()):
         run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
         log = (w.dir / run.get("log", f"runs/{w.slug(url)}.jsonl")).resolve()
+        log = os.path.relpath(log, logs_root)
         if fate == "running":
             running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
                            f"log {log}")
