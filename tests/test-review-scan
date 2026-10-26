@@ -861,9 +861,10 @@ class List(Base):
 
 
 class Status(Base):
-    def test_status_prints_recorded_log_or_legacy_path(self):
+    def test_status_prints_absolute_recorded_or_legacy_log_paths(self):
+        watch_dir = (rs.HOME / self.watch).resolve()
         log = "runs/github-com-acme-app-pull-1/20261023T120000Z.jsonl"
-        for recorded in (None, log):
+        for recorded in (None, log, str(watch_dir / "external.jsonl")):
             for running in (False, True):
                 with self.subTest(recorded=recorded, running=running):
                     self.cli("tick", self.watch, "--only", PR1, spawn=lambda *_: recorded)
@@ -871,7 +872,7 @@ class Status(Base):
                          patch.object(rs, "is_scheduled", return_value=False):
                         _, out = self.cli("status", self.watch)
                     expected = recorded or "runs/github-com-acme-app-pull-1.jsonl"
-                    self.assertIn(f"log {expected}", out)
+                    self.assertIn(f"log {watch_dir / expected}", out)
 
     def test_status_separates_running_waiting_ended_and_settled(self):
         self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]

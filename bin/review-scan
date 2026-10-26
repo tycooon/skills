@@ -1056,7 +1056,7 @@ def cmd_status(a, limit=15):
     running, ended, settled = [], [], []
     for url, rec in sorted(prs.items()):
         run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
-        log = run.get("log", f"runs/{w.slug(url)}.jsonl")
+        log = (w.dir / run.get("log", f"runs/{w.slug(url)}.jsonl")).resolve()
         if fate == "running":
             running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
                            f"log {log}")
