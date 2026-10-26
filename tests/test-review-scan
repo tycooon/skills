@@ -893,6 +893,24 @@ class List(Base):
 
 
 class Status(Base):
+    def test_status_durations_show_total_minutes_and_seconds(self):
+        started = rs.now_utc()
+        stamp = rs.iso(started)
+        self.cli("tick", self.watch, "--only", PR1)
+        cases = ((0, "0m 0s"), (0.9, "0m 0s"), (59, "0m 59s"), (59.9, "0m 59s"),
+                 (60, "1m 0s"), (65, "1m 5s"), (65.9, "1m 5s"), (127, "2m 7s"),
+                 (7265, "121m 5s"), (7265.9, "121m 5s"))
+        for seconds, duration in cases:
+            with self.subTest(seconds=seconds), \
+                 patch.object(rs, "now_utc", return_value=started + rs.dt.timedelta(seconds=seconds)), \
+                 patch.object(rs.Watch, "running", return_value=True), \
+                 patch.object(rs, "is_scheduled", return_value=False):
+                code, out = self.cli("status", self.watch)
+                self.assertEqual(code, 0)
+                self.assertIn(f"last tick {stamp} ({duration} ago):", out)
+                self.assertIn(f"  started {PR1}: running for {duration}\n", out)
+                self.assertIn(f"running (1):\n  {PR1}: started {stamp} ({duration} ago) for ", out)
+
     def test_status_prints_absolute_recorded_or_legacy_log_paths(self):
         watch_dir = (rs.HOME / self.watch).resolve()
         log = "runs/github-com-acme-app-pull-1/20261023T120000Z.jsonl"

@@ -1014,8 +1014,9 @@ def run_fate(w, url, rec):
 
 
 def ago(t, now):
-    mins = int((now - parse_time(t)).total_seconds() // 60)
-    return f"{mins}m ago" if mins < 120 else f"{mins // 60}h ago"
+    seconds = int((now - parse_time(t)).total_seconds() // 1)
+    mins, secs = divmod(seconds, 60)
+    return f"{mins}m {secs}s ago"
 
 
 def cmd_status(a, limit=15):
