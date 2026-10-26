@@ -281,18 +281,14 @@ class Watch:
         self.runs = self.dir / "runs"
 
     @contextlib.contextmanager
-    def locked(self, reconcile_runner=True):
+    def locked(self):
         """Hold the watch's lock while reading, changing and saving its state: tick, settle
         and nudge all modify prs.json, and two ticks must not both start a run for one PR."""
         if not (self.dir / "config.json").exists():
             raise SystemExit(f"no watch {self.name!r}; create it with `review-scan init`")
         with open(self.dir / ".lock", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
-            self.load()
-            if reconcile_runner and self.config.get("runner") != self.runner:
-                set_runner(self.config, self.runner)
-                write_json(self.dir / "config.json", self.config)
-            yield self
+            yield self.load()
 
     def load(self):
         try:
@@ -424,6 +420,9 @@ def cmd_tick(a, spawn=None):
         if getattr(a, "chained", False) and not is_scheduled(w.name):
             w.log("chained tick skipped: the watch is not installed")
             return 0
+        if w.config.get("runner") != w.runner:
+            set_runner(w.config, w.runner)
+            write_json(w.dir / "config.json", w.config)
         return tick(w, a, spawn or spawn_run)
 
 
@@ -992,9 +991,8 @@ def cmd_model(a):
         cfg = w.load().config
         print(f"watch {a.watch}: reviewer {w.runner} {cfg['reviewer_model']} at {cfg['effort']} effort")
         return 0
-    with w.locked(reconcile_runner=runner is None) as w:
-        if runner is not None:
-            set_runner(w.config, runner)
+    with w.locked() as w:
+        set_runner(w.config, runner if runner is not None else w.runner)
         if a.model:
             w.config["reviewer_model"] = a.model
         if a.effort:

@@ -86,6 +86,18 @@ class Base(unittest.TestCase):
 
 
 class Pause(Base):
+    def test_unsupported_saved_model_can_be_paused_and_skips_ticks(self):
+        w = rs.Watch(self.watch).load()
+        self.addCleanup(rs.write_json, w.dir / "config.json", dict(w.config))
+        w.config["reviewer_model"] = "old-custom-alias"
+        rs.write_json(w.dir / "config.json", w.config)
+        self.assertEqual(self.cli("pause", self.watch)[0], 0)
+        with patch.object(rs, "list_target", side_effect=AssertionError("read while paused")):
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.cli("resume", self.watch)[0], 0)
+        self.assertFalse(rs.Watch(self.watch).load().paused)
+
     def test_paused_ticks_skip_reads_cleanup_and_launches(self):
         with rs.Watch(self.watch).locked() as w:
             w.prs.update(_paused=True, _tick={"kept_urls": [PR1]})
@@ -664,6 +676,26 @@ class PausedNudge(Base):
         home.start()
         self.addCleanup(home.stop)
         super().setUp()
+
+    def test_unsupported_models_do_not_block_other_watches(self):
+        cases = [("a-unrelated", "other/repo", False), ("b-paused", "acme/app", True),
+                 ("c-active", "acme/app", False)]
+        for name, target, paused in cases:
+            self.cli("init", name, "--target", target, "--own", "review-bot")
+            if paused:
+                self.cli("pause", name)
+            w = rs.Watch(name).load()
+            w.config["reviewer_model"] = "old-custom-alias"
+            rs.write_json(w.dir / "config.json", w.config)
+        started = []
+        with patch.object(rs.subprocess, "Popen", side_effect=lambda cmd, **kw: started.append(cmd[1:])):
+            self.assertEqual(self.cli("nudge", PR1, "--head", B)[0], 0)
+        self.assertEqual(started, [["tick", "c-active", "--only", PR1],
+                                   ["tick", self.watch, "--only", PR1]])
+        for name in ("b-paused", "c-active", self.watch):
+            self.assertEqual(rs.Watch(name).load().prs[PR1]["recheck"],
+                             [f"nudge after a push of {B[:12]}"])
+        self.assertNotIn(PR1, rs.Watch("a-unrelated").load().prs)
 
     def test_paused_nudge_queues_then_resume_processes_the_recheck(self):
         self.cli("tick", self.watch)
