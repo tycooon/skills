@@ -7,11 +7,14 @@
 Run it as one background shell command: the agent's session resumes when it
 exits. It only detects readiness and never changes the PR. Ready means all four
 of babysit-pr's conditions hold on the same head: the external AI reviewer's
-newest verdict approves the head (or a head it differs from only by a
-base-sync, read against the base the PR had when the verdict was posted), every check on the head is green and no
+newest verdict approves the head (or covers it by a base-sync, read against the
+base the PR had when the verdict was posted, or by answered or resolved
+non-blocking findings with at most CARRY_LINE_CAP changed lines since approval),
+every check on the head is green and no
 Actions run for it is still queued or running (a rerun shortens the rollup to what already finished)
 or ended unsuccessfully in its workflow's newest attempt (GitHub drops a cancelled run's checks from the
-rollup), the head's oldest run is RUN_SETTLE old (to cover a run Actions creates late), no review thread is unresolved,
+rollup), the head's oldest run is RUN_SETTLE old (to cover a run Actions creates late),
+no review thread blocks (answered non-blocking findings no longer do),
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
 
 Exit codes:
@@ -38,13 +41,13 @@ Exit codes:
 
 GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab and
 the same four conditions: an approval (a formal one, or a verdict note), every
-resolvable discussion resolved, the head pipeline green (one on the head sha, or a
+resolvable discussion resolved except answered non-blocking findings, the head pipeline green (one on the head sha, or a
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
 a conflict nor need_rebase. Formal approval system notes inherit the signature
 and SHA of the nearest unpaired same-account verdict note; an unpaired system
 approval remains unsigned. A discussion whose first note says "non-blocking"
-counts as a finding of the verdict its reviewer posted with or after it, while the
-note is still anchored at that verdict's commit.
+counts as a finding of the verdict its reviewer posted with or after it, even if
+GitLab has re-anchored the note to a later commit.
 
 Options:
   --head SHA        the head to watch, e.g. the commit just pushed. Without it,
@@ -264,7 +267,7 @@ def changed_spans(patch):
 
 def changed_hunks(owner, name, old, new):
     """Each changed file's runs of changed lines between two commits, on old's
-    side: {path: [(first, last)]}. None when the compare fails or a file has no
+    side: {path: [(first, last, added)]}. None when the compare fails or a file has no
     patch to read (binary, or too large for the API), since then nothing proves
     the change is small."""
     r = gh(["api", f"repos/{owner}/{name}/compare/{old}...{new}", "--jq", "[.files[] | {filename, patch}]"])
@@ -520,7 +523,7 @@ def gl_mr_to_pr(mr, discussions, commit):
         resolvable = [n for n in human if n.get("resolvable")]
         if resolvable:
             first, last = human[0], human[-1]
-            path, line_first, line_last, side, anchored_at = gl_position(first)
+            path, line_first, line_last, side, _ = gl_position(first)
             threads.append({
                 "isResolved": all(n.get("resolved") for n in resolvable),
                 "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
@@ -528,7 +531,7 @@ def gl_mr_to_pr(mr, discussions, commit):
                     "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
                 "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author")),
                     "createdAt": last["created_at"], "url": f"{mr['web_url']}#note_{last['id']}" if mr.get("web_url") else None}]},
-                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"], "_anchor": anchored_at,
+                "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"],
             })
             # A reply lands inside its thread and moves no other count; review_count reads this.
             replies += len(human) - 1
@@ -547,10 +550,8 @@ def gl_mr_to_pr(mr, discussions, commit):
         if opener["state"] == "APPROVED":
             owner = next((r for r in verdict_notes if (r["author"] or {}).get("login") == t["_opened"]
                           and ts(r["submittedAt"]) >= ts(t["_at"])), None)
-            # Its lines match the verdict's hunks only while GitLab still anchors the note at the
-            # verdict's commit; once re-anchored to a later head, the carry is skipped: a stall.
-            opener["id"] = owner["id"] if owner and t["_anchor"] == owner["commit"]["oid"] else None
-        del t["_opened"], t["_at"], t["_anchor"]
+            opener["id"] = owner["id"] if owner else None
+        del t["_opened"], t["_at"]
     merge = "conflict" if mr.get("has_conflicts") else mr.get("detailed_merge_status")
     pipeline = head_pipeline(mr)
     contexts = []
@@ -908,57 +909,39 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, hunks_bet
     return True
 
 
-# How far a fix may reach past the lines its finding names and still answer it.
-FINDING_SLACK = 5
+# Limit how much new work an answered nit can carry past review.
+CARRY_LINE_CAP = 30
 
 
-def finding_ranges(pr, sha, reviewers):
-    """The lines a listed or identity-line reviewer's formal approval of `sha` left
-    findings on, as {path: [(first, last)]} on sha's side of the diff."""
+def finding_threads(pr, sha, reviewers):
+    """Threads left by a qualifying formal approval of `sha`, including removed lines."""
     ids = {
         r["id"] for r in pr["reviews"]["nodes"]
         if r.get("id") and r["state"] == "APPROVED" and (r.get("commit") or {}).get("oid") == sha
         and counts_as_verdict(r["author"], r["body"] or "", reviewers)
     }
-    ranges = {}
-    for t in pr["reviewThreads"]["nodes"]:
-        if (thread_opener(t).get("pullRequestReview") or {}).get("id") not in ids or not t.get("path"):
-            continue
-        # A finding on a removed line is numbered in the base's file, not the approved head's.
-        if t.get("diffSide") == "LEFT":
-            continue
-        last = t.get("originalLine") or t.get("line")
-        if not last:
-            continue
-        first = t.get("originalStartLine") or t.get("startLine") or last
-        ranges.setdefault(t["path"], []).append((first - FINDING_SLACK, last + FINDING_SLACK))
-    return ranges
+    return [t for t in pr["reviewThreads"]["nodes"]
+            if (thread_opener(t).get("pullRequestReview") or {}).get("id") in ids]
 
 
-def answers_findings(hunks, ranges):
-    """Whether every run of changed lines sits inside one of the findings' line ranges,
-    adding no more lines than that range holds: a large insertion beside a nit is new
-    code, not its fix."""
-    return bool(hunks) and all(
-        any(lo <= first and last <= hi and added <= hi - lo + 1 for lo, hi in ranges.get(path, []))
-        for path, spans in hunks.items() for first, last, added in spans
-    )
+def changed_line_count(hunks):
+    """Total changed lines, counting replacements once; None for unknown or empty hunks."""
+    if not hunks or any(not spans for spans in hunks.values()):
+        return None
+    return sum(max(last - first + 1, added) for spans in hunks.values() for first, last, added in spans)
 
 
 def carries(pr, sha, head, at, reviewers, same_authored_lines, hunks_between=None):
-    """How an approval of `sha` posted at `at` still covers `head`, as the end of a reason
-    line, or None: `head` is a base-sync of `sha`, or the commits after it change only the
-    lines of the non-blocking findings that approval left. review-scan's settle applies
-    the same test to an earlier head a review run says still covers the current one."""
+    """How an approval of `sha` posted at `at` still covers `head`, or None: a base-sync,
+    or at least one finding, all answered or resolved, with at most CARRY_LINE_CAP changed lines.
+    review-scan's settle imports this test so both gates agree."""
     if same_authored_lines(sha, head, at):
         return f", a base-sync of {head[:12]}"
-    # An approval with non-blocking findings carries to the author's fix: commits
-    # after it whose every changed line sits within those findings' lines.
-    ranges = finding_ranges(pr, sha, reviewers) if hunks_between else {}
-    if ranges:
-        hunks = hunks_between(sha, head)
-        if hunks is not None and answers_findings(hunks, ranges):
-            return "; later commits change only its findings' lines"
+    findings = finding_threads(pr, sha, reviewers) if hunks_between else []
+    if findings and all(t["isResolved"] or answered(t) for t in findings):
+        changed = changed_line_count(hunks_between(sha, head))
+        if changed is not None and changed <= CARRY_LINE_CAP:
+            return f"; all findings answered or resolved, {changed}/{CARRY_LINE_CAP} later changed lines"
     return None
 
 
