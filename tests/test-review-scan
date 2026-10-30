@@ -458,7 +458,8 @@ def full_pr(threads=()):
                                    "submittedAt": "2026-10-23T09:00:00Z", "commit": {"oid": A}}]},
             "comments": {"nodes": []},
             "reviewThreads": {"nodes": [{"isResolved": False, "path": path, "line": line, "originalLine": line,
-                                         "diffSide": "RIGHT", "comments": {"nodes": [finding]}}
+                                         "diffSide": "RIGHT", "comments": {"nodes": [finding]},
+                                         "replies": {"totalCount": 2, "nodes": [{"author": {"login": "author"}}]}}
                                         for path, line in threads]}}
 
 
@@ -536,9 +537,12 @@ class Settle(Base):
         self.full = full_pr(threads=[("src/lib.rs", 40)])
         self.hunks = {"src/lib.rs": [(41, 42, 2)]}
         code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
-        self.assertEqual(code, 0)  # the later commit changes only the finding's lines
-        # The fix lands in another file the finding names: only a fresh approval covers it.
-        self.hunks = {"docs/notes.md": [(10, 10, 1)]}
+        self.assertEqual(code, 0)  # an answered finding with a small fix
+        # The fix may reach another file, up to 30 changed lines in total.
+        self.hunks = {"docs/notes.md": [(10, 10, 30)]}
+        code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+        self.assertEqual(code, 0)
+        self.hunks = {"docs/notes.md": [(10, 10, 31)]}
         code, out = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
         self.assertEqual(code, 6)
         self.assertIn(f"post a fresh formal approval naming {B}", out)
@@ -546,6 +550,29 @@ class Settle(Base):
         self.activity[PR1] = act(head=B, approvers=("review-bot",))
         code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE)
         self.assertEqual(code, 0)
+
+    def test_covered_by_requires_all_findings_answered_or_resolved(self):
+        self.activity[PR1] = act(head=B, approvers=(), approved_at={("review-bot", A)})
+        self.lines[B] = ["f +y"]
+        self.full = full_pr(threads=[("src/lib.rs", 40), ("src/other.rs", 50)])
+        self.hunks = {"src/lib.rs": [(40, 40, 1)]}
+        unanswered = self.full["reviewThreads"]["nodes"][1]
+        unanswered["replies"] = {"totalCount": 1, "nodes": [{"author": {"login": "review-bot"}}]}
+        for resolved, expected in ((False, 6), (True, 0)):
+            unanswered["isResolved"] = resolved
+            code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+            self.assertEqual(code, expected)
+
+    def test_covered_by_refuses_unknown_or_empty_changes_and_no_findings(self):
+        self.activity[PR1] = act(head=B, approvers=(), approved_at={("review-bot", A)})
+        self.lines[B] = ["f +y"]
+        for threads, hunks in (([("src/lib.rs", 40)], None), ([("src/lib.rs", 40)], {}),
+                               ([("src/lib.rs", 40)], {"src/lib.rs": []}),
+                               ([], {"docs/notes.md": [(10, 10, 1)]})):
+            with self.subTest(threads=threads, hunks=hunks):
+                self.full, self.hunks = full_pr(threads=threads), hunks
+                code, _ = self.cli("settle", self.watch, PR1, "--head", B, *SINCE, "--covered-by", A[:12])
+                self.assertEqual(code, 6)
 
     def test_sibling_recheck_registers_once_and_only_on_success(self):
         self.activity[PR1] = act(approvers=())

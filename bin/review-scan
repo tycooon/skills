@@ -773,7 +773,7 @@ def settle(w, a, pr):
               + (f" or {a.covered_by[:12]}" if a.covered_by else "") + "; post it, then settle again")
         return 6
     if a.verdict == "approved" and not covered(pr, own, a.head) and not pr.get("carry"):
-        print(f"refused: the commits since {a.covered_by[:12]} are no base-sync and reach past its findings' lines, "
+        print(f"refused: the commits since {a.covered_by[:12]} are no base-sync and fail the answered-findings or line-cap check, "
               f"so its approval does not cover {a.head[:12]}; post a fresh formal approval naming {a.head}, "
               "then settle again without --covered-by")
         return 6
@@ -840,7 +840,8 @@ def wait_pr_ready():
 
 def carry(url, sha, head, own):
     """Whether our newest approval of `sha` still covers `head` by wait-pr-ready's mechanical
-    test: a base-sync, or later commits that change only the lines of the findings it left.
+    test: a base-sync, or at least one finding, all answered or resolved, and at most
+    CARRY_LINE_CAP changed lines.
     The waiter reads nothing else, so a head settled as approved past that test would leave
     the PR's author waiting on a verdict that never shows on GitHub."""
     w = wait_pr_ready()
@@ -1166,8 +1167,9 @@ def main(argv=None):
     s.add_argument("--verdict", required=True, choices=["approved", "findings", "outside-filter"],
                    help="what the run left: an approval at the head, open threads of ours, or a PR outside the filter")
     s.add_argument("--covered-by", help="with --verdict approved: the earlier head whose approval of ours still "
-                   "covers this one; settle refuses it unless the commits since are a base-sync or change only "
-                   "that approval's findings' lines, as wait-pr-ready reads them")
+                   "covers this one; settle refuses it unless the commits since are a base-sync or that "
+                   "approval left findings, all are answered or resolved, and the changes total at most "
+                   f"{wait_pr_ready().CARRY_LINE_CAP} lines, as wait-pr-ready reads them")
     s.add_argument("--weighed", action="append", help="a thread weighed and left silent at this head")
     s.add_argument("--recheck", action="append", help="a sibling PR this review changed the picture for")
     n = sub.add_parser("nudge")
