@@ -8,9 +8,11 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -288,15 +290,63 @@ class CommandWatch(unittest.TestCase):
         self.tick()
         self.assertEqual(len(self.started), 3)
 
+    def test_timed_out_commands_kill_descendants(self):
+        communicate = self.aw.subprocess.Popen.communicate
+        def short_timeout(process, *args, **kwargs):
+            if kwargs.get('timeout') is not None:
+                self.assertEqual(kwargs['timeout'], 120)
+                kwargs['timeout'] = .3
+            return communicate(process, *args, **kwargs)
+
+        def alive(pid):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        for kind in ('list', 'brief', 'verify', 'prepare', 'notify'):
+            with self.subTest(command=kind):
+                pidfile = self.root / f'{kind}.child'
+                command = shlex.join(['sh', '-c', f'sleep 30 & echo $! > {shlex.quote(str(pidfile))}; wait'])
+                w = self.aw.Watch('work').load()
+                w.config.update(source_cmd=command, notify_cmd=command)
+                try:
+                    with patch.object(self.aw.subprocess.Popen, 'communicate', short_timeout), contextlib.redirect_stderr(io.StringIO()):
+                        if kind == 'notify':
+                            self.aw.notify_watch(w, 'timeout test')
+                            self.assertIn('notification command failed:', (w.dir / 'scan.log').read_text())
+                        else:
+                            with self.assertRaisesRegex(self.aw.ScanError, 'timed out'):
+                                if kind == 'prepare':
+                                    self.aw.shell_command(command, str(self.root))
+                                else:
+                                    self.aw.SOURCE.invoke(w, kind, {})
+                    self.assertTrue(pidfile.exists(), 'the shell must start its child before timing out')
+                    child = int(pidfile.read_text())
+                    deadline = time.monotonic() + 3
+                    while alive(child) and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertFalse(alive(child), f'{kind} left child {child} alive after its timeout')
+                finally:
+                    if pidfile.exists():
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(int(pidfile.read_text()), signal.SIGKILL)
+
+    def test_timeout_cleanup_tolerates_group_already_exited(self):
+        communicate = self.aw.subprocess.Popen.communicate
+        def exited(process, *args, **kwargs):
+            if kwargs.get('timeout'):
+                process.wait()
+                raise subprocess.TimeoutExpired(process.args, kwargs['timeout'])
+            return communicate(process, *args, **kwargs)
+        with patch.object(self.aw.subprocess.Popen, 'communicate', exited):
+            with self.assertRaisesRegex(self.aw.ScanError, 'timed out'):
+                self.aw.shell_command('exit 0', str(self.root))
+
     def test_source_timeouts_are_bounded(self):
         self.tick()
-        original = self.aw.subprocess.run
-        def timeout(cmd, **kw):
-            if kw.get('shell'):
-                self.assertEqual(kw['timeout'], 120)
-                raise subprocess.TimeoutExpired(cmd, 120)
-            return original(cmd, **kw)
-        with patch.object(self.aw.subprocess, 'run', side_effect=timeout):
+        with patch.object(self.aw, 'run_shell', side_effect=subprocess.TimeoutExpired('source', 120)):
             self.assertEqual(self.tick()[0], 5)
             self.assertEqual(self.settle()[0], 6)
 
@@ -402,12 +452,12 @@ for line in brief.splitlines():
         self.assertEqual(len(self.started), 1)
 
     def test_brief_timeout_is_a_failed_start(self):
-        original = self.aw.subprocess.run
-        def run(cmd, **kw):
-            if isinstance(cmd, str) and cmd.endswith(' brief'):
+        original = self.aw.run_shell
+        def run(cmd, *args, **kw):
+            if cmd.endswith(' brief'):
                 raise subprocess.TimeoutExpired(cmd, 120)
-            return original(cmd, **kw)
-        with patch.object(self.aw.subprocess, 'run', side_effect=run):
+            return original(cmd, *args, **kw)
+        with patch.object(self.aw, 'run_shell', side_effect=run):
             self.assertEqual(self.tick()[0], 5)
         self.assertEqual(self.started, [])
 
