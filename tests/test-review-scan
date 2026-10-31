@@ -1323,6 +1323,7 @@ class CodexRunner(Base):
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/inherited-account"}), \
              patch.object(rs.shutil, "which", return_value="/bin/codex"), \
              patch.object(rs.engine, "codex_logged_in", return_value=True), \
+             patch.object(rs.engine, "codex_git_dirs", return_value=[]), \
              patch.object(rs.engine, "claude_logged_in", side_effect=AssertionError("Claude login used")), \
              patch.object(rs.engine, "proc_start", return_value="start"), \
              patch.object(rs.subprocess, "Popen") as popen:
@@ -1388,7 +1389,7 @@ class RunHistory(Base):
         self.run_dir = self.w.runs / self.w.slug(PR1)
         self.commands = []
         for name, value in (("proc_start", "start"), ("claude_logged_in", True),
-                            ("codex_logged_in", True)):
+                            ("codex_logged_in", True), ("codex_git_dirs", [])):
             self.enter_patch(patch.object(rs.engine, name, return_value=value))
         self.enter_patch(patch.object(rs.shutil, "which", side_effect=lambda name: f"/bin/{name}"))
         self.enter_patch(patch.object(rs.subprocess, "Popen", side_effect=self.run_stub))

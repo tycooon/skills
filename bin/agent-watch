@@ -54,7 +54,9 @@ command failure is logged without changing tick accounting. Agent runs also use 
 
 State: $AGENT_WATCH_HOME (default ~/.local/state/agent-watch)/<watch>/prs.json.
 Model IDs select Claude or Codex, as in review-scan. Account/model commands and
-former-agent history work the same way. Paused ticks do no work; in-flight runs can
+former-agent history work the same way.
+Codex runs in a git work tree grant sandbox write access to its git dir and the common dir's objects, refs and logs, discovered after preparation at each launch. This avoids per-command git write approvals and weakens git containment; see the --add-dir paragraph in the [Codex skill, step 2](../codex/SKILL.md#2-launch) for the security trade-off.
+Paused ticks do no work; in-flight runs can
 still settle. Rechecks queue work for the next tick. install uses launchd on macOS
 and writes an idempotent tagged crontab entry on Linux; uninstall keeps state.
 Runs lasting at least 60 seconds chain another tick if the watch remains installed.
@@ -488,6 +490,19 @@ def prune_idle_runs(w, now):
                 directory.rmdir()
 
 
+def codex_git_dirs(directory):
+    try:
+        p = subprocess.run(["git", "-C", str(directory), "rev-parse", "--is-inside-work-tree",
+                            "--absolute-git-dir", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, check=True, timeout=10)
+        inside, git_dir, common_dir = p.stdout.splitlines()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    if inside != "true":
+        return []
+    return list(dict.fromkeys([git_dir, *(str(Path(common_dir) / name) for name in ("objects", "refs", "logs"))]))
+
+
 def spawn_run(w, url, brief):
     cfg = w.config
     runner = w.runner
@@ -517,8 +532,10 @@ def spawn_run(w, url, brief):
     last_path = run.with_suffix(".last.md")
     if runner == "codex":
         cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
-               "-c", "sandbox_workspace_write.network_access=true",
-               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"]
+               "-c", "sandbox_workspace_write.network_access=true"]
+        for path in codex_git_dirs(cfg.get("run_dir", str(w.dir))):
+            cmd.extend(["--add-dir", path])
+        cmd.extend(["--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"])
         env = claude_env(None)
     else:
         cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],

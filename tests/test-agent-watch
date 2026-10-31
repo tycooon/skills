@@ -417,6 +417,89 @@ for line in brief.splitlines():
         self.assertEqual(self.calls('brief')[0][1]['items'], self.settings['items'])
         self.assertEqual(state['_tick']['started'], 1)
 
+    def git(self, directory, *args):
+        return subprocess.run(['git', '-C', str(directory), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def checkout(self):
+        directory = self.root / 'main checkout'
+        directory.mkdir()
+        self.git(directory, 'init')
+        self.git(directory, '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+                 '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'Initial commit')
+        return directory
+
+    def launch_git_dirs(self, directory, model='gpt-6-astra', prepare=None):
+        extra = ['--run-dir', str(directory), '--reviewer-model', model]
+        if prepare:
+            extra.extend(['--prepare-cmd', prepare])
+        self.assertEqual(self.init(*extra)[0], 0)
+        original = subprocess.Popen
+        launched = []
+        with patch.object(self.aw.shutil, 'which', return_value='/stub/runner'), \
+             patch.object(self.aw, 'codex_logged_in', return_value=True), \
+             patch.object(self.aw, 'claude_logged_in', return_value=True), \
+             patch.object(self.aw, 'proc_start', return_value='start'), \
+             patch.object(self.aw.subprocess, 'Popen') as popen:
+            popen.return_value.pid = 4242
+            def capture(cmd, *args, **kwargs):
+                if cmd[:3] == ['/bin/sh', '-c', self.aw.WRAPPER]:
+                    launched.append(cmd[7:])
+                    return popen.return_value
+                return original(cmd, *args, **kwargs)
+            popen.side_effect = capture
+            result = self.cli('tick', 'work')
+            self.assertEqual(result[0], 0, result)
+            argv, = launched
+        return [argv[i + 1] for i, arg in enumerate(argv) if arg == '--add-dir']
+
+    def test_codex_linked_worktree_gets_own_git_dir_and_shared_storage(self):
+        main = self.checkout()
+        linked = self.root / 'linked worktree'
+        self.git(main, 'worktree', 'add', '-b', 'linked', str(linked))
+        nested = linked / 'nested'
+        nested.mkdir()
+        self.assertEqual(self.launch_git_dirs(nested), [
+            str(main / '.git' / 'worktrees' / 'linked-worktree'),
+            str(main / '.git' / 'objects'), str(main / '.git' / 'refs'), str(main / '.git' / 'logs')])
+
+    def test_codex_main_checkout_gets_git_dir_once_and_shared_storage(self):
+        main = self.checkout()
+        self.assertEqual(self.launch_git_dirs(main), [
+            str(main / '.git'), str(main / '.git' / 'objects'),
+            str(main / '.git' / 'refs'), str(main / '.git' / 'logs')])
+
+    def test_codex_outside_git_gets_no_grants(self):
+        self.assertEqual(self.launch_git_dirs(self.root), [])
+
+    def test_codex_bare_repository_gets_no_grants(self):
+        directory = self.root / 'bare.git'
+        self.git(self.root, 'init', '--bare', str(directory))
+        self.assertEqual(self.launch_git_dirs(directory), [])
+
+    def test_claude_checkout_gets_no_grants(self):
+        self.assertEqual(self.launch_git_dirs(self.checkout(), model='sonnet'), [])
+
+    def test_codex_discovers_checkout_created_by_prepare(self):
+        directory = self.root / 'prepared checkout'
+        directory.mkdir()
+        self.assertEqual(self.launch_git_dirs(directory, prepare='git init'), [
+            str(directory / '.git'), str(directory / '.git' / 'objects'),
+            str(directory / '.git' / 'refs'), str(directory / '.git' / 'logs')])
+
+    def test_codex_git_discovery_failure_still_launches_without_grants(self):
+        main = self.checkout()
+        original = subprocess.run
+        for failure in (FileNotFoundError('git'), subprocess.CalledProcessError(1, 'git'),
+                        subprocess.TimeoutExpired('git', 10)):
+            with self.subTest(failure=type(failure).__name__):
+                def run(cmd, *args, **kwargs):
+                    if cmd[0] == 'git':
+                        raise failure
+                    return original(cmd, *args, **kwargs)
+                with patch.object(self.aw.subprocess, 'run', side_effect=run):
+                    self.assertEqual(self.launch_git_dirs(main), [])
+
     def test_live_pidfile_counts_even_after_its_item_leaves_listing(self):
         self.tick()
         self.settings['items'] = [item('two')]
