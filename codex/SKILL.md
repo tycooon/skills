@@ -123,6 +123,15 @@ The log opens with `stale rollout path` errors, which are noise, and within seco
 
 **When auto mode refuses.** The first launch in a conversation is usually refused as `[Create Unsafe Agents]` when the user's request said no more than "run codex". Whenever a launch or a resume is refused, don't try variants: show the user the exact command, say what `--approve-for-me` does, and re-issue it unchanged on their go. If it is refused again, the command is theirs to run.
 
+**Out of usage limits.** A launch or a resume that ends with `hit your usage limit` in its log or `-o` file will fail the same way until the limit resets, so don't retry it, and switch to [remote-claude](../remote-claude/SKILL.md) on the same HOST without asking:
+
+- Keep the worktree and the branch, uncommitted work included, and start the Claude session there. Skip remote-claude's new worktree and go straight to its launch.
+- Its brief is this session's brief, plus the follow-up the run was given, if any, plus a line saying a Codex run stopped at its usage limit and left the worktree as it is, so Claude reads `git status` and `git log` and carries on from there.
+- Pass the session's EFFORT. The model follows remote-claude.
+- Tell the user about the switch, with the reset time the log gives. The PR stays with Claude to the end, since neither tool can resume the other's session. The next task tries Codex first: a refused launch costs seconds.
+
+A run with no HOST has nowhere to switch to: tell the user the limit and its reset time.
+
 ## 3. Review
 
 Don't wait for a resumed run to exit before reviewing. Codex spends most of a run waiting on CI after its push, and a review that starts at the push lands while it still waits, where step 4's follow-up has it answer new threads in the same run. So alongside each resume, arm a background poll that exits when the PR's head moves:
