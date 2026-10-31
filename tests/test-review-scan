@@ -56,9 +56,9 @@ class Base(unittest.TestCase):
         self.spawned = []
         rs.list_target = lambda spec: self.listing[spec]
         rs.activity_since = lambda url, since: self.activity[url]
-        rs.now_utc = lambda: rs.parse_time("2026-10-23T12:00:00Z")
+        rs.engine.now_utc = lambda: rs.parse_time("2026-10-23T12:00:00Z")
         self.notified = []
-        rs.notify = self.notified.append
+        rs.engine.notify = self.notified.append
         self.watch = f"w{self.id().split('.')[-1]}"
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--reviewer-model", "sonnet")
 
@@ -112,7 +112,7 @@ class Pause(Base):
         flags = [(), ("--chained",), ("--full",), ("--only", PR1), ("--dry-run",),
                  ("--chained", "--full", "--only", PR1, "--dry-run")]
         for scheduled in (False, True):
-            with patch.object(rs, "is_scheduled", return_value=scheduled), \
+            with patch.object(rs.engine, "is_scheduled", return_value=scheduled), \
                     patch.object(rs, "list_target", wraps=rs.list_target) as listing:
                 for variant in flags:
                     with self.subTest(scheduled=scheduled, flags=variant):
@@ -179,7 +179,7 @@ class Pause(Base):
     def test_pause_survives_configuration_changes_and_reinit(self):
         self.cli("pause", self.watch)
         before = self.prs()
-        with patch.object(rs, "claude_auth_status", return_value={"loggedIn": False}):
+        with patch.object(rs.engine, "claude_auth_status", return_value={"loggedIn": False}):
             self.cli("account", self.watch, "default")
         self.cli("model", self.watch, "opus", "--effort", "high")
         for _ in range(2):
@@ -196,9 +196,9 @@ class Pause(Base):
         pid.write_text("4242 start")
         plist = w.dir / "watch.plist"
         with patch.object(rs.sys, "platform", "darwin"), \
-                patch.object(rs, "plist_path", return_value=plist), \
+                patch.object(rs.engine, "plist_path", return_value=plist), \
                 patch.object(rs.subprocess, "run"), \
-                patch.object(rs, "our_pid", return_value=4242), \
+                patch.object(rs.engine, "our_pid", return_value=4242), \
                 patch.object(rs.os, "killpg") as kill:
             self.cli("install", self.watch)
             self.assertTrue(plist.exists())
@@ -212,7 +212,7 @@ class Pause(Base):
 
     def test_status_shows_pause_independently_of_schedule(self):
         for scheduled in (False, True):
-            with patch.object(rs, "is_scheduled", return_value=scheduled):
+            with patch.object(rs.engine, "is_scheduled", return_value=scheduled):
                 for command in ("pause", "resume"):
                     self.cli(command, self.watch)
                     for args in (("list",), ("status",), ("status", self.watch)):
@@ -310,7 +310,7 @@ class Tick(Base):
         with patch.object(rs, "list_target", side_effect=rs.ScanError("net/http: TLS handshake timeout")):
             for n in range(1, 4):
                 with self.subTest(tick=n):
-                    rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * (n - 1))
+                    rs.engine.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * (n - 1))
                     code, out = self.cli("tick", self.watch)
                     self.assertEqual(code, 5)
                     self.assertIn("UNREAD (net/http: TLS handshake timeout)", out)
@@ -364,13 +364,13 @@ class Tick(Base):
             self.assertEqual(self.cli("tick", self.watch)[0], 5)
         before = self.prs()
         for unread in (True, False):
-            rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2)
+            rs.engine.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2)
             with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout") if unread else None,
                               return_value=[]):
                 self.assertEqual(self.cli("tick", self.watch, "--dry-run")[0], 5 if unread else 0)
             self.assertEqual(self.prs(), before)
             self.assertEqual(self.notified, [])
-        rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=4)
+        rs.engine.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=4)
         with patch.object(rs, "list_target", side_effect=rs.ScanError("timeout")):
             self.assertEqual(self.cli("tick", self.watch)[0], 5)
         self.assertEqual(self.prs()["_unread"], {"ticks": 2, "since": first})
@@ -394,14 +394,14 @@ class Tick(Base):
         first = rs.iso(rs.now_utc())
         with patch.object(self, "spawn", side_effect=FileNotFoundError("claude")):
             for n in range(2):
-                rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
+                rs.engine.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
                 self.assertEqual(self.cli("tick", self.watch)[0], 5)
                 _, status = self.cli("status", self.watch)
                 self.assertIn(f"PROBLEM since {first}:", status)
                 self.assertIn("2 review run(s) failed to start", status)
                 self.assertEqual(len(self.notified), 1)
             changed = "2026-10-23T12:04:00Z"
-            rs.now_utc = lambda: rs.parse_time(changed)
+            rs.engine.now_utc = lambda: rs.parse_time(changed)
             self.listing["acme/app"] = [row(PR1)]
             self.cli("tick", self.watch)
             _, status = self.cli("status", self.watch)
@@ -417,7 +417,7 @@ class Tick(Base):
             rs.write_json(w.dir / "config.json", w.config)
         first = rs.iso(rs.now_utc())
         for n in range(2):
-            rs.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
+            rs.engine.now_utc = lambda: rs.parse_time(first) + rs.dt.timedelta(minutes=2 * n)
             self.assertEqual(self.cli("tick", self.watch)[0], 0)
             self.assertNotIn("_unread", self.prs())
             _, status = self.cli("status", self.watch)
@@ -628,8 +628,8 @@ class Spawn(Base):
 
         real, real_start, real_login = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in
         rs.subprocess.Popen = FakePopen
-        rs.claude_logged_in = lambda *_: True
-        rs.proc_start = lambda pid: "Fri Oct 23 12:00:00 2026" if pid == 4242 else None
+        rs.engine.claude_logged_in = lambda *_: True
+        rs.engine.proc_start = lambda pid: "Fri Oct 23 12:00:00 2026" if pid == 4242 else None
         try:
             w = rs.Watch(self.watch).load()
             rs.spawn_run(w, PR1, "brief")
@@ -639,18 +639,18 @@ class Spawn(Base):
             self.assertEqual(cmd[cmd.index("--model") + 1], "sonnet")
             self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "auto")
             self.assertTrue(w.running(PR1))
-            rs.proc_start = lambda pid: "Sat Oct 24 09:00:00 2026"  # pid reused by another process
+            rs.engine.proc_start = lambda pid: "Sat Oct 24 09:00:00 2026"  # pid reused by another process
             self.assertFalse(w.running(PR1))
         finally:
-            rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in = real, real_start, real_login
+            rs.subprocess.Popen, rs.engine.proc_start, rs.engine.claude_logged_in = real, real_start, real_login
 
     def test_a_logged_out_cli_fails_the_start_and_notifies(self):
         real_login = rs.claude_logged_in
-        rs.claude_logged_in = lambda *_: False
+        rs.engine.claude_logged_in = lambda *_: False
         try:
             code, out = self.cli("tick", self.watch, spawn=rs.spawn_run)
         finally:
-            rs.claude_logged_in = real_login
+            rs.engine.claude_logged_in = real_login
         self.assertEqual(code, 5)
         self.assertEqual(out.count("FAILED to start (the claude CLI is logged out"), 2)
         self.assertNotIn("last_run", self.prs()[PR1])
@@ -667,12 +667,12 @@ class Spawn(Base):
         rs.subprocess.run = fake_run
         try:
             for out, expected in (('{"loggedIn": false}', False), ('{"loggedIn": true}', True), ("garbage", True)):
-                rs._logged_in, self.status_out = {}, out
+                rs.engine._logged_in, self.status_out = {}, out
                 self.assertEqual(rs.claude_logged_in(), expected)
                 rs.claude_logged_in()
             self.assertEqual(len(calls), 3)
         finally:
-            rs.subprocess.run, rs._logged_in = real_run, {}
+            rs.subprocess.run, rs.engine._logged_in = real_run, {}
 
 
 class Nudge(Base):
@@ -699,7 +699,7 @@ class Nudge(Base):
 
 class PausedNudge(Base):
     def setUp(self):
-        home = patch.object(rs, "HOME", Path(TMP.name) / self.id().split(".")[-1])
+        home = patch.object(rs.engine, "HOME", Path(TMP.name) / self.id().split(".")[-1])
         home.start()
         self.addCleanup(home.stop)
         super().setUp()
@@ -907,13 +907,13 @@ class Init(unittest.TestCase):
 class List(Base):
     def test_list_and_bare_status_show_every_watch(self):
         real, real_sched = rs.our_pid, rs.is_scheduled
-        rs.our_pid = lambda pidfile: None
-        rs.is_scheduled = lambda name: False
+        rs.engine.our_pid = lambda pidfile: None
+        rs.engine.is_scheduled = lambda name: False
         try:
             _, out = self.cli("list")
             _, bare = self.cli("status")
         finally:
-            rs.our_pid, rs.is_scheduled = real, real_sched
+            rs.engine.our_pid, rs.engine.is_scheduled = real, real_sched
         self.assertIn(f"{self.watch}: reviewer claude sonnet, not scheduled, 0 run(s) in flight", out)
         self.assertIn("  acme/app", out)
         self.assertEqual(out, bare)
@@ -930,9 +930,9 @@ class Status(Base):
                  (7265, "121m 5s"), (7265.9, "121m 5s"))
         for seconds, duration in cases:
             with self.subTest(seconds=seconds), \
-                 patch.object(rs, "now_utc", return_value=started + rs.dt.timedelta(seconds=seconds)), \
+                 patch.object(rs.engine, "now_utc", return_value=started + rs.dt.timedelta(seconds=seconds)), \
                  patch.object(rs.Watch, "running", return_value=True), \
-                 patch.object(rs, "is_scheduled", return_value=False):
+                 patch.object(rs.engine, "is_scheduled", return_value=False):
                 code, out = self.cli("status", self.watch)
                 self.assertEqual(code, 0)
                 self.assertIn(f"last tick {stamp} ({duration} ago):", out)
@@ -951,7 +951,7 @@ class Status(Base):
                     self.cli("tick", self.watch, "--only", PR1, spawn=lambda *_: recorded)
                     before = self.prs()
                     with patch.object(rs.Watch, "running", return_value=running), \
-                         patch.object(rs, "is_scheduled", return_value=False):
+                         patch.object(rs.engine, "is_scheduled", return_value=False):
                         code, out = self.cli("status", self.watch)
                     self.assertEqual(code, 0)
                     self.assertEqual(out.count("logs root:"), 1)
@@ -969,11 +969,11 @@ class Status(Base):
         self.cli("settle", self.watch, PR1, "--head", A, *SINCE)
         real_running, real_sched = rs.Watch.running, rs.is_scheduled
         rs.Watch.running = lambda w, url: url.endswith("/3")
-        rs.is_scheduled = lambda name: True
+        rs.engine.is_scheduled = lambda name: True
         try:
             _, out = self.cli("status", self.watch)
         finally:
-            rs.Watch.running, rs.is_scheduled = real_running, real_sched
+            rs.Watch.running, rs.engine.is_scheduled = real_running, real_sched
         self.assertIn("3 started, 2 waiting for a slot", out)
         self.assertIn(f"  started {PR1}: settled approved at", out)
         self.assertIn("  started https://github.com/acme/app/pull/3: running for", out)
@@ -1034,22 +1034,22 @@ class ChainedTick(Base):
     def test_a_chained_tick_does_nothing_once_the_watch_is_uninstalled(self):
         real = rs.is_scheduled
         try:
-            rs.is_scheduled = lambda name: False
+            rs.engine.is_scheduled = lambda name: False
             self.assertEqual(self.cli("tick", self.watch, "--chained")[0], 0)
             self.assertEqual(self.spawned, [])
-            rs.is_scheduled = lambda name: True
+            rs.engine.is_scheduled = lambda name: True
             self.cli("tick", self.watch, "--chained")
             self.assertEqual(len(self.spawned), 2)
         finally:
-            rs.is_scheduled = real
+            rs.engine.is_scheduled = real
 
     def test_a_manual_tick_runs_whether_or_not_the_watch_is_installed(self):
         real = rs.is_scheduled
-        rs.is_scheduled = lambda name: False
+        rs.engine.is_scheduled = lambda name: False
         try:
             self.cli("tick", self.watch)
         finally:
-            rs.is_scheduled = real
+            rs.engine.is_scheduled = real
         self.assertEqual(len(self.spawned), 2)
 
 
@@ -1084,14 +1084,14 @@ class ChainTick(unittest.TestCase):
                 seen["cmd"], self.pid = cmd, 4242
 
         real = rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which
-        rs.subprocess.Popen, rs.proc_start = FakePopen, (lambda pid: "t")
-        rs.claude_logged_in, rs.shutil.which = (lambda *_: True), (lambda name: "/bin/claude")
+        rs.subprocess.Popen, rs.engine.proc_start = FakePopen, (lambda pid: "t")
+        rs.engine.claude_logged_in, rs.shutil.which = (lambda *_: True), (lambda name: "/bin/claude")
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 rs.main(["init", "chain", "--target", "acme/app", "--own", "x"])
             rs.spawn_run(rs.Watch("chain").load(), PR1, "brief")
         finally:
-            rs.subprocess.Popen, rs.proc_start, rs.claude_logged_in, rs.shutil.which = real
+            rs.subprocess.Popen, rs.engine.proc_start, rs.engine.claude_logged_in, rs.shutil.which = real
         cmd = seen["cmd"]
         self.assertEqual(cmd[:3], ["/bin/sh", "-c", rs.WRAPPER])
         self.assertEqual(cmd[5:9], ["chain", str(rs.CHAIN_AFTER), "claude", "-p"])
@@ -1100,11 +1100,11 @@ class ChainTick(unittest.TestCase):
 class Account(Base):
     def switch(self, config):
         real = rs.claude_auth_status
-        rs.claude_auth_status = lambda d=None: {"loggedIn": d is not None, "email": "me@x", "orgName": "Team", "subscriptionType": "team"}
+        rs.engine.claude_auth_status = lambda d=None: {"loggedIn": d is not None, "email": "me@x", "orgName": "Team", "subscriptionType": "team"}
         try:
             return self.cli("account", self.watch, config)
         finally:
-            rs.claude_auth_status = real
+            rs.engine.claude_auth_status = real
 
     def config(self):
         return json.loads((Path(TMP.name) / self.watch / "config.json").read_text())
@@ -1239,7 +1239,7 @@ class CodexRunner(Base):
     def test_switch_records_history_only_on_change_and_brief_adopts_it(self):
         created = self.config()["created"]
         first, second = "2026-10-23T13:00:00Z", "2026-10-23T14:00:00Z"
-        with patch.object(rs, "now_utc", return_value=rs.parse_time(first)):
+        with patch.object(rs.engine, "now_utc", return_value=rs.parse_time(first)):
             self.switch()
         self.assertEqual(self.config()["former_agents"], [{"agent": "Claude", "since": created, "until": first}])
         self.switch()
@@ -1250,7 +1250,7 @@ class CodexRunner(Base):
                      "last reviewed", "threads", "covering approval", "(Codex handoff)", "someone else's"):
             self.assertIn(text, brief)
         self.assertIn("review-scan settle", brief)
-        with patch.object(rs, "now_utc", return_value=rs.parse_time(second)):
+        with patch.object(rs.engine, "now_utc", return_value=rs.parse_time(second)):
             self.switch("opus")
         self.assertEqual(self.config()["former_agents"], [
             {"agent": "Claude", "since": created, "until": first},
@@ -1267,7 +1267,7 @@ class CodexRunner(Base):
         created = w.config["created"]
         w.config["former_agents"] = [{"agent": "Codex", "until": "2026-10-23T13:00:00Z"}]
         rs.write_json(w.dir / "config.json", w.config)
-        with patch.object(rs, "now_utc", return_value=rs.parse_time("2026-10-23T14:00:00Z")):
+        with patch.object(rs.engine, "now_utc", return_value=rs.parse_time("2026-10-23T14:00:00Z")):
             self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
         self.assertEqual(self.config()["created"], created)
         self.cli("tick", self.watch)
@@ -1307,7 +1307,7 @@ class CodexRunner(Base):
     def test_output_names_runner_and_account(self):
         _, changed = self.switch()
         self.assertIn("reviewer codex gpt-6-astra", changed)
-        with patch.object(rs, "is_scheduled", return_value=False), patch.object(rs, "our_pid", return_value=None):
+        with patch.object(rs.engine, "is_scheduled", return_value=False), patch.object(rs.engine, "our_pid", return_value=None):
             for command in (("list",), ("status", self.watch), ("model", self.watch)):
                 _, out = self.cli(*command)
                 self.assertIn("reviewer codex gpt-6-astra", out)
@@ -1322,9 +1322,9 @@ class CodexRunner(Base):
         self.addCleanup((w.runs / f"{w.slug(PR1)}.pid").unlink, missing_ok=True)
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/inherited-account"}), \
              patch.object(rs.shutil, "which", return_value="/bin/codex"), \
-             patch.object(rs, "codex_logged_in", return_value=True), \
-             patch.object(rs, "claude_logged_in", side_effect=AssertionError("Claude login used")), \
-             patch.object(rs, "proc_start", return_value="start"), \
+             patch.object(rs.engine, "codex_logged_in", return_value=True), \
+             patch.object(rs.engine, "claude_logged_in", side_effect=AssertionError("Claude login used")), \
+             patch.object(rs.engine, "proc_start", return_value="start"), \
              patch.object(rs.subprocess, "Popen") as popen:
             popen.return_value.pid = 4242
             contents = []
@@ -1352,7 +1352,7 @@ class CodexRunner(Base):
         self.switch()
         for found, logged_in, message in (("/bin/codex", False, "codex login"), (None, True, "codex is not on PATH")):
             with self.subTest(message=message), patch.object(rs.shutil, "which", return_value=found), \
-                 patch.object(rs, "codex_logged_in", return_value=logged_in), \
+                 patch.object(rs.engine, "codex_logged_in", return_value=logged_in), \
                  patch.object(rs.subprocess, "Popen") as popen:
                 self.notified.clear()
                 w = rs.Watch(self.watch).load()
@@ -1368,7 +1368,7 @@ class CodexRunner(Base):
     def test_login_status_cached_and_errors_allow_run(self):
         for status, expected in ((0, True), (1, False), (OSError("unavailable"), True),
                                  (rs.subprocess.TimeoutExpired("codex", 30), True)):
-            with self.subTest(status=status), patch.object(rs, "_codex_logged_in", None), \
+            with self.subTest(status=status), patch.object(rs.engine, "_codex_logged_in", None), \
                  patch.object(rs.subprocess, "run") as run:
                 if isinstance(status, Exception):
                     run.side_effect = status
@@ -1389,7 +1389,7 @@ class RunHistory(Base):
         self.commands = []
         for name, value in (("proc_start", "start"), ("claude_logged_in", True),
                             ("codex_logged_in", True)):
-            self.enter_patch(patch.object(rs, name, return_value=value))
+            self.enter_patch(patch.object(rs.engine, name, return_value=value))
         self.enter_patch(patch.object(rs.shutil, "which", side_effect=lambda name: f"/bin/{name}"))
         self.enter_patch(patch.object(rs.subprocess, "Popen", side_effect=self.run_stub))
 
@@ -1448,10 +1448,10 @@ class RunHistory(Base):
             for failure in ("missing", "logged-out"):
                 with self.subTest(runner=runner, failure=failure), \
                      patch.object(rs.shutil, "which", return_value=None if failure == "missing" else f"/bin/{runner}"), \
-                     patch.object(rs, f"{runner}_logged_in", return_value=False):
+                     patch.object(rs.engine, f"{runner}_logged_in", return_value=False):
                     for attempt in range(12):
                         now = rs.parse_time("2026-10-23T12:00:00Z") + rs.dt.timedelta(minutes=2 * attempt)
-                        with patch.object(rs, "now_utc", return_value=now), self.assertRaises(OSError):
+                        with patch.object(rs.engine, "now_utc", return_value=now), self.assertRaises(OSError):
                             rs.spawn_run(self.w, PR1, "failed brief")
                     self.assertEqual(list(self.w.runs.rglob("*.*")), [])
 
@@ -1466,7 +1466,7 @@ class RunHistory(Base):
                 with patch.object(rs.subprocess, "Popen", side_effect=OSError("cannot start")):
                     for attempt in range(12):
                         now = rs.parse_time("2026-10-23T12:02:00Z") + rs.dt.timedelta(minutes=2 * attempt)
-                        with patch.object(rs, "now_utc", return_value=now), self.assertRaisesRegex(OSError, "cannot start"):
+                        with patch.object(rs.engine, "now_utc", return_value=now), self.assertRaisesRegex(OSError, "cannot start"):
                             rs.spawn_run(self.w, url, "failed brief")
                 after = {path: path.read_bytes() for path in self.w.runs.rglob("*.*")}
                 self.assertEqual(after, before)
