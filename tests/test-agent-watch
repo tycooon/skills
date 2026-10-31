@@ -104,6 +104,18 @@ class CommandWatch(unittest.TestCase):
     def settle(self, key='one', fingerprint='v1', *extra):
         return self.cli('settle', 'work', key, '--fingerprint', fingerprint, '--verdict', 'done', *extra)
 
+    def start_recheck(self):
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(self.settle()[0], 0)
+        self.clock += self.aw.dt.timedelta(minutes=1)
+        self.assertEqual(self.cli('recheck', 'work', 'one', '--reason', 'edited item')[0], 0)
+        active = dict(item('one', 'recheck:v1'), payload={'revision': 'edited', 'verify': 'original'})
+        self.settings['items'] = [active]
+        self.write()
+        self.assertEqual(self.tick()[0], 0)
+        self.alive.add('one')
+        return active
+
     def test_fingerprint_lifecycle_and_contract(self):
         self.assertEqual(self.tick()[0], 0)
         self.assertEqual(len(self.started), 1)
@@ -270,6 +282,64 @@ class CommandWatch(unittest.TestCase):
         self.assertEqual(self.settle('one', 'v2')[0], 0)
         self.assertEqual(self.calls('verify')[-1][1]['item'], updated)
         self.assertEqual(len(self.started), 1)
+
+    def test_historical_placeholder_preserves_live_recheck_for_settlement(self):
+        active = self.start_recheck()
+        placeholder = dict(item('one'), payload={'settlement_only': True})
+        self.settings['items'] = [placeholder]
+        self.write()
+        for _ in range(2):
+            rc, out, _ = self.tick()
+            self.assertEqual(rc, 0)
+            self.assertIn('1 listed, 1 kept', out)
+            self.assertEqual(self.state()['_items'], {'one': active})
+            self.assertEqual(self.state()['_tick']['started'], 0)
+        self.assertEqual(len(self.started), 2)
+        w = self.aw.Watch('work').load()
+        listed, failed, _, _ = self.aw.SOURCE.list(w, self.clock)
+        self.assertEqual(failed, [])
+        self.assertEqual(listed, {'one': placeholder})
+        self.assertEqual(w.prs['_items'], {'one': active})
+        self.assertEqual(self.settle('one', 'recheck:v1')[0], 0)
+        self.assertEqual(self.calls('verify')[-1][1]['item'], active)
+        self.assertEqual(self.state()['one']['settled']['fingerprint'], 'recheck:v1')
+
+    def test_new_fingerprint_replaces_live_recheck_row(self):
+        self.start_recheck()
+        self.settings['items'] = [item('one')]
+        self.write()
+        self.tick()
+        updated = dict(item('one', 'v2'), payload={'revision': 'newer'})
+        self.settings['items'] = [updated]
+        self.write()
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(self.state()['_items'], {'one': updated})
+        self.assertEqual(self.settle('one', 'recheck:v1')[0], 3)
+        self.assertEqual(len(self.calls('verify')), 1)
+        self.assertEqual(self.settle('one', 'v2')[0], 0)
+        self.assertEqual(self.calls('verify')[-1][1]['item'], updated)
+
+    def test_historical_placeholder_returns_after_recheck_run_ends(self):
+        active = self.start_recheck()
+        placeholder = dict(item('one'), payload={'settlement_only': True})
+        self.settings['items'] = [placeholder]
+        self.write()
+        self.tick()
+        self.assertEqual(self.state()['_items'], {'one': active})
+        self.alive.clear()
+        self.tick()
+        self.assertEqual(self.state()['_items'], {'one': placeholder})
+        self.assertEqual(self.settle('one', 'recheck:v1')[0], 3)
+
+    def test_historical_placeholder_wins_after_live_recheck_settles(self):
+        self.start_recheck()
+        self.clock += self.aw.dt.timedelta(seconds=1)
+        self.assertEqual(self.settle('one', 'recheck:v1')[0], 0)
+        placeholder = dict(item('one', 'recheck:v1'), payload={'settlement_only': True})
+        self.settings['items'] = [placeholder]
+        self.write()
+        self.tick()
+        self.assertEqual(self.state()['_items'], {'one': placeholder})
 
     def test_old_settlement_does_not_drop_removed_item_from_new_run(self):
         self.tick()
