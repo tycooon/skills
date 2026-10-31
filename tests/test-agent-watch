@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""Tests for bin/agent-watch. Run: tests/test-agent-watch"""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.dont_write_bytecode = True
+SCRIPT = Path(__file__).resolve().parent.parent / 'bin' / 'agent-watch'
+
+FAKE = '''import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+c = json.loads(p.read_text())
+verb = sys.argv[2]
+data = json.load(sys.stdin)
+with p.with_suffix('.calls').open('a') as f:
+    f.write(json.dumps([verb, data, str(pathlib.Path.cwd())]) + '\\n')
+if c.get(verb + '_error'):
+    print(c[verb + '_error'], file=sys.stderr)
+    sys.exit(1)
+if verb == 'list':
+    print(c.get('raw', json.dumps({'items': c.get('items', [])})))
+elif verb == 'brief':
+    print('Work on ' + ', '.join(i['key'] for i in data['items']))
+elif verb == 'verify':
+    print('verified')
+'''
+
+
+def item(key, fingerprint='v1'):
+    return dict(key=key, fingerprint=fingerprint, title=key, payload={'value': key})
+
+
+class CommandWatch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        loader = importlib.machinery.SourceFileLoader('agent_watch', str(SCRIPT))
+        self.aw = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.aw)
+        self.aw.HOME = self.root / 'state'
+        self.source = self.root / 'source.py'
+        self.source.write_text(FAKE)
+        self.control = self.root / 'control.json'
+        self.settings = {'items': [item('one')]}
+        self.write()
+        self.cmd = shlex.join([sys.executable, str(self.source), str(self.control)])
+        self.started = []
+        self.clock = self.aw.parse_time('2026-10-31T10:00:00Z')
+        self.enter(patch.object(self.aw, 'now_utc', side_effect=lambda: self.clock))
+        self.alive = set()
+        self.enter(patch.object(self.aw, 'our_pid', side_effect=self.live_pid))
+        self.enter(patch.object(self.aw.sys, "platform", "linux"))
+        self.init()
+
+    def enter(self, p):
+        self.addCleanup(p.stop)
+        return p.start()
+
+    def write(self):
+        self.control.write_text(json.dumps(self.settings))
+
+    def init(self, *extra):
+        return self.cli('init', 'work', '--source-cmd', self.cmd, '--run-dir', str(self.root),
+                        '--reviewer-model', 'sonnet', '--effort', 'high', *extra)
+
+    def cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.aw.main(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def tick(self, spawn=None, *flags):
+        with patch.object(self.aw, 'spawn_run', side_effect=spawn or self.spawn):
+            return self.cli('tick', 'work', *flags)
+
+    def spawn(self, w, key, brief):
+        self.started.append((key, brief))
+        (w.runs / f"{w.slug(key)}.pid").write_text('4242 start')
+
+    def live_pid(self, pidfile):
+        w = self.aw.Watch('work').load()
+        return 4242 if pidfile.stem in {w.slug(key) for key in self.alive} else None
+
+    def state(self):
+        return self.aw.Watch('work').load().prs
+
+    def calls(self, verb):
+        p = self.control.with_suffix('.calls')
+        return [v for v in map(json.loads, p.read_text().splitlines()) if v[0] == verb]
+
+    def settle(self, key='one', fingerprint='v1', *extra):
+        return self.cli('settle', 'work', key, '--fingerprint', fingerprint, '--verdict', 'done', *extra)
+
+    def test_fingerprint_lifecycle_and_contract(self):
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(len(self.started), 1)
+        brief = self.started[0][1]
+        self.assertIn('agent-watch settle work one --fingerprint v1 --verdict', brief)
+        self.assertIn('2026-10-31T10:00:00Z', brief)
+        self.assertEqual(self.calls('list')[0][1], {'settled': {}})
+        call = self.calls('brief')[0]
+        self.assertEqual(call[1]['items'], [item('one')])
+        self.assertEqual(call[1]['attempt'], 1)
+        self.assertEqual(call[1]['settled'], {'one': None})
+        self.assertEqual(call[2], str(self.root))
+        self.assertEqual(self.settle()[0], 0)
+        self.tick()
+        self.assertEqual(len(self.started), 1)
+        self.assertEqual(self.calls('list')[-1][1]['settled']['one']['verdict'], 'done')
+        self.settings['items'] = [item('one', 'v2')]
+        self.write()
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+
+    def test_batch_order_and_one_slot(self):
+        self.init('--max-items-per-run', '3')
+        self.settings['items'] = [item(str(n)) for n in range(5)]
+        self.write()
+        self.tick()
+        self.assertEqual(len(self.started), 1)
+        self.assertEqual([i['key'] for i in self.calls('brief')[0][1]['items']], ['0', '1', '2'])
+        self.alive.add('0')
+        for key in ['0', '1', '2']:
+            self.assertEqual(self.settle(key)[0], 0)
+        self.tick()
+        self.assertEqual(len(self.started), 1)
+        self.alive.clear()
+        self.tick()
+        self.assertEqual([i['key'] for i in self.calls('brief')[-1][1]['items']], ['3', '4'])
+        self.assertEqual(len(self.started), 2)
+
+    def test_daily_cap_and_expiry(self):
+        self.init('--max-runs-per-day', '1')
+        self.settings['items'] = [item('one'), item('two')]
+        self.write()
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.started), 1)
+        out = self.cli('status', 'work')[1]
+        self.assertIn('source command:', out)
+        self.assertIn('run dir:', out)
+        self.assertIn('runs in last 24h: 1 / 1', out)
+        self.assertIn('waiting for a free slot', out)
+        self.clock += self.aw.dt.timedelta(hours=24, seconds=1)
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+
+    def test_attempt_hold_notifies_once_and_new_fingerprint_releases(self):
+        self.init('--max-attempts', '2')
+        notices = self.enter(patch.object(self.aw, 'notify'))
+        self.tick()
+        self.tick()
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+        self.assertEqual(notices.call_count, 1)
+        self.assertIn('one', notices.call_args.args[0])
+        self.assertIn('held', self.cli('status', 'work')[1])
+        self.settings['items'] = [item('one', 'v2')]
+        self.write()
+        self.tick()
+        self.assertEqual(len(self.started), 3)
+        self.assertEqual(self.calls('brief')[-1][1]['attempt'], 1)
+
+    def test_verify_meta_refusal_and_stale(self):
+        self.tick()
+        rc, out, _ = self.settle('one', 'v1', '--meta', '{"count": 2}')
+        self.assertEqual((rc, out), (0, 'settled one\n'))
+        self.assertEqual(self.state()['one']['settled']['meta'], {'count': 2})
+        self.assertEqual(self.calls('verify')[-1][1], dict(key='one', fingerprint='v1', verdict='done',
+                                                       meta={'count': 2}, item=item('one')))
+        self.settings['verify_error'] = 'cannot accept verdict'
+        self.write()
+        rc, out, err = self.settle()
+        self.assertEqual(rc, 6)
+        self.assertIn('cannot accept verdict', out + err)
+        self.assertEqual(self.settle('one', 'stale')[0], 3)
+        self.assertEqual(len(self.calls('verify')), 2)
+
+    def test_unlisted_settle_is_refused_but_other_listed_key_is_allowed(self):
+        self.settings['items'] = [item('one'), item('two')]
+        self.write()
+        self.tick()
+        self.assertEqual(self.settle('two')[0], 0)
+        self.assertEqual(self.settle('missing')[0], 3)
+
+    def test_recheck_resets_hold_and_settled_is_owed(self):
+        self.init('--max-attempts', '1')
+        self.tick()
+        self.tick()
+        self.cli('recheck', 'work', 'one', '--reason', 'look again')
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+        self.settle()
+        self.cli('recheck', 'work', 'one', '--reason', 'new evidence')
+        self.tick()
+        self.assertEqual(len(self.started), 3)
+        self.assertIn('new evidence', self.state()['one']['last_run']['reason'])
+
+    def test_recheck_arriving_during_run_survives_settle(self):
+        self.tick()
+        self.cli('recheck', 'work', 'one', '--reason', 'new evidence')
+        self.settle()
+        self.assertEqual(self.state()['one']['recheck'], ['new evidence'])
+        self.tick()
+        self.settle()
+        self.assertNotIn('recheck', self.state()['one'])
+
+    def test_removed_items_keep_settled_records(self):
+        self.tick()
+        self.settle()
+        before = self.state()['one']['settled']
+        self.settings['items'] = []
+        self.write()
+        self.tick()
+        self.assertEqual(self.state()['one']['settled'], before)
+
+    def test_list_failure_notifies_once_via_command(self):
+        target = self.root / 'notices'
+        self.init('--notify-cmd', 'cat >> ' + shlex.quote(str(target)))
+        self.settings['list_error'] = 'unreadable'
+        self.write()
+        self.assertEqual(self.tick()[0], 5)
+        self.assertFalse(target.exists())
+        self.assertEqual(self.tick()[0], 5)
+        self.assertTrue(target.exists())
+        before = target.read_text()
+        self.tick()
+        self.assertEqual(target.read_text(), before)
+        self.assertIn('could not read any target', before)
+
+    def test_invalid_list_is_unreadable(self):
+        for raw in ('no json', '{}', '{"items": [{}]}', '{"items": [{"key": "_tick"}]}'):
+            self.settings['raw'] = raw
+            self.write()
+            self.assertEqual(self.tick()[0], 5)
+        self.assertEqual(self.started, [])
+
+    def test_prepare_and_brief_failures_are_failed_starts(self):
+        self.init('--prepare-cmd', 'exit 7')
+        rc, out, err = self.tick()
+        self.assertEqual(rc, 5)
+        self.assertIn('FAILED to start', out)
+        self.assertEqual(self.started, [])
+        self.assertNotIn('last_run', self.state()['one'])
+        self.init()
+        self.settings['brief_error'] = 'brief unavailable'
+        self.write()
+        rc, out, err = self.tick()
+        self.assertEqual(rc, 5)
+        self.assertIn('brief unavailable', out + err)
+        self.assertEqual(self.started, [])
+
+    def test_failed_batch_counts_as_one_failed_run(self):
+        self.init('--max-items-per-run', '3', '--prepare-cmd', 'exit 7')
+        self.settings['items'] = [item('one'), item('two'), item('three')]
+        self.write()
+        rc, out, err = self.tick()
+        self.assertEqual(rc, 5)
+        self.assertIn('1 run(s) failed to start', out)
+        self.assertEqual(out.count('run FAILED to start'), 3)
+
+    def test_fingerprint_cycle_clears_previous_hold(self):
+        self.init('--max-attempts', '1')
+        self.tick()
+        self.settle()
+        self.settings['items'] = [item('one', 'v2')]
+        self.write()
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+        self.settings['items'] = [item('one')]
+        self.write()
+        self.tick()
+        self.settings['items'] = [item('one', 'v2')]
+        self.write()
+        self.tick()
+        self.assertEqual(len(self.started), 3)
+
+    def test_source_timeouts_are_bounded(self):
+        self.tick()
+        original = self.aw.subprocess.run
+        def timeout(cmd, **kw):
+            if kw.get('shell'):
+                self.assertEqual(kw['timeout'], 120)
+                raise subprocess.TimeoutExpired(cmd, 120)
+            return original(cmd, **kw)
+        with patch.object(self.aw.subprocess, 'run', side_effect=timeout):
+            self.assertEqual(self.tick()[0], 5)
+            self.assertEqual(self.settle()[0], 6)
+
+    def test_pause_allows_settle_and_recheck_waits(self):
+        self.tick()
+        self.cli('pause', 'work')
+        self.assertEqual(self.settle()[0], 0)
+        self.cli('recheck', 'work', 'one', '--reason', 'again')
+        self.tick()
+        self.assertEqual(len(self.started), 1)
+        self.cli('resume', 'work')
+        self.tick()
+        self.assertEqual(len(self.started), 2)
+
+    def test_linux_crontab_install_uninstall_is_scoped(self):
+        tab = ['# user entry\n* * * * * other-command\n']
+        original = self.aw.subprocess.run
+        def cron(cmd, **kw):
+            if cmd == ['crontab', '-l']:
+                return subprocess.CompletedProcess(cmd, 0, stdout=tab[0], stderr='')
+            if cmd == ['crontab', '-']:
+                tab[0] = kw['input']
+                return subprocess.CompletedProcess(cmd, 0, stdout='', stderr='')
+            return original(cmd, **kw)
+        with patch.object(self.aw.sys, 'platform', 'linux'), patch.object(self.aw.subprocess, 'run', side_effect=cron):
+            self.assertEqual(self.cli('install', 'work')[0], 0)
+            first = tab[0]
+            self.assertEqual(self.cli('install', 'work')[0], 0)
+            self.assertEqual(tab[0], first)
+            self.assertTrue(self.aw.is_scheduled('work'))
+            self.assertFalse(self.aw.is_scheduled('wor'))
+            self.assertEqual(self.cli('uninstall', 'work')[0], 0)
+            self.assertEqual(tab[0], '# user entry\n* * * * * other-command\n')
+            self.assertFalse(self.aw.is_scheduled('work'))
+
+    def test_real_runner_receives_brief_in_run_dir_and_settles_batch(self):
+        self.init('--max-items-per-run', '2')
+        self.settings['items'] = [item('one'), item('two')]
+        self.write()
+        binary = self.root / 'claude'
+        binary.write_text('#!' + sys.executable + '\n' + '''import json, pathlib, shlex, subprocess, sys
+if sys.argv[1:3] == ['auth', 'status']:
+    print('{"loggedIn": true}')
+    sys.exit(0)
+brief = sys.stdin.read()
+pathlib.Path('runner.json').write_text(json.dumps({'cwd': str(pathlib.Path.cwd()), 'brief': brief}))
+for line in brief.splitlines():
+    if 'agent-watch settle ' in line:
+        cmd = shlex.split(line.split(' --verdict ')[0]) + ['--verdict', 'done']
+        subprocess.run(cmd, check=True)
+''')
+        binary.chmod(0o755)
+        env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ['PATH'],
+                   AGENT_WATCH_HOME=str(self.aw.HOME))
+        p = subprocess.run([str(SCRIPT), 'tick', 'work'], env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        import time
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = self.state()
+            if all('settled' in state.get(key, {}) for key in ('one', 'two')):
+                break
+            time.sleep(.02)
+        self.assertTrue(all('settled' in state.get(key, {}) for key in ('one', 'two')), state)
+        observed = json.loads((self.root / 'runner.json').read_text())
+        self.assertEqual(observed['cwd'], str(self.root))
+        self.assertIn('Work on one, two', observed['brief'])
+        self.assertEqual(self.calls('brief')[0][1]['items'], self.settings['items'])
+        self.assertEqual(state['_tick']['started'], 1)
+
+    def test_live_pidfile_counts_even_after_its_item_leaves_listing(self):
+        self.tick()
+        self.settings['items'] = [item('two')]
+        self.write()
+        w = self.aw.Watch('work').load()
+        (w.runs / 'orphan.pid').write_text('123 start')
+        with patch.object(self.aw, 'our_pid', side_effect=lambda f: 123 if f.exists() else None):
+            self.tick()
+        self.assertEqual(len(self.started), 1)
+        self.assertEqual(self.state()['_tick']['waiting'][0][0], 'two')
+
+    def test_command_keys_cannot_collide_in_pidfiles(self):
+        w = self.aw.Watch('work').load()
+        self.assertNotEqual(w.slug('one/two'), w.slug('one:two'))
+        self.assertLess(len(w.slug('x' * 1000)), 150)
+
+    def test_dry_run_does_not_persist_or_run_prepare(self):
+        marker = self.root / 'prepared'
+        self.init('--prepare-cmd', 'touch ' + shlex.quote(str(marker)))
+        self.tick(None, '--dry-run')
+        self.assertEqual(self.started, [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.state(), {})
+
+    def test_failed_start_does_not_consume_daily_or_attempt_limits(self):
+        self.init('--max-runs-per-day', '1', '--max-attempts', '1')
+        def fail(*args):
+            raise OSError('cannot spawn')
+        self.assertEqual(self.tick(fail)[0], 5)
+        self.assertEqual(self.state().get('_runs'), [])
+        self.assertNotIn('attempts', self.state()['one'])
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(len(self.started), 1)
+
+    def test_brief_timeout_is_a_failed_start(self):
+        original = self.aw.subprocess.run
+        def run(cmd, **kw):
+            if isinstance(cmd, str) and cmd.endswith(' brief'):
+                raise subprocess.TimeoutExpired(cmd, 120)
+            return original(cmd, **kw)
+        with patch.object(self.aw.subprocess, 'run', side_effect=run):
+            self.assertEqual(self.tick()[0], 5)
+        self.assertEqual(self.started, [])
+
+    def test_linux_schedules_of_both_tools_do_not_remove_each_other(self):
+        loader = importlib.machinery.SourceFileLoader('review_scan', str(SCRIPT.with_name('review-scan')))
+        rs = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(rs)
+        rs.engine.HOME = self.aw.HOME
+        with contextlib.redirect_stdout(io.StringIO()):
+            rs.main(['init', 'review', '--target', 'acme/app', '--own', 'bot', '--reviewer-model', 'sonnet'])
+        tab = ['# user entry\n']
+        def cron(cmd, **kw):
+            if cmd == ['crontab', '-']:
+                tab[0] = kw['input']
+            return subprocess.CompletedProcess(cmd, 0, stdout=tab[0], stderr='')
+        with patch.object(self.aw.subprocess, 'run', side_effect=cron):
+            self.cli('install', 'work')
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(rs.main(['install', 'review']), 0)
+                self.assertEqual(rs.main(['install', 'review']), 0)
+            self.assertEqual(tab[0].count('# review-scan:review'), 1)
+            self.assertEqual(tab[0].count('# agent-watch:work'), 1)
+            self.assertTrue(rs.is_scheduled('review'))
+            self.cli('uninstall', 'work')
+            self.assertTrue(rs.is_scheduled('review'))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(rs.main(['uninstall', 'review']), 0)
+            self.assertEqual(tab[0], '# user entry\n')
+
+
+
+if __name__ == '__main__':
+    unittest.main()

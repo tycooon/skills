@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+"""Run scheduled agents over items emitted by a command source.
+
+  agent-watch init <watch> --source-cmd CMD --run-dir DIR
+                   [--prepare-cmd CMD] [--notify-cmd CMD]
+                   [--max-items-per-run N] [--max-parallel N]
+                   [--max-runs-per-day N] [--max-attempts N]
+                   [--reviewer-model MODEL] [--effort LEVEL]
+  agent-watch tick <watch> [--full] [--only KEY] [--dry-run]
+  agent-watch settle <watch> <key> --fingerprint F --verdict V [--meta JSON]
+  agent-watch recheck <watch> <key> --reason TEXT
+  agent-watch pause|resume|status|account|model|install|uninstall <watch>
+  agent-watch list
+
+Command source contract
+
+CMD is a shell command run from DIR with list, brief or verify appended. Each
+invocation receives one JSON object on stdin and has a 120-second timeout.
+
+CMD list receives {"settled": {key: settled_record}} and prints
+  {"items": [{"key": "...", "fingerprint": "...", "title": "...", "payload": {}}]}
+Keys are unique nonempty strings and cannot begin with '_' (reserved for engine
+state); fingerprints and titles are strings, and payload is an object. Emit items
+in priority order. Unlisted keys keep their settled records. A missing settlement,
+changed fingerprint or queued recheck makes an item owed. Invalid output or a
+nonzero exit is unreadable; two consecutive unreadable ticks notify once until
+recovery or a different problem. An empty list is a healthy, quiet watch.
+
+CMD brief receives {"watch": name, "items": [item, ...], "settled": {key: record_or_null},
+"run_started": iso, "attempt": n} and prints plain text. n is the highest next
+attempt number among this batch's items at their current fingerprints. The engine
+appends the run start time and an exact agent-watch settle command for every key.
+A brief failure or timeout fails that run's start.
+
+CMD verify receives {"key", "fingerprint", "verdict", "meta", "item"}; item is the
+last successfully listed item. Exit 0 permits settlement; a nonzero exit or timeout
+refuses with exit 6 and the command's stderr. A fingerprint different from the latest
+listing, or a key absent from it, refuses with exit 3 without calling verify. A listed
+key can settle even if it was not in that run's batch. A successful settle stores
+{"fingerprint", "verdict", "meta", "at"}; meta defaults to {} and may be any JSON value.
+
+Each run takes up to --max-items-per-run items (default 1), in list order, and uses
+one parallel slot and one daily run. --max-parallel defaults to 1. The daily cap
+counts successful starts in the last 24 hours; the default is unlimited. Items
+waiting for either cap appear in tick accounting and status. --max-attempts counts
+successful starts per key at its current fingerprint (default unlimited); an ended
+run that reaches the limit holds the key and notifies once. A new fingerprint or
+recheck clears the hold and attempt count. Failed starts consume neither limit.
+
+--prepare-cmd runs in DIR before each run; failure prevents that start.
+--notify-cmd receives notification text on stdin in DIR, in addition to stderr and
+macOS desktop notifications. Linux sends no desktop notification. A notification
+command failure is logged without changing tick accounting. Agent runs also use DIR.
+
+State: $AGENT_WATCH_HOME (default ~/.local/state/agent-watch)/<watch>/prs.json.
+Model IDs select Claude or Codex, as in review-scan. Account/model commands and
+former-agent history work the same way. Paused ticks do no work; in-flight runs can
+still settle. Rechecks queue work for the next tick. install uses launchd on macOS
+and writes an idempotent tagged crontab entry on Linux; uninstall keeps state.
+Runs lasting at least 60 seconds chain another tick if the watch remains installed.
+
+Exit codes: 0 success; 2 bad usage; 3 stale/unlisted fingerprint; 5 unreadable source
+or failed start; 6 source verification refused. review-scan uses this same engine
+with its PR source, legacy state location, schedule labels and settle refusal codes.
+"""
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("AGENT_WATCH_HOME", "~/.local/state/agent-watch")).expanduser()
+TOOL = "agent-watch"
+UNREAD_TICKS_BEFORE_ALERT = 2
+_logged_in = {}
+_codex_logged_in = None
+CHAIN_AFTER = 60
+RUNS_TO_KEEP = 10
+RUN_RETENTION_DAYS = 30
+SHARED = ("CLAUDE.md", "settings.json", "skills", "plugins")
+WRAPPER = """exe=$1 watch=$2 min=$3; shift 3
+start=$(date +%s)
+"$@"; rc=$?
+rm -f "$0"
+if [ $(( $(date +%s) - start )) -ge "$min" ]; then "$exe" tick --chained "$watch" >/dev/null 2>&1 & fi
+exit $rc"""
+
+
+class ScanError(RuntimeError):
+    pass
+
+
+def now_utc():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_time(s):
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def run_json(cmd, timeout=120):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise ScanError(f"{shlex.join(cmd[:4])}…: {(p.stderr or p.stdout).strip()[:300]}")
+    return json.loads(p.stdout or "null")
+
+
+def write_json(path, obj):
+    """Atomic replace through a unique temp file, so concurrent writers never share one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def proc_start(pid):
+    """A process's start time as ps prints it, or None when there is no such process."""
+    p = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+    return p.stdout.strip() or None
+
+
+def our_pid(pidfile):
+    """The pid in a run's pidfile while that same process is alive, else None. The pidfile
+    holds the start time too, so a pid the system has since reused for something else fails."""
+    try:
+        pid, start = pidfile.read_text().split(" ", 1)
+        pid = int(pid)
+    except (FileNotFoundError, ValueError):
+        return None
+    return pid if proc_start(pid) == start.strip() else None
+
+
+def notify(message):
+    print(message, file=sys.stderr)
+    if sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", f"display notification {json.dumps(message)} with title \"{TOOL}\""],
+                       capture_output=True)
+
+
+class Watch:
+    def __init__(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+            raise SystemExit(f"bad watch name {name!r}: letters, digits, '.', '_' and '-' only")
+        self.name, self.dir = name, HOME / name
+        self.runs = self.dir / "runs"
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Serialize ticks and settlements so no item starts twice or loses a recheck."""
+        if not (self.dir / "config.json").exists():
+            raise SystemExit(f"no watch {self.name!r}; create it with `{TOOL} init`")
+        with open(self.dir / ".lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield self.load()
+
+    def load(self):
+        try:
+            self.config = json.loads((self.dir / "config.json").read_text())
+        except FileNotFoundError:
+            raise SystemExit(f"no watch {self.name!r}; create it with `{TOOL} init`")
+        p = self.dir / "prs.json"
+        self.prs = json.loads(p.read_text()) if p.exists() else {}
+        return self
+
+    def save(self):
+        write_json(self.dir / "prs.json", self.prs)
+
+    @property
+    def runner(self):
+        return runner_for_model(self.config["reviewer_model"])
+
+    @property
+    def paused(self):
+        return bool(self.prs.get("_paused", False))
+
+    def log(self, line):
+        with open(self.dir / "scan.log", "a") as f:
+            f.write(f"{iso(now_utc())} {line}\n")
+
+    def slug(self, url):
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", url.split("://", 1)[-1]).strip("-")
+        if self.config.get("source_cmd"):
+            return slug[:100] + "-" + hashlib.sha256(url.encode()).hexdigest()[:16]
+        return slug
+
+    def running(self, url):
+        key = (self.prs.get(url, {}).get("last_run") or {}).get("run_key", url)
+        return our_pid(self.runs / f"{self.slug(key)}.pid") is not None
+
+
+def initialize_watch(w, a, source_config):
+    old = w.dir / "config.json"
+    previous = json.loads(old.read_text()) if old.exists() else {}
+    model = a.reviewer_model if a.reviewer_model is not None else previous.get("reviewer_model", "opus")
+    runner = runner_for_model(model)
+    config = {**source_config, "reviewer_model": model, "effort": a.effort,
+              "max_parallel": a.max_parallel, "created": iso(now_utc())}
+    if previous:
+        for key in ("claude_config", "former_agents", "created"):
+            if key in previous:
+                config[key] = previous[key]
+        config["runner"] = previous.get("runner", "claude")
+        set_runner(config, runner)
+    else:
+        config["runner"] = runner
+    w.runs.mkdir(parents=True, exist_ok=True)
+    write_json(w.dir / "config.json", config)
+    return config
+
+
+def runner_for_model(model):
+    if model.startswith(("gpt-", "codex-")) or re.fullmatch(r"codex|o\d+(?:-.+)?", model):
+        return "codex"
+    if model.startswith("claude-") or re.fullmatch(r"(?:opus|sonnet|haiku)(?:\[\d+[km]\])?", model):
+        return "claude"
+    raise SystemExit(f"cannot infer a runner for model {model!r}; use a Claude ID, opus/sonnet/haiku, "
+                     "or a gpt-*, codex or o-series model")
+
+
+def set_runner(config, runner):
+    if runner != config.get("runner", "claude"):
+        history = config.setdefault("former_agents", [])
+        since = history[-1]["until"] if history else config["created"]
+        history.append({"agent": config.get("runner", "claude").title(), "since": since, "until": iso(now_utc())})
+    config["runner"] = runner
+
+
+def cmd_pause_resume(a):
+    with Watch(a.watch).locked() as w:
+        w.prs["_paused"] = a.cmd == "pause"
+        w.save()
+    if w.paused:
+        kind = "runs" if w.config.get("source_cmd") else "reviews"
+        print(f"watch {w.name}: paused; {kind} in flight can finish and settle")
+    else:
+        print(f"watch {w.name}: resumed; schedule unchanged; run `{TOOL} tick {w.name}` for an immediate scan")
+    return 0
+
+
+def cmd_tick(a, spawn=None):
+    with Watch(a.watch).locked() as w:
+        if w.paused:
+            print(f"watch {w.name}: paused; tick skipped")
+            return 0
+        # Recheck after locking: uninstall may have landed while the chained tick waited.
+        if getattr(a, "chained", False) and not is_scheduled(w.name):
+            w.log("chained tick skipped: the watch is not installed")
+            return 0
+        if w.config.get("runner") != w.runner:
+            set_runner(w.config, w.runner)
+            write_json(w.dir / "config.json", w.config)
+        return tick(w, a, spawn or spawn_run)
+
+
+def tick(w, a, spawn):
+    cfg, now = w.config, now_utc()
+    if not a.dry_run:
+        prune_idle_runs(w, now)
+    listed, failed, accounting, finished = SOURCE.list(w, now)
+    all_unread = bool(failed) and len(failed) == len(SOURCE.targets(w))
+    owed = []
+    held = []
+    for key, row in listed.items():
+        if a.only and key != a.only:
+            continue
+        rec = w.prs.setdefault(key, {})
+        attempts = rec.get("attempts", {})
+        if cfg.get("source_cmd") and attempts and attempts.get("fingerprint") != row[SOURCE.version_field]:
+            rec.pop("attempts", None)
+        reason = SOURCE.owed(rec, row, a.full)
+        if not reason:
+            continue
+        if w.running(key):
+            accounting.append(f"{key}: owed ({reason}), run still in flight")
+            continue
+        version = row[SOURCE.version_field]
+        attempts = rec.get("attempts", {})
+        count = attempts.get("count", 0) if attempts.get("fingerprint") == version else 0
+        if cfg.get("max_attempts") and count >= cfg["max_attempts"]:
+            accounting.append(f"{key}: held after {count} attempts without settling")
+            held.append(key)
+            if not a.dry_run and not attempts.get("notified"):
+                notify_watch(w, f"watch {w.name}: {key} held after {count} attempts without settling")
+                attempts["notified"] = True
+            continue
+        owed.append((key, row, reason, count + 1))
+    if SOURCE.listed_slots_only:
+        in_flight = sum(w.running(key) for key in listed)
+    else:
+        in_flight = sum(our_pid(f) is not None for f in w.runs.glob("*.pid"))
+    recent = [t for t in w.prs.get("_runs", []) if parse_time(t) > now - dt.timedelta(hours=24)]
+    started, not_started, waiting, started_urls = 0, [], [], []
+    size = cfg.get("max_items_per_run", 1)
+    for offset in range(0, len(owed), size):
+        batch = owed[offset:offset + size]
+        cap = cfg.get("max_runs_per_day")
+        if in_flight + started >= cfg["max_parallel"] or (cap and len(recent) + started >= cap):
+            for key, row, reason, attempt in batch:
+                accounting.append(f"{key}: owed ({reason}), waiting for a free slot")
+                waiting.append([key, reason])
+            continue
+        if a.dry_run:
+            accounting.extend(f"{key}: would start a run ({reason})" for key, _, reason, _ in batch)
+            continue
+        key = batch[0][0]
+        try:
+            if cfg.get("prepare_cmd"):
+                shell_command(cfg["prepare_cmd"], cfg["run_dir"])
+            brief = SOURCE.brief(w, batch, listed, now)
+            log = spawn(w, key, brief)
+        except (OSError, ScanError, subprocess.SubprocessError) as e:
+            not_started.append(key)
+            for k, _, reason, _ in batch:
+                accounting.append(f"{k}: owed ({reason}), run FAILED to start ({e})")
+            continue
+        for k, row, reason, attempt in batch:
+            rec = w.prs[k]
+            run = {"started": iso(now), SOURCE.version_field: row[SOURCE.version_field], "reason": reason,
+                   "recheck": list(rec.get("recheck", []))}
+            if cfg.get("source_cmd"):
+                run["run_key"] = key
+                rec["attempts"] = {"fingerprint": row[SOURCE.version_field], "count": attempt}
+            if log is not None:
+                run["log"] = log
+            rec["last_run"] = run
+            started_urls.append(k)
+            accounting.append(f"{k}: started a run ({reason})")
+        started += 1
+    if not a.dry_run:
+        SOURCE.finish(w, finished, accounting)
+        if cfg.get("source_cmd"):
+            w.prs["_runs"] = recent + [iso(now)] * started
+    for line in accounting:
+        w.log(line)
+        print(line)
+    unread = w.prs.get("_unread", {})
+    if not a.dry_run:
+        if all_unread:
+            unread = {"ticks": unread.get("ticks", 0) + 1, "since": unread.get("since") or iso(now)}
+            w.prs["_unread"] = unread
+        else:
+            w.prs.pop("_unread", None)
+    problem = None
+    if not SOURCE.targets(w):
+        problem = f"watch {w.name}: nothing left to watch; run `{TOOL} uninstall {w.name}`"
+    elif all_unread and unread.get("ticks", 0) >= UNREAD_TICKS_BEFORE_ALERT:
+        problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `{TOOL} status {w.name}`"
+    elif not_started:
+        kind = "" if cfg.get("source_cmd") else "review "
+        problem = f"watch {w.name}: {len(not_started)} {kind}run(s) failed to start; see `{TOOL} status {w.name}`"
+    if problem:
+        print(problem)
+    if not a.dry_run:
+        kept_urls = set(listed) | {k for k in (w.prs.get("_tick") or {}).get("kept_urls", [])
+                                   if any(SOURCE.covers(spec, k) for spec in failed)}
+        w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
+                          "waiting": waiting, "kept_urls": sorted(kept_urls)}
+        if cfg.get("source_cmd"):
+            w.prs["_tick"].update(accounting=accounting, held=held)
+        alert = w.prs.setdefault("_alert", {})
+        same_problem = problem and alert.get("problem") == problem
+        since = (alert.get("since") or iso(now)) if same_problem else iso(now)
+        if all_unread and problem:
+            since = unread["since"]
+        if problem and not same_problem:
+            notify_watch(w, problem)
+        alert.clear()
+        if problem:
+            alert.update(problem=problem, since=since)
+        w.save()
+    return 5 if failed or not_started else 0
+
+
+def finish_settle(w, key, record, log_line, message, rechecks=()):
+    rec = w.prs.setdefault(key, {})
+    done = list((rec.get("last_run") or {}).get("recheck", []))
+    left = []
+    for entry in rec.get("recheck", []):
+        if entry in done:
+            done.remove(entry)
+        else:
+            left.append(entry)
+    if left:
+        rec["recheck"] = left
+    else:
+        rec.pop("recheck", None)
+    for target, entry in rechecks:
+        entries = w.prs.setdefault(target, {}).setdefault("recheck", [])
+        if entry not in entries:
+            entries.append(entry)
+    rec["settled"] = record
+    w.save()
+    w.log(log_line)
+    print(message)
+    return 0
+
+
+def claude_env(config_dir):
+    """The environment a run gets: the CLI's own login, or the one in config_dir."""
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def claude_auth_status(config_dir=None):
+    p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30,
+                       env=claude_env(config_dir))
+    return json.loads(p.stdout)
+
+
+def claude_logged_in(config_dir=None):
+    """Whether the claude CLI has a login in config_dir (None: its default one), read once per
+    process. Its login is separate from the desktop app's, and a logged-out CLI fails every run
+    in its first second, so the tick checks before starting any. An unreadable status is not
+    taken as logged out: the run's own log says why."""
+    if config_dir not in _logged_in:
+        try:
+            _logged_in[config_dir] = claude_auth_status(config_dir).get("loggedIn") is not False
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            _logged_in[config_dir] = True
+    return _logged_in[config_dir]
+
+
+def codex_logged_in():
+    """Cache the CLI login per process; an unreadable status must not block runs."""
+    global _codex_logged_in
+    if _codex_logged_in is None:
+        try:
+            p = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30,
+                               env=claude_env(None))
+            _codex_logged_in = p.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _codex_logged_in = True
+    return _codex_logged_in
+
+
+def prune_runs(directory):
+    with contextlib.suppress(OSError):
+        if directory.is_symlink():
+            return
+        runs = {}
+        for path in directory.iterdir():
+            match = re.fullmatch(r"(\d{8}T\d{6}Z)(?:-(\d+))?\.(?:brief\.md|jsonl|last\.md)", path.name)
+            if match:
+                key = (match[1], int(match[2] or 1))
+                runs.setdefault(key, []).append(path)
+        for key in sorted(runs, reverse=True)[RUNS_TO_KEEP:]:
+            for path in runs[key]:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+
+
+def prune_idle_runs(w, now):
+    cutoff = (now - dt.timedelta(days=RUN_RETENTION_DAYS)).timestamp()
+    with contextlib.suppress(OSError):
+        for directory in w.runs.iterdir():
+            with contextlib.suppress(OSError):
+                if directory.is_symlink() or not directory.is_dir():
+                    continue
+                if our_pid(w.runs / f"{directory.name}.pid") is not None:
+                    continue
+                files = list(directory.iterdir())
+                if not files or max(path.lstat().st_mtime for path in files) >= cutoff:
+                    continue
+                for path in files:
+                    if path.name.endswith(".pid"):
+                        continue
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                directory.rmdir()
+
+
+def spawn_run(w, url, brief):
+    cfg = w.config
+    runner = w.runner
+    if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
+        raise FileNotFoundError(f"{runner} is not on PATH")
+    if runner == "codex":
+        if not codex_logged_in():
+            raise PermissionError("the codex CLI is logged out; run `codex login`")
+    else:
+        account = cfg.get("claude_config")
+        if not claude_logged_in(account):
+            login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
+            raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+    slug = w.slug(url)
+    directory = w.runs / slug
+    directory.mkdir(parents=True, exist_ok=True)
+    stamp = now_utc().strftime("%Y%m%dT%H%M%SZ")
+    suffix = 1
+    # Pruning can free an earlier suffix; reusing it would sort this run among the oldest.
+    for path in directory.glob(f"{stamp}*"):
+        match = re.fullmatch(rf"{stamp}(?:-(\d+))?\..+", path.name)
+        if match:
+            suffix = max(suffix, int(match[1] or 1) + 1)
+    stem = stamp if suffix == 1 else f"{stamp}-{suffix}"
+    run = directory / stem
+    brief_path, log_path = run.with_suffix(".brief.md"), run.with_suffix(".jsonl")
+    last_path = run.with_suffix(".last.md")
+    if runner == "codex":
+        cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
+               "-c", "sandbox_workspace_write.network_access=true",
+               "--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"]
+        env = claude_env(None)
+    else:
+        cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+               "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+        env = claude_env(account)
+    pidfile = w.runs / f"{slug}.pid"
+    # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
+    # start the next tick at once: runs take a minute or two, so waiting for the schedule left
+    # the slots idle most of each interval. A run shorter than CHAIN_AFTER starts none, so a
+    # run that dies on start can't spin the watch; the schedule picks it up again.
+    wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
+    try:
+        brief_path.write_text(brief)
+        with open(brief_path) as stdin, open(log_path, "w") as out:
+            p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=cfg.get("run_dir", str(w.dir)),
+                                 start_new_session=True, env=env)
+    except Exception:
+        for path in (brief_path, log_path, last_path):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        prune_runs(directory)
+        raise
+    pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
+    prune_runs(directory)
+    return str(log_path.relative_to(w.dir))
+
+
+def cron_tag(name):
+    return f"# {TOOL}:{name}"
+
+
+def owns_cron_line(line, name):
+    if line.rstrip().endswith(cron_tag(name)):
+        return True
+    # Existing manually pasted review schedules have no tag.
+    return re.search(rf"(?:^|[/\s]){re.escape(TOOL)} tick {re.escape(name)}(?![\w.-])", line) is not None
+
+
+def read_crontab():
+    try:
+        p = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except OSError as e:
+        raise ScanError(str(e)) from e
+    if p.returncode and "no crontab" not in p.stderr.lower():
+        raise ScanError(p.stderr.strip() or f"crontab -l exited {p.returncode}")
+    return p.stdout if not p.returncode else ""
+
+
+def write_crontab(text):
+    try:
+        p = subprocess.run(["crontab", "-"], input=text, capture_output=True, text=True)
+    except OSError as e:
+        raise ScanError(str(e)) from e
+    if p.returncode:
+        raise ScanError(p.stderr.strip() or f"crontab - exited {p.returncode}")
+
+
+def is_scheduled(name):
+    """A launchd agent on a Mac; elsewhere this watch's entry in the user's crontab."""
+    if sys.platform == "darwin":
+        return plist_path(name).exists()
+    try:
+        return any(owns_cron_line(line, name) for line in read_crontab().splitlines())
+    except ScanError:
+        return False
+
+
+def schedule_status(w):
+    return ("scheduled" if is_scheduled(w.name) else "not scheduled") + (", paused" if w.paused else "")
+
+
+def cmd_list(a):
+    """Every watch on this machine: its targets, reviewer, schedule, runs in flight and any problem."""
+    watches = sorted(d.parent.name for d in HOME.glob("*/config.json"))
+    if not watches:
+        print(f"no watches in {HOME}; create one with `{TOOL} init`")
+        return 0
+    for name in watches:
+        w = Watch(name).load()
+        cfg = w.config
+        scheduled = schedule_status(w)
+        running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
+        print(f"{name}: reviewer {w.runner} {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
+              + (f", account {cfg['claude_config']}" if cfg.get("claude_config") and w.runner == "claude" else ""))
+        for line in SOURCE.describe(w, detail=False):
+            print(line)
+        problem = w.prs.get("_alert", {}).get("problem")
+        if problem:
+            print(f"  PROBLEM since {w.prs['_alert']['since']}: {problem}")
+    return 0
+
+
+def cmd_account(a):
+    """Show or switch the Claude account a watch's runs use: a config directory with its own
+    login (`claude auth login` under CLAUDE_CONFIG_DIR), or `default`, the CLI's own login.
+    Runs already going finish on the account they started with."""
+    w = Watch(a.watch)
+    cfg = w.load().config
+    if w.runner == "codex":
+        if a.config is not None:
+            raise SystemExit("Codex runs use the codex CLI's own login; run `codex login`")
+        print(f"watch {a.watch}: the codex CLI login")
+        return 0
+    if a.config is None:
+        print(f"watch {a.watch}: {cfg.get('claude_config') or 'default'}")
+        return 0
+    target = None
+    if a.config != "default":
+        target = str(Path(a.config).expanduser().resolve())
+        d, home = Path(target), Path("~/.claude").expanduser()
+        if d == home.resolve():
+            raise SystemExit("that is the default login's directory; use `default` instead")
+        d.mkdir(parents=True, exist_ok=True)
+        for name in SHARED:
+            link, src = d / name, home / name
+            if src.exists() and not link.exists() and not link.is_symlink():
+                link.symlink_to(src)
+                print(f"linked {link} -> {src}")
+    try:
+        status = claude_auth_status(target)
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        status = {"error": str(e)}
+    with w.locked() as w:
+        w.config["claude_config"] = target
+        write_json(w.dir / "config.json", w.config)
+    who = f"{status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})"
+    print(f"watch {a.watch}: runs from now on use {target or 'the default login'}")
+    if status.get("loggedIn"):
+        print(f"  logged in as {who}")
+    else:
+        login = f"CLAUDE_CONFIG_DIR={target} claude auth login" if target else "claude auth login"
+        print(f"  not logged in yet: run `{login}`; until then the tick reports its runs as failing to start")
+    return 0
+
+
+def cmd_model(a):
+    """Show or change the model and effort a watch's runs use. Runs already going keep theirs."""
+    w = Watch(a.watch)
+    runner = runner_for_model(a.model) if a.model is not None else None
+    if a.model is None and a.effort is None:
+        cfg = w.load().config
+        print(f"watch {a.watch}: reviewer {w.runner} {cfg['reviewer_model']} at {cfg['effort']} effort")
+        return 0
+    with w.locked() as w:
+        set_runner(w.config, runner if runner is not None else w.runner)
+        if a.model:
+            w.config["reviewer_model"] = a.model
+        if a.effort:
+            w.config["effort"] = a.effort
+        write_json(w.dir / "config.json", w.config)
+    print(f"watch {a.watch}: runs from now on use reviewer {w.runner} {w.config['reviewer_model']} at {w.config['effort']} effort")
+    return 0
+
+
+def run_fate(w, url, rec):
+    """An ended run has no settlement after its start; status uses this in both views."""
+    run, done = rec.get("last_run") or {}, rec.get("settled")
+    if w.running(url):
+        return "running"
+    if run.get("started") and not (done and done["at"] >= run["started"]):
+        return "ended"
+    return "settled" if done else None
+
+
+def ago(t, now):
+    seconds = int((now - parse_time(t)).total_seconds() // 1)
+    mins, secs = divmod(seconds, 60)
+    return f"{mins}m {secs}s ago"
+
+
+def cmd_status(a, limit=15):
+    if a.watch is None:
+        return cmd_list(a)
+    w = Watch(a.watch).load()
+    cfg, now = w.config, now_utc()
+    account = "the codex CLI login" if w.runner == "codex" else cfg.get("claude_config") or "the claude CLI default login"
+    print(f"account: {account}")
+    print(f"watch {w.name}: reviewer {w.runner} {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
+          f"{SOURCE.policy(w)}{schedule_status(w)}")
+    for line in SOURCE.describe(w, detail=True):
+        print(line)
+    if cfg.get("source_cmd"):
+        recent = [t for t in w.prs.get("_runs", []) if parse_time(t) > now - dt.timedelta(hours=24)]
+        print(f"runs in last 24h: {len(recent)} / {cfg.get('max_runs_per_day') or 'unlimited'}")
+    logs_root = w.runs.resolve()
+    print(f"logs root: {logs_root}")
+    if w.prs.get("_alert", {}).get("problem"):
+        print(f"PROBLEM since {w.prs['_alert']['since']}: {w.prs['_alert']['problem']}")
+    prs = {u: r for u, r in w.prs.items() if not u.startswith("_")}
+    tick = w.prs.get("_tick")
+    if tick:
+        print(f"last tick {tick['at']} ({ago(tick['at'], now)}): {tick['kept']} {SOURCE.noun} kept, {tick['started']} started, "
+              f"{len(tick['waiting'])} waiting for a slot")
+        # What became of the runs it started: they often settle within minutes, before anyone looks.
+        for url in tick.get("started_urls", []):
+            rec = prs.get(url, {})
+            run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
+            if fate == "running":
+                fate = f"running for {ago(run['started'], now)[:-4]}"
+            elif fate == "settled":
+                fate = f"settled {done.get('verdict', '')} at {done['at']}".replace("  ", " ")
+            else:
+                fate = "ended without settling"
+            print(f"  started {url}: {fate}")
+    kept = set(tick["kept_urls"]) if tick and "kept_urls" in tick else None
+    running, ended, settled = [], [], []
+    for url, rec in sorted(prs.items()):
+        run, done, fate = rec.get("last_run") or {}, rec.get("settled"), run_fate(w, url, rec)
+        log = (w.dir / run.get("log", f"runs/{w.slug(url)}.jsonl")).resolve()
+        log = os.path.relpath(log, logs_root)
+        if fate == "running":
+            running.append(f"{url}: started {run.get('started')} ({ago(run['started'], now)}) for {run.get('reason')}; "
+                           f"log {log}")
+        elif fate == "ended" and (kept is None or url in kept):
+            ended.append(f"{url}: run started {run['started']} ended without settling; log {log}")
+        elif fate == "settled":
+            settled.append((done["at"], f"{url}: {done.get('verdict', 'settled')} at {done[SOURCE.version_field][:12]}, {done['at']}"
+                            + (", recheck pending" if rec.get("recheck") else "")))
+    if cfg.get("source_cmd"):
+        for line in (tick or {}).get("accounting", []):
+            print(f"  {line}")
+    busy = {u for u, r in prs.items() if w.running(u) or (r.get("settled") and tick and r["settled"]["at"] >= tick["at"])}
+    waiting = [f"{u}: {why}" for u, why in (tick or {}).get("waiting", []) if u not in busy]
+    settled = [line for _, line in sorted(settled, reverse=True)]
+
+    def section(title, lines):
+        if not lines:
+            return
+        print(f"{title} ({len(lines)}):")
+        for line in lines[:limit]:
+            print(f"  {line}")
+        if len(lines) > limit:
+            print(f"  … and {len(lines) - limit} more")
+
+    section("running", running)
+    section("waiting for a slot", waiting)
+    section("ended without settling", ended)
+    section("settled, newest first", settled)
+    return 0
+
+
+def plist_path(name):
+    return Path("~/Library/LaunchAgents").expanduser() / f"com.github.tycooon.{TOOL}.{name}.plist"
+
+
+def cmd_install(a):
+    w = Watch(a.watch).load()
+    exe = Path(sys.argv[0]).resolve()
+    command = [str(exe), "tick", w.name]
+    if w.config.get("source_cmd"):
+        command = ["env", f"AGENT_WATCH_HOME={w.dir.parent.resolve()}", *command]
+    script = "exec " + shlex.join(command)
+    if sys.platform != "darwin":
+        log = shlex.quote(str(w.dir / "cron.log"))
+        line = (f"*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)} >> {log} 2>&1 "
+                f"{cron_tag(w.name)}")
+        tab = read_crontab()
+        kept = [entry for entry in tab.splitlines(keepends=True) if not owns_cron_line(entry, w.name)]
+        text = "".join(kept)
+        text += ("\n" if text and not text.endswith("\n") else "") + line + "\n"
+        if text != tab:
+            write_crontab(text)
+        print(f"installed crontab entry for {w.name}: a tick every {max(1, a.interval // 60)} minute(s)")
+        return 0
+    plist = plist_path(w.name)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.github.tycooon.{TOOL}.{w.name}</string>
+  <key>ProgramArguments</key><array><string>/bin/zsh</string><string>-lc</string><string>{script}</string></array>
+  <key>StartInterval</key><integer>{a.interval}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>{w.dir / "launchd.log"}</string>
+  <key>StandardErrorPath</key><string>{w.dir / "launchd.log"}</string>
+</dict></plist>
+""")
+    subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+    subprocess.run(["launchctl", "load", str(plist)], check=True)
+    print(f"installed {plist}: a tick every {a.interval}s, the first one now")
+    return 0
+
+
+def cmd_uninstall(a):
+    w = Watch(a.watch).load()
+    if sys.platform == "darwin":
+        plist = plist_path(w.name)
+        if plist.exists():
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            plist.unlink()
+    else:
+        tab = read_crontab()
+        text = "".join(line for line in tab.splitlines(keepends=True) if not owns_cron_line(line, w.name))
+        if text != tab:
+            write_crontab(text)
+    for pidfile in w.runs.glob("*.pid"):
+        pid = our_pid(pidfile)
+        if pid is None:
+            continue
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    print(f"uninstalled watch {w.name}; its state stays in {w.dir}")
+    return 0
+
+
+def shell_command(command, directory, data=None):
+    try:
+        p = subprocess.run(command, shell=True, cwd=directory, input=json.dumps(data) if data is not None else None,
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ScanError(str(e)) from e
+    if p.returncode:
+        raise ScanError((p.stderr or p.stdout).strip() or f"command exited {p.returncode}")
+    return p.stdout
+
+
+def notify_watch(w, message):
+    notify(message)
+    if w.config.get("notify_cmd"):
+        try:
+            subprocess.run(w.config["notify_cmd"], shell=True, cwd=w.config["run_dir"], input=message + "\n",
+                           capture_output=True, text=True, timeout=120, check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            w.log(f"notification command failed: {e}")
+
+
+class CommandSource:
+    listed_slots_only = False
+    version_field = "fingerprint"
+    noun = "items"
+
+    def targets(self, w):
+        return [w.config["source_cmd"]]
+
+    def invoke(self, w, verb, data):
+        return shell_command(w.config["source_cmd"] + " " + verb, w.config["run_dir"], data)
+
+    def list(self, w, now):
+        target = w.config["source_cmd"]
+        try:
+            settled = {k: r["settled"] for k, r in w.prs.items() if not k.startswith("_") and "settled" in r}
+            result = json.loads(self.invoke(w, "list", {"settled": settled}))
+            rows = result["items"]
+            if not isinstance(rows, list):
+                raise ValueError("items must be an array")
+            listed = {}
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("key"), str) or not row["key"]
+                        or row["key"].startswith("_") or not isinstance(row.get("fingerprint"), str)
+                        or not isinstance(row.get("title"), str) or not isinstance(row.get("payload"), dict)):
+                    raise ValueError("items need a nonempty key (not starting with '_'), fingerprint, title and object payload")
+                if row["key"] in listed:
+                    raise ValueError(f"duplicate key: {row['key']}")
+                listed[row["key"]] = row
+        except (ScanError, ValueError, KeyError, TypeError) as e:
+            return {}, [target], [f"{target}: UNREAD ({e})"], []
+        w.prs["_items"] = listed
+        return listed, [], [f"{target}: {len(rows)} listed, {len(rows)} kept"], []
+
+    def finish(self, w, finished, accounting):
+        pass
+
+    def owed(self, rec, row, full):
+        if full:
+            return "full pass"
+        if rec.get("recheck"):
+            return "recheck: " + "; ".join(rec["recheck"])
+        if "settled" not in rec:
+            return "never settled by this watch"
+        if rec["settled"]["fingerprint"] != row["fingerprint"]:
+            return "new fingerprint " + row["fingerprint"]
+        return None
+
+    def brief(self, w, batch, listed, now):
+        items = [row for _, row, _, _ in batch]
+        data = {"watch": w.name, "items": items, "settled": {k: w.prs[k].get("settled") for k, _, _, _ in batch},
+                "run_started": iso(now), "attempt": max(attempt for _, _, _, attempt in batch)}
+        text = self.invoke(w, "brief", data)
+        footer = ["", f"Run start time: {iso(now)}", "End by settling each completed item:"]
+        exe = str(Path(__file__).resolve())
+        for row in items:
+            footer.append("  " + shlex.join([exe, "settle", w.name, row["key"], "--fingerprint", row["fingerprint"]])
+                          + " --verdict <verdict> [--meta '<JSON>']")
+        return text.rstrip() + "\n" + "\n".join(footer) + "\n"
+
+    def verify(self, w, a):
+        row = w.prs.get("_items", {}).get(a.key)
+        if row is None or row["fingerprint"] != a.fingerprint:
+            print(f"refused: fingerprint is now {row['fingerprint'] if row else 'unlisted'}, not {a.fingerprint}; the next tick handles it")
+            return 3
+        try:
+            self.invoke(w, "verify", {"key": a.key, "fingerprint": a.fingerprint, "verdict": a.verdict,
+                                      "meta": a.meta, "item": row})
+        except ScanError as e:
+            print(f"refused: {e}", file=sys.stderr)
+            return 6
+        return 0
+
+    def covers(self, spec, key):
+        return True
+
+    def describe(self, w, detail):
+        yield f"source command: {w.config['source_cmd']}"
+        yield f"run dir: {w.config['run_dir']}"
+
+    def policy(self, w):
+        return ""
+
+
+SOURCE = CommandSource()
+
+
+def cmd_init(a):
+    w = Watch(a.watch)
+    directory = Path(a.run_dir).expanduser().resolve()
+    if not directory.is_dir():
+        raise SystemExit(f"not a run directory: {directory}")
+    config = initialize_watch(w, a, {"source_cmd": a.source_cmd, "run_dir": str(directory),
+                                     "prepare_cmd": a.prepare_cmd, "notify_cmd": a.notify_cmd,
+                                     "max_items_per_run": a.max_items_per_run,
+                                     "max_runs_per_day": a.max_runs_per_day, "max_attempts": a.max_attempts})
+    print(f"watch {w.name}: command source, reviewer {config['runner']} {config['reviewer_model']} at {a.effort} effort, state in {w.dir}")
+    return 0
+
+
+def cmd_settle(a):
+    with Watch(a.watch).locked() as w:
+        refusal = SOURCE.verify(w, a)
+        if refusal:
+            return refusal
+        record = {"fingerprint": a.fingerprint, "verdict": a.verdict, "meta": a.meta, "at": iso(now_utc())}
+        return finish_settle(w, a.key, record, f"{a.key}: settled at {a.fingerprint} ({a.verdict})", f"settled {a.key}")
+
+
+def cmd_recheck(a):
+    if not a.key or a.key.startswith("_"):
+        raise SystemExit("a key must be nonempty and must not start with '_'")
+    with Watch(a.watch).locked() as w:
+        rec = w.prs.setdefault(a.key, {})
+        rec.setdefault("recheck", []).append(a.reason)
+        rec.pop("attempts", None)
+        w.save()
+        w.log(f"{a.key}: recheck queued ({a.reason})")
+    print(f"recheck queued for {a.key}")
+    return 0
+
+
+def positive(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    i = sub.add_parser("init")
+    i.add_argument("watch")
+    i.add_argument("--source-cmd", required=True)
+    i.add_argument("--run-dir", required=True)
+    i.add_argument("--prepare-cmd")
+    i.add_argument("--notify-cmd")
+    i.add_argument("--max-items-per-run", type=positive, default=1)
+    i.add_argument("--max-runs-per-day", type=positive)
+    i.add_argument("--max-attempts", type=positive)
+    i.add_argument("--max-parallel", type=positive, default=1)
+    i.add_argument("--reviewer-model")
+    i.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"], default="medium")
+    t = sub.add_parser("tick")
+    t.add_argument("watch")
+    t.add_argument("--full", action="store_true")
+    t.add_argument("--only")
+    t.add_argument("--dry-run", action="store_true")
+    t.add_argument("--chained", action="store_true")
+    s = sub.add_parser("settle")
+    s.add_argument("watch")
+    s.add_argument("key")
+    s.add_argument("--fingerprint", required=True)
+    s.add_argument("--verdict", required=True)
+    s.add_argument("--meta", type=json.loads, default={})
+    r = sub.add_parser("recheck")
+    r.add_argument("watch")
+    r.add_argument("key")
+    r.add_argument("--reason", required=True)
+    sub.add_parser("list")
+    sub.add_parser("status").add_argument("watch", nargs="?")
+    for command in ("pause", "resume", "uninstall"):
+        sub.add_parser(command).add_argument("watch")
+    ins = sub.add_parser("install")
+    ins.add_argument("watch")
+    ins.add_argument("--interval", type=positive, default=120)
+    mod = sub.add_parser("model")
+    mod.add_argument("watch")
+    mod.add_argument("model", nargs="?")
+    mod.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    acc = sub.add_parser("account")
+    acc.add_argument("watch")
+    acc.add_argument("config", nargs="?")
+    a = p.parse_args(argv)
+    try:
+        return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "recheck": cmd_recheck,
+                "list": cmd_list, "status": cmd_status, "pause": cmd_pause_resume, "resume": cmd_pause_resume,
+                "install": cmd_install, "uninstall": cmd_uninstall, "model": cmd_model, "account": cmd_account}[a.cmd](a)
+    except ScanError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 5
+
+
+if __name__ == "__main__":
+    sys.exit(main())
