@@ -5,7 +5,7 @@ description: "Hand a coding task to a headless Claude Code session on a remote d
 
 # Run a Remote Claude Session
 
-The user asked for a Claude session on a remote dev host, or your machine rules send the repository's coding work there. It works like a Codex session: a headless Claude Code (`claude -p`) on HOST writes the code, you review it and resume the same session until its PR is ready, and you make none of the changes yourself. A running session counts as a subagent toward any limit your instructions put on running them in parallel.
+The user asked for a Claude session on a remote dev host, your machine rules send the repository's coding work there, or a Codex run hit its usage limit (codex's *Out of usage limits*). It works like a Codex session: a headless Claude Code (`claude -p`) on HOST writes the code, you review it and resume the same session until its PR is ready, and you make none of the changes yourself. A running session counts as a subagent toward any limit your instructions put on running them in parallel.
 
 Follow [codex](../codex/SKILL.md) from start to finish, with its *On a remote host* section, and swap in Claude's commands as below. Everything codex says about the brief, overlapping PRs, the worktree, mockups, review, resumes and finishing holds unchanged.
 
