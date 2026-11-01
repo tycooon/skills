@@ -38,6 +38,7 @@ refuses with exit 6 and the command's stderr. A fingerprint different from the l
 listing, or a key absent from it, refuses with exit 3 without calling verify. A listed
 key can settle even if it was not in that run's batch. A successful settle stores
 {"fingerprint", "verdict", "meta", "at"}; meta defaults to {} and may be any JSON value.
+Items removed from the listing or replaced by a placeholder carrying their prior settled fingerprint remain available to settle while their run is live, including every key in a batch.
 
 Each run takes up to --max-items-per-run items (default 1), in list order, and uses
 one parallel slot and one daily run. --max-parallel defaults to 1. The daily cap
@@ -887,6 +888,13 @@ class CommandSource:
     def invoke(self, w, verb, data):
         return shell_command(w.config["source_cmd"] + " " + verb, w.config["run_dir"], data)
 
+    def live_unsettled(self, w, key, row):
+        rec = w.prs.get(key, {})
+        run, done = rec.get("last_run") or {}, rec.get("settled") or {}
+        # Timestamps have second precision; a tied settlement may belong to a previous run.
+        return bool(run and w.running(key)
+                    and (done.get("fingerprint") != row["fingerprint"] or done.get("at", "") <= run["started"]))
+
     def list(self, w, now):
         target = w.config["source_cmd"]
         try:
@@ -906,7 +914,14 @@ class CommandSource:
                 listed[row["key"]] = row
         except (ScanError, ValueError, KeyError, TypeError) as e:
             return {}, [target], [f"{target}: UNREAD ({e})"], []
-        w.prs["_items"] = listed
+        items = dict(listed)
+        for key, row in w.prs.get("_items", {}).items():
+            current = listed.get(key)
+            historical = (current is not None and current["fingerprint"] != row["fingerprint"]
+                          and current["fingerprint"] == w.prs.get(key, {}).get("settled", {}).get("fingerprint"))
+            if (current is None or historical) and self.live_unsettled(w, key, row):
+                items[key] = row
+        w.prs["_items"] = items
         return listed, [], [f"{target}: {len(rows)} listed, {len(rows)} kept"], []
 
     def finish(self, w, finished, accounting):
