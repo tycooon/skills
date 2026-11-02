@@ -16,8 +16,8 @@ or ended unsuccessfully in its workflow's newest attempt (GitHub drops a cancell
 rollup), the head's oldest run is RUN_SETTLE old (to cover a run Actions creates late),
 no review thread blocks (answered non-blocking findings no longer do),
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
-On either host, a finding is non-blocking when its opening comment carries the
-"non-blocking" marker and its author and identity qualify under the verdict rules
+On either host, a finding is non-blocking when its opening comment's leading
+P2/P3 severity tag carries the "non-blocking" marker and its author and identity qualify under the verdict rules
 (--reviewer, or an AI identity line without it). On GitHub, a thread opened by an
 APPROVED review also remains non-blocking for compatibility.
 
@@ -49,8 +49,8 @@ resolvable discussion resolved except answered non-blocking findings, the head p
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
 a conflict nor need_rebase. Formal approval system notes inherit the signature
 and SHA of the nearest unpaired same-account verdict note; an unpaired system
-approval remains unsigned. A discussion whose first note carries the same
-"non-blocking" marker and qualifying reviewer identity stops blocking once answered.
+approval remains unsigned. A discussion whose first note carries the same leading
+P2/P3 non-blocking tag and qualifying reviewer identity stops blocking once answered.
 It counts as a finding of the verdict its reviewer posted with or after it, even if
 GitLab has re-anchored the note to a later commit.
 
@@ -447,7 +447,7 @@ GL_MERGE = {
 GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
 # The statuses with which GitLab says the pipeline still gates the merge.
 GL_CI_GATING = {"ci_must_pass", "ci_still_running"}
-NON_BLOCKING = re.compile(r"non[- ]blocking", re.I)
+NON_BLOCKING = re.compile(r"^\W*\[\s*P[23]\b[^\]]*\bnon[- ]blocking\b[^\]]*\]", re.I)
 VERDICT_NOTE = re.compile(r"^[\s*_#>`]*APPROVED\b")
 
 
