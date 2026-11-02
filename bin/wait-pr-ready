@@ -16,6 +16,10 @@ or ended unsuccessfully in its workflow's newest attempt (GitHub drops a cancell
 rollup), the head's oldest run is RUN_SETTLE old (to cover a run Actions creates late),
 no review thread blocks (answered non-blocking findings no longer do),
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
+On either host, a finding is non-blocking when its opening comment's leading
+P2/P3 severity tag carries the "non-blocking" marker and its author and identity qualify under the verdict rules
+(--reviewer, or an AI identity line without it). On GitHub, a thread opened by an
+APPROVED review also remains non-blocking for compatibility.
 
 Exit codes:
   0  ready; the line ends with the PR's activity mark, for --after
@@ -45,8 +49,9 @@ resolvable discussion resolved except answered non-blocking findings, the head p
 merged results pipeline on the MR's merge ref), and detailed_merge_status neither
 a conflict nor need_rebase. Formal approval system notes inherit the signature
 and SHA of the nearest unpaired same-account verdict note; an unpaired system
-approval remains unsigned. A discussion whose first note says "non-blocking"
-counts as a finding of the verdict its reviewer posted with or after it, even if
+approval remains unsigned. A discussion whose first note carries the same leading
+P2/P3 non-blocking tag and qualifying reviewer identity stops blocking once answered.
+It counts as a finding of the verdict its reviewer posted with or after it, even if
 GitLab has re-anchored the note to a later commit.
 
 Options:
@@ -153,7 +158,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           originalLine
           originalStartLine
           diffSide
-          comments(first: 1) { nodes { author { login } pullRequestReview { id state } } }
+          comments(first: 1) { nodes { author { login } body pullRequestReview { id state } } }
           replies: comments(last: 1) { totalCount nodes { author { login } createdAt url } }
         }
       }
@@ -442,7 +447,7 @@ GL_MERGE = {
 GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
 # The statuses with which GitLab says the pipeline still gates the merge.
 GL_CI_GATING = {"ci_must_pass", "ci_still_running"}
-NON_BLOCKING = re.compile(r"non[- ]blocking", re.I)
+NON_BLOCKING = re.compile(r"^\W*P[23]\b\s*(?:,\s*|\(\s*)non[- ]blocking\b", re.I)
 VERDICT_NOTE = re.compile(r"^[\s*_#>`]*APPROVED\b")
 
 
@@ -506,8 +511,8 @@ def gl_mr_to_pr(mr, discussions, commit):
     """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
     when) and APPROVED verdict notes as reviews, other top-level notes as comments,
     resolvable discussions as review threads, the head pipeline as the one status check.
-    A non-blocking finding is tied to the verdict its reviewer posted with or after it, as a
-    GitHub finding belongs to the approving review that opened it."""
+    A marked non-blocking finding is tied to the verdict its reviewer posted with or after
+    it for approval carry; its marker and identity determine whether it blocks readiness."""
     reviews, comments, threads, replies = [], [], [], 0
     for d in discussions:
         notes = d.get("notes") or []
@@ -527,8 +532,8 @@ def gl_mr_to_pr(mr, discussions, commit):
             threads.append({
                 "isResolved": all(n.get("resolved") for n in resolvable),
                 "path": path, "line": line_last, "originalLine": line_last, "originalStartLine": line_first, "diffSide": side,
-                "comments": {"nodes": [{"author": gl_user(first.get("author")), "pullRequestReview": {
-                    "id": None, "state": "APPROVED" if NON_BLOCKING.search(first.get("body") or "") else "COMMENTED"}}]},
+                "comments": {"nodes": [{"author": gl_user(first.get("author")), "body": first.get("body") or "",
+                    "pullRequestReview": {"id": None, "state": "COMMENTED"}}]},
                 "replies": {"totalCount": len(human), "nodes": [{"author": gl_user(last.get("author")),
                     "createdAt": last["created_at"], "url": f"{mr['web_url']}#note_{last['id']}" if mr.get("web_url") else None}]},
                 "_opened": (first.get("author") or {}).get("username"), "_at": first["created_at"],
@@ -547,7 +552,7 @@ def gl_mr_to_pr(mr, discussions, commit):
     gl_attribute_approvals(reviews, verdict_notes)
     for t in threads:
         opener = t["comments"]["nodes"][0]["pullRequestReview"]
-        if opener["state"] == "APPROVED":
+        if NON_BLOCKING.search(thread_opener(t)["body"]):
             owner = next((r for r in verdict_notes if (r["author"] or {}).get("login") == t["_opened"]
                           and ts(r["submittedAt"]) >= ts(t["_at"])), None)
             opener["id"] = owner["id"] if owner else None
@@ -782,9 +787,11 @@ def thread_last(t):
     return thread_comment(t, "replies")
 
 
-def non_blocking(t):
-    """A thread an approving review opened: review-pr's P2/P3 findings on a head it approved."""
-    return ((thread_opener(t).get("pullRequestReview") or {}).get("state")) == "APPROVED"
+def non_blocking(t, reviewers):
+    opener = thread_opener(t)
+    body = opener.get("body") or ""
+    return ((opener.get("pullRequestReview") or {}).get("state") == "APPROVED"
+            or (bool(NON_BLOCKING.search(body)) and counts_as_verdict(opener.get("author"), body, reviewers)))
 
 
 def answered(t):
@@ -795,10 +802,10 @@ def answered(t):
     return replies.get("totalCount", 0) > 1 and (last.get("author") or {}).get("login") != opener
 
 
-def blocking_threads(pr):
+def blocking_threads(pr, reviewers=()):
     """Unresolved threads that hold the merge. A non-blocking finding stops holding it
     once the author has answered it, by a fix or by declining."""
-    return sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"] and not (non_blocking(t) and answered(t)))
+    return sum(1 for t in pr["reviewThreads"]["nodes"] if not t["isResolved"] and not (non_blocking(t, reviewers) and answered(t)))
 
 
 def owed_threads(pr, after):
@@ -883,7 +890,7 @@ def only_approvals(pr, seen, *, no_ci, reviewers, same_authored_lines, hunks_bet
     unlisted account still wakes it: a session reviewer posts plain comments, so
     such an approval more likely means `--reviewer` names the wrong account.
     """
-    unresolved = blocking_threads(pr)
+    unresolved = blocking_threads(pr, reviewers)
     fresh = [p for p in posts(pr) if p[0] not in seen and not is_thread_reply(p[2], p[4])]
     if unresolved:
         return False
@@ -973,7 +980,7 @@ def evaluate(pr, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
         approval_state(pr, reviewers, same_authored_lines, hunks_between),
         checks_state(pr, no_ci),
     ]
-    unresolved = blocking_threads(pr)
+    unresolved = blocking_threads(pr, reviewers)
     gates.append((unresolved == 0, f"{unresolved} unresolved threads"))
     mergeable, status = pr["mergeable"], pr["mergeStateStatus"]
     gates.append((mergeable == "MERGEABLE" and status in MERGEABLE_STATES, f"mergeable={mergeable}/{status}"))
@@ -1114,7 +1121,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         ready, reasons = evaluate(pr, **gates)
         state["checks_only"] = not ready and approval_state(
             pr, gates["reviewers"], gates["same_authored_lines"], gates["hunks_between"]
-        )[0] and blocking_threads(pr) == 0 and has_checks(pr) and checks_still_running(pr)
+        )[0] and blocking_threads(pr, gates["reviewers"]) == 0 and has_checks(pr) and checks_still_running(pr)
         runs_failed = []
         if ready and not args.no_ci:
             running, runs_failed, oldest = host["head_runs"](head)
