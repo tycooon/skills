@@ -186,7 +186,7 @@ class GitLab(unittest.TestCase):
 
     def test_an_answered_non_blocking_finding_does_not_hold_the_mr(self):
         approved = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}
-        nit = {"notes": [gl_note(2, "review-bot", "[P3, non-blocking] Rename", resolvable=True),
+        nit = {"notes": [gl_note(2, "review-bot", "P3 (non-blocking): rename", resolvable=True),
                          gl_note(3, "dev", "Done", resolvable=True)]}
         self.assertTrue(evaluate(gl_pr(discussions=[approved, nit]), reviewers=["review-bot"])[0])
 
@@ -209,7 +209,7 @@ class GitLab(unittest.TestCase):
 
     def test_gitlab_findings_carry_across_files_and_reanchoring(self):
         verdict = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {OLD} — AI reviewer: Claude")]}
-        nit = gl_note(2, "review-bot", "[P3, non-blocking] Rename", at="2026-10-15T09:59:00Z", resolvable=True)
+        nit = gl_note(2, "review-bot", "P3 (non-blocking): rename", at="2026-10-15T09:59:00Z", resolvable=True)
         nit["position"] = {"new_path": "src/a.rs", "new_line": 40, "head_sha": OLD}
         for anchor in (OLD, HEAD, None):
             for resolved in (False, True):
@@ -410,6 +410,8 @@ class NonBlocking(unittest.TestCase):
                 "[P1] AI reviewer: Codex. This is not a non-blocking nit: the retry loses data.",
                 "[P1, non-blocking] AI reviewer: Codex. The retry loses data.",
                 "[P2] AI reviewer: Codex. This is not a non-blocking nit.",
+                "[P2] This is not a non-blocking nit.",
+                "P2 This is not a non-blocking nit.",
                 "AI reviewer: Codex. Example: [P3, non-blocking]",
             ):
                 with self.subTest(host=host, body=body):
@@ -421,7 +423,9 @@ class NonBlocking(unittest.TestCase):
         for host in ("GitHub", "GitLab"):
             for body in ("[P3, non-blocking] AI reviewer: Codex. Rename this.",
                          "**[P3, non-blocking]** AI reviewer: Codex. Rename this.",
-                         "[p3, non blocking] AI reviewer: Codex. Rename this."):
+                         "[p3, non blocking] AI reviewer: Codex. Rename this.",
+                         "P3 (non-blocking): rename",
+                         "**P2, non-blocking.** Rename"):
                 with self.subTest(host=host, body=body):
                     ready, reasons = evaluate(self.marked_pr(host, "review-bot", body), reviewers=["review-bot"])
                     self.assertTrue(ready, reasons)
@@ -632,7 +636,7 @@ class Loop(unittest.TestCase):
 
     def test_a_gitlab_owed_discussion_carries_author_time_and_url(self):
         last_at = "2026-10-15T10:05:00Z"
-        discussion = {"notes": [gl_note(1, "review-bot", "[P3, non-blocking] Consider this", resolvable=True),
+        discussion = {"notes": [gl_note(1, "review-bot", "non-blocking: consider this", resolvable=True),
                                  gl_note(2, "author", "Answered", at="2026-10-15T10:04:00Z"),
                                  gl_note(3, "review-bot", "Please clarify", at=last_at),
                                  gl_note(4, "author", "system update", at="2026-10-15T10:06:00Z", system=True)]}

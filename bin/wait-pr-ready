@@ -447,7 +447,7 @@ GL_MERGE = {
 GL_PIPELINE = {"success": "SUCCESS", "skipped": "SUCCESS", "failed": "FAILURE", "canceled": "CANCELLED"}
 # The statuses with which GitLab says the pipeline still gates the merge.
 GL_CI_GATING = {"ci_must_pass", "ci_still_running"}
-NON_BLOCKING = re.compile(r"^\W*\[\s*P[23]\b[^\]]*\bnon[- ]blocking\b[^\]]*\]", re.I)
+NON_BLOCKING = re.compile(r"^\W*P[23]\b\s*(?:,\s*|\(\s*)non[- ]blocking\b", re.I)
 VERDICT_NOTE = re.compile(r"^[\s*_#>`]*APPROVED\b")
 
 
