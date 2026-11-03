@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Choose a ready agent host by available slots, queue depth and CPU pressure."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
+import json
+import math
+import subprocess
+import sys
+
+
+PROBE_TIMEOUT = 20
+REMOTE_SCRIPT = """python3 - <<'PY'
+import json
+from pathlib import Path
+import re
+import subprocess
+
+try:
+    slots = json.loads(Path('/etc/agent-slot.json').read_text()).get('slots', 0)
+except (OSError, ValueError, AttributeError):
+    slots = 0
+status = subprocess.run(['agent-slot', 'status'], check=True, capture_output=True, text=True)
+held = sum(bool(re.match(r'^slot [0-9]+: pid\\b', line)) for line in status.stdout.splitlines())
+# Keep the pattern out of the probing shell's command line so it cannot count itself.
+processes = subprocess.run(['pgrep', '-fc', '/usr/local/bin/' + 'agent-slot'], capture_output=True, text=True)
+if processes.returncode not in (0, 1):
+    raise RuntimeError('pgrep failed')
+waiting = max(0, int(processes.stdout.strip() or '0') - held)
+some = next(line for line in Path('/proc/pressure/cpu').read_text().splitlines() if line.startswith('some '))
+cpu = float(dict(field.split('=') for field in some.split()[1:])['avg60'])
+print(json.dumps(dict(ready=(Path.home() / '.devbox-ready').is_file(), slots=slots,
+                     held=held, waiting=waiting, cpu=cpu)))
+PY
+"""
+
+
+def probe(host):
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, REMOTE_SCRIPT],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "unreachable (timeout)"
+    except OSError as error:
+        return None, f"unreachable ({error.strerror})"
+    if result.returncode:
+        return None, f"unreachable (ssh exited {result.returncode})"
+    try:
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict) or type(data["ready"]) is not bool:
+            raise ValueError
+        for field in ("slots", "held", "waiting"):
+            if type(data[field]) is not int or data[field] < 0:
+                raise ValueError
+        cpu = data["cpu"]
+        if type(cpu) not in (int, float) or not math.isfinite(cpu) or cpu < 0:
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        return None, "unusable (invalid probe output)"
+    state = "ready" if data["ready"] else "not ready"
+    return data, (f"{state}, {data['held']}/{data['slots']} held, "
+                  f"{data['waiting']} waiting, cpu {cpu:.1f}%")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("hosts", metavar="HOST", nargs="+")
+    args = parser.parse_args(argv)
+    if any(host.startswith("-") for host in args.hosts):
+        parser.error("HOST must not start with '-'")
+    with ThreadPoolExecutor(max_workers=len(args.hosts)) as pool:
+        results = list(pool.map(probe, args.hosts))
+    usable = []
+    for host, (data, diagnostic) in zip(args.hosts, results):
+        print(f"{host}: {diagnostic}", file=sys.stderr)
+        if data is not None and data["ready"] and data["slots"] > 0:
+            usable.append((host, data))
+    if not usable:
+        return 1
+
+    def free(candidate):
+        data = candidate[1]
+        return data["slots"] - data["held"] - data["waiting"]
+
+    available = [candidate for candidate in usable if free(candidate) > 0]
+
+    def rank(candidate):
+        data = candidate[1]
+        load = -free(candidate) if available else Fraction(data["held"] + data["waiting"], data["slots"])
+        return load, data["cpu"]
+
+    print(min(available or usable, key=rank)[0])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
