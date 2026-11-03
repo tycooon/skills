@@ -30,8 +30,14 @@ if processes.returncode not in (0, 1):
 waiting = max(0, int(processes.stdout.strip() or '0') - held)
 some = next(line for line in Path('/proc/pressure/cpu').read_text().splitlines() if line.startswith('some '))
 cpu = float(dict(field.split('=') for field in some.split()[1:])['avg60'])
+try:
+    login = subprocess.run(['codex', 'login', 'status'], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=15)
+    codex_login = login.returncode == 0
+except (OSError, subprocess.TimeoutExpired):
+    codex_login = False
 print(json.dumps(dict(ready=(Path.home() / '.devbox-ready').is_file(), slots=slots,
-                     held=held, waiting=waiting, cpu=cpu)))
+                     codex_login=codex_login, held=held, waiting=waiting, cpu=cpu)))
 PY
 """
 
@@ -50,8 +56,11 @@ def probe(host):
         return None, f"unreachable (ssh exited {result.returncode})"
     try:
         data = json.loads(result.stdout)
-        if not isinstance(data, dict) or type(data["ready"]) is not bool:
+        if not isinstance(data, dict):
             raise ValueError
+        for field in ("ready", "codex_login"):
+            if type(data[field]) is not bool:
+                raise ValueError
         for field in ("slots", "held", "waiting"):
             if type(data[field]) is not int or data[field] < 0:
                 raise ValueError
@@ -61,6 +70,8 @@ def probe(host):
     except (ValueError, KeyError, TypeError):
         return None, "unusable (invalid probe output)"
     state = "ready" if data["ready"] else "not ready"
+    if not data["codex_login"]:
+        state += ", codex logged out"
     return data, (f"{state}, {data['held']}/{data['slots']} held, "
                   f"{data['waiting']} waiting, cpu {cpu:.1f}%")
 
@@ -76,7 +87,7 @@ def main(argv=None):
     usable = []
     for host, (data, diagnostic) in zip(args.hosts, results):
         print(f"{host}: {diagnostic}", file=sys.stderr)
-        if data is not None and data["ready"] and data["slots"] > 0:
+        if data is not None and data["ready"] and data["codex_login"] and data["slots"] > 0:
             usable.append((host, data))
     if not usable:
         return 1
