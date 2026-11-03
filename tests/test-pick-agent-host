@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""Tests for bin/pick-agent-host. Run: tests/test-pick-agent-host"""
+
+import contextlib
+import io
+import json
+import os
+import runpy
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "pick-agent-host"
+
+STUB_SSH = r'''import json, os, pathlib, sys, time
+args = sys.argv[1:]
+if len(args) != 6 or args[:4] != ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]:
+    sys.exit(93)
+host = args[4]
+root = pathlib.Path(os.environ["STUB_ROOT"])
+fixture = json.loads((root / "fixtures.json").read_text())[host]
+(root / (host + ".call")).write_text(json.dumps(args))
+if "barrier" in fixture:
+    deadline = time.monotonic() + 3
+    while not all((root / (peer + ".call")).exists() for peer in fixture["barrier"]):
+        if time.monotonic() > deadline:
+            sys.exit(92)
+        time.sleep(0.01)
+time.sleep(fixture.get("sleep", 0))
+if fixture.get("exit", 0):
+    sys.stderr.write("connection refused\n")
+    sys.exit(fixture["exit"])
+print(fixture.get("raw", json.dumps(fixture.get("data"))))
+'''
+
+SHORT_TIMEOUT_DRIVER = '''import runpy, sys
+script, *hosts = sys.argv[1:]
+module = runpy.run_path(script, run_name="picker_test")
+assert module["PROBE_TIMEOUT"] == 20
+module["main"].__globals__["PROBE_TIMEOUT"] = 0.25
+sys.argv = [script, *hosts]
+sys.exit(module["main"]())
+'''
+
+
+def metrics(slots=6, held=0, waiting=0, cpu=0.0, ready=True):
+    return {"ready": ready, "slots": slots, "held": held, "waiting": waiting, "cpu": cpu}
+
+
+class PickerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        stub = self.root / "ssh"
+        stub.write_text("#!" + sys.executable + "\n" + STUB_SSH)
+        stub.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"],
+                        STUB_ROOT=str(self.root), PYTHONDONTWRITEBYTECODE="1")
+
+    def run_picker(self, fixtures, hosts=None, short_timeout=False):
+        (self.root / "fixtures.json").write_text(json.dumps(fixtures))
+        hosts = list(fixtures) if hosts is None else hosts
+        command = [str(SCRIPT), *hosts]
+        if short_timeout:
+            command = [sys.executable, "-c", SHORT_TIMEOUT_DRIVER, str(SCRIPT), *hosts]
+        return subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=8)
+
+    def assert_choice(self, fixtures, expected, **kwargs):
+        result = self.run_picker(fixtures, **kwargs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, expected + "\n")
+        self.assertEqual([line.split(":", 1)[0] for line in result.stderr.splitlines()],
+                         list(fixtures))
+        return result
+
+    def test_picks_most_free_slots(self):
+        result = self.assert_choice({
+            "host-a": {"data": metrics(slots=6, held=4, cpu=12.3)},
+            "host-b": {"data": metrics(slots=4, held=1, cpu=90)},
+        }, "host-b")
+        self.assertEqual(result.stderr.splitlines()[0],
+                         "host-a: ready, 4/6 held, 0 waiting, cpu 12.3%")
+
+    def test_waiting_runs_consume_free_slots(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=8, held=1, waiting=6)},
+            "host-b": {"data": metrics(slots=4, held=2)},
+        }, "host-b")
+
+    def test_free_slot_tie_uses_cpu(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=6, held=4, cpu=12.3)},
+            "host-b": {"data": metrics(slots=4, held=2, cpu=2.5)},
+        }, "host-b")
+
+    def test_free_slot_and_cpu_tie_uses_list_order(self):
+        self.assert_choice({
+            "host-b": {"data": metrics(slots=4, held=2, cpu=2.5)},
+            "host-a": {"data": metrics(slots=6, held=4, cpu=2.5)},
+        }, "host-b")
+
+    def test_unreachable_not_ready_and_zero_slot_hosts_are_skipped(self):
+        result = self.assert_choice({
+            "host-a": {"exit": 255},
+            "host-b": {"data": metrics(slots=100, ready=False)},
+            "host-c": {"data": metrics(slots=0)},
+            "host-d": {"data": metrics(slots=2, held=1)},
+        }, "host-d")
+        self.assertIn("host-a: unreachable", result.stderr)
+        self.assertIn("host-b: not ready", result.stderr)
+        self.assertIn("host-c: ready, 0/0 held", result.stderr)
+
+    def test_all_full_uses_load_ratio_instead_of_absolute_queue(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=2, held=2, waiting=1, cpu=0)},
+            "host-b": {"data": metrics(slots=8, held=8, waiting=2, cpu=99)},
+        }, "host-b")
+
+    def test_all_full_uses_held_and_waiting_in_load_ratio(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=4, held=2, waiting=6)},
+            "host-b": {"data": metrics(slots=2, held=2, waiting=1)},
+        }, "host-b")
+
+    def test_full_host_beats_overloaded_host(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=8, held=8, waiting=1)},
+            "host-b": {"data": metrics(slots=2, held=1, waiting=1, cpu=99)},
+        }, "host-b")
+
+    def test_all_full_ratio_tie_uses_cpu(self):
+        self.assert_choice({
+            "host-a": {"data": metrics(slots=2, held=2, waiting=1, cpu=12)},
+            "host-b": {"data": metrics(slots=4, held=4, waiting=2, cpu=3)},
+        }, "host-b")
+
+    def test_all_full_ratio_and_cpu_tie_uses_list_order(self):
+        self.assert_choice({
+            "host-b": {"data": metrics(slots=4, held=4, waiting=2, cpu=3)},
+            "host-a": {"data": metrics(slots=2, held=2, waiting=1, cpu=3)},
+        }, "host-b")
+
+    def test_none_usable_exits_one_without_stdout(self):
+        fixtures = {
+            "host-a": {"exit": 255},
+            "host-b": {"data": metrics(ready=False)},
+            "host-c": {"data": metrics(slots=0)},
+        }
+        result = self.run_picker(fixtures)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), len(fixtures))
+
+    def test_malformed_probe_output_is_skipped(self):
+        for raw in ("not json", "{}", "[]", json.dumps(metrics(held=-1)),
+                    json.dumps(metrics(cpu=float("nan"))), json.dumps(metrics(slots=True))):
+            with self.subTest(raw=raw):
+                self.assert_choice({
+                    "host-a": {"raw": raw},
+                    "host-b": {"data": metrics(slots=1)},
+                }, "host-b")
+
+    def test_one_host_can_be_chosen(self):
+        self.assert_choice({"host-a": {"data": metrics(slots=2)}}, "host-a")
+
+    def test_probes_run_in_parallel(self):
+        hosts = ["host-a", "host-b", "host-c"]
+        self.assert_choice({host: {"data": metrics(), "barrier": hosts} for host in hosts},
+                           "host-a")
+        for host in hosts:
+            args = json.loads((self.root / (host + ".call")).read_text())
+            self.assertEqual(args[4], host)
+            self.assertTrue(args[5])
+
+    def test_sleeping_probe_times_out_and_other_host_is_chosen(self):
+        result = self.assert_choice({
+            "host-a": {"data": metrics(slots=100), "sleep": 2},
+            "host-b": {"data": metrics(slots=1)},
+        }, "host-b", short_timeout=True)
+        self.assertIn("host-a: unreachable (timeout)", result.stderr)
+
+    def test_all_sleeping_probes_exit_one_on_timeout(self):
+        result = self.run_picker({
+            "host-a": {"data": metrics(), "sleep": 2},
+            "host-b": {"data": metrics(), "sleep": 2},
+        }, short_timeout=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr.splitlines(), [
+            "host-a: unreachable (timeout)", "host-b: unreachable (timeout)"])
+
+    def test_no_hosts_is_usage_error(self):
+        result = self.run_picker({}, hosts=[])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage:", result.stderr.lower())
+
+
+class RemoteProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        module = runpy.run_path(str(SCRIPT), run_name="picker_test")
+        cls.source = module["REMOTE_SCRIPT"].split("\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    def setUp(self):
+        self.files = {
+            "/etc/agent-slot.json": '{"slots": 6}',
+            "/home/agent/.devbox-ready": "",
+            "/proc/pressure/cpu": (
+                "some avg10=1.00 avg60=12.30 avg300=4.00 total=123\n"
+                "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"),
+        }
+        self.status = "slot 0: pid 100 cwd /work/a\nslot 1: pid 200 cwd /work/b\n"
+        self.processes = "5\n"
+        self.status_code = 0
+        self.pgrep_code = 0
+        self.calls = []
+
+    def run_probe(self):
+        files = self.files
+
+        class ProbePath:
+            def __init__(self, path):
+                self.path = path
+
+            @classmethod
+            def home(cls):
+                return cls("/home/agent")
+
+            def __truediv__(self, name):
+                return type(self)(self.path + "/" + name)
+
+            def read_text(self):
+                if self.path not in files:
+                    raise FileNotFoundError(self.path)
+                return files[self.path]
+
+            def is_file(self):
+                return self.path in files
+
+        def run(args, **kwargs):
+            self.calls.append(args)
+            if args == ["agent-slot", "status"]:
+                code, stdout = self.status_code, self.status
+            elif args == ["pgrep", "-fc", "/usr/local/bin/agent-slot"]:
+                code, stdout = self.pgrep_code, self.processes
+            else:
+                self.fail(f"unexpected subprocess: {args}")
+            if kwargs.get("check") and code:
+                raise subprocess.CalledProcessError(code, args)
+            return subprocess.CompletedProcess(args, code, stdout, "")
+
+        output = io.StringIO()
+        with patch("pathlib.Path", ProbePath), patch("subprocess.run", side_effect=run), \
+                contextlib.redirect_stdout(output):
+            exec(compile(self.source, "remote-probe", "exec"), {})
+        return json.loads(output.getvalue())
+
+    def test_collects_ready_slots_held_waiting_and_avg60(self):
+        self.assertEqual(self.run_probe(), metrics(slots=6, held=2, waiting=3, cpu=12.3))
+        self.assertEqual(self.calls, [
+            ["agent-slot", "status"], ["pgrep", "-fc", "/usr/local/bin/agent-slot"]])
+
+    def test_only_held_slot_lines_are_counted(self):
+        self.status += "6 configured slots\nslot 2: free\nother slot 3: pid 300\n"
+        self.assertEqual(self.run_probe()["held"], 2)
+
+    def test_waiting_never_falls_below_zero(self):
+        self.processes = "1\n"
+        self.assertEqual(self.run_probe()["waiting"], 0)
+
+    def test_missing_or_invalid_config_falls_back_to_zero_slots(self):
+        for contents in (None, "not json", "null", "[]", "{}"):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    self.files.pop("/etc/agent-slot.json", None)
+                else:
+                    self.files["/etc/agent-slot.json"] = contents
+                self.assertEqual(self.run_probe()["slots"], 0)
+
+    def test_missing_marker_reports_not_ready(self):
+        del self.files["/home/agent/.devbox-ready"]
+        self.assertFalse(self.run_probe()["ready"])
+
+    def test_pgrep_no_matches_is_not_an_error(self):
+        self.pgrep_code = 1
+        for output in ("0\n", ""):
+            with self.subTest(output=output):
+                self.processes = output
+                self.assertEqual(self.run_probe()["waiting"], 0)
+
+    def test_agent_slot_status_failure_aborts_probe(self):
+        self.status_code = 1
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.run_probe()
+
+    def test_pgrep_failure_aborts_probe(self):
+        self.pgrep_code = 2
+        with self.assertRaises(RuntimeError):
+            self.run_probe()
+
+
+if __name__ == "__main__":
+    unittest.main()
