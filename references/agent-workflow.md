@@ -12,6 +12,7 @@ A repo's own AGENTS.md or CLAUDE.md wins over this file where the two conflict. 
 - Follow-up work to a merged PR goes in a new PR, on a new branch from `origin/master`, never on the old branch. So before every push, check whether the current branch is already merged into `origin/master`, and if it is, move to a new branch first.
 - Immediately before every `git push`, the first one and every follow-up (review fixes, CI retries) alike, run `git fetch origin && git merge origin/master`. Master moves while you write specs, run CI or wait for a "go", so a sync from earlier in the session is stale by the time you push, and the branch lands behind, sometimes on top of a commit that touched the same files.
 - When a branch's diff carries unrelated commits, reset it before opening the PR rather than shipping mixed changes.
+- Push a PR branch only at a head you want CI and review to judge. While a round still has commits coming (another agent's work you'll stack on, a fix you're about to make), move commits without pushing the PR branch, for example with a git bundle. If you had to push an unfinished head anyway, cancel its runs right after the push: `gh run list --branch <branch> --commit <sha>`, then `gh run cancel` on each unfinished one. Runs on a head nobody will merge or review only hold runners and delay the head that matters.
 - Before claiming a PR covers some work, check its state with `gh pr view <number>`: it may have been squash-merged or closed.
 
 ## Merging, deploying and CI
