@@ -40,7 +40,7 @@ def probe(host):
     try:
         result = subprocess.run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, REMOTE_SCRIPT],
-            capture_output=True, text=True, timeout=PROBE_TIMEOUT,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
         return None, "unreachable (timeout)"

@@ -22,6 +22,8 @@ if len(args) != 6 or args[:4] != ["-o", "BatchMode=yes", "-o", "ConnectTimeout=1
 host = args[4]
 root = pathlib.Path(os.environ["STUB_ROOT"])
 fixture = json.loads((root / "fixtures.json").read_text())[host]
+if fixture.get("require_stdin_eof") and sys.stdin.buffer.read(1) != b"":
+    sys.exit(94)
 (root / (host + ".call")).write_text(json.dumps(args))
 if "barrier" in fixture:
     deadline = time.monotonic() + 3
@@ -61,13 +63,14 @@ class PickerTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=str(self.root) + os.pathsep + os.environ["PATH"],
                         STUB_ROOT=str(self.root), PYTHONDONTWRITEBYTECODE="1")
 
-    def run_picker(self, fixtures, hosts=None, short_timeout=False):
+    def run_picker(self, fixtures, hosts=None, short_timeout=False, stdin_text=None):
         (self.root / "fixtures.json").write_text(json.dumps(fixtures))
         hosts = list(fixtures) if hosts is None else hosts
         command = [str(SCRIPT), *hosts]
         if short_timeout:
             command = [sys.executable, "-c", SHORT_TIMEOUT_DRIVER, str(SCRIPT), *hosts]
-        return subprocess.run(command, env=self.env, text=True, capture_output=True, timeout=8)
+        return subprocess.run(command, env=self.env, text=True, input=stdin_text,
+                              capture_output=True, timeout=8)
 
     def assert_choice(self, fixtures, expected, **kwargs):
         result = self.run_picker(fixtures, **kwargs)
@@ -84,6 +87,13 @@ class PickerTests(unittest.TestCase):
         }, "host-b")
         self.assertEqual(result.stderr.splitlines()[0],
                          "host-a: ready, 4/6 held, 0 waiting, cpu 12.3%")
+
+    def test_probe_stdin_is_eof_when_picker_receives_input(self):
+        result = self.assert_choice({
+            "host-a": {"data": metrics(), "require_stdin_eof": True},
+            "host-b": {"data": metrics(), "require_stdin_eof": True},
+        }, "host-a", stdin_text="input reserved for the caller\n")
+        self.assertEqual(result.stderr.count(": ready,"), 2)
 
     def test_waiting_runs_consume_free_slots(self):
         self.assert_choice({
