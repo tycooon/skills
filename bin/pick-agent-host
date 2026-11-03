@@ -13,9 +13,11 @@ import sys
 PROBE_TIMEOUT = 20
 REMOTE_SCRIPT = """python3 - <<'PY'
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 try:
     slots = json.loads(Path('/etc/agent-slot.json').read_text()).get('slots', 0)
@@ -30,6 +32,16 @@ if processes.returncode not in (0, 1):
 waiting = max(0, int(processes.stdout.strip() or '0') - held)
 some = next(line for line in Path('/proc/pressure/cpu').read_text().splitlines() if line.startswith('some '))
 cpu = float(dict(field.split('=') for field in some.split()[1:])['avg60'])
+disk_budget_text = None
+disk_over_budget = False
+try:
+    # The sweep replaces this file atomically; read text and age from one inode.
+    with (Path.home() / '.cache/agent-disk-over-budget').open() as state:
+        disk_budget_text = state.read().strip()
+        age = time.time() - os.fstat(state.fileno()).st_mtime
+    disk_over_budget = age <= 45 * 60
+except FileNotFoundError:
+    pass
 try:
     login = subprocess.run(['codex', 'login', 'status'], stdin=subprocess.DEVNULL,
                            capture_output=True, timeout=15)
@@ -37,7 +49,8 @@ try:
 except (OSError, subprocess.TimeoutExpired):
     codex_login = False
 print(json.dumps(dict(ready=(Path.home() / '.devbox-ready').is_file(), slots=slots,
-                     codex_login=codex_login, held=held, waiting=waiting, cpu=cpu)))
+                     codex_login=codex_login, held=held, waiting=waiting, cpu=cpu,
+                     disk_over_budget=disk_over_budget, disk_budget_text=disk_budget_text)))
 PY
 """
 
@@ -58,9 +71,13 @@ def probe(host):
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             raise ValueError
-        for field in ("ready", "codex_login"):
+        for field in ("ready", "codex_login", "disk_over_budget"):
             if type(data[field]) is not bool:
                 raise ValueError
+        if data["disk_budget_text"] is not None and not isinstance(data["disk_budget_text"], str):
+            raise ValueError
+        if data["disk_over_budget"] and data["disk_budget_text"] is None:
+            raise ValueError
         for field in ("slots", "held", "waiting"):
             if type(data[field]) is not int or data[field] < 0:
                 raise ValueError
@@ -72,6 +89,8 @@ def probe(host):
     state = "ready" if data["ready"] else "not ready"
     if not data["codex_login"]:
         state += ", codex logged out"
+    if data["disk_over_budget"]:
+        state += f", disk over budget ({data['disk_budget_text']})"
     return data, (f"{state}, {data['held']}/{data['slots']} held, "
                   f"{data['waiting']} waiting, cpu {cpu:.1f}%")
 
@@ -96,7 +115,8 @@ def main(argv=None):
         data = candidate[1]
         return data["slots"] - data["held"] - data["waiting"]
 
-    available = [candidate for candidate in usable if free(candidate) > 0]
+    available = [candidate for candidate in usable
+                 if not candidate[1]["disk_over_budget"] and free(candidate) > 0]
 
     def rank(candidate):
         data = candidate[1]
