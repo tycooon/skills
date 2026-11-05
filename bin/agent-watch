@@ -2,14 +2,14 @@
 """Run scheduled agents over items emitted by a command source.
 
   agent-watch init <watch> --source-cmd CMD --run-dir DIR
-                   [--prepare-cmd CMD] [--notify-cmd CMD]
+                   [--prepare-cmd CMD] [--launcher JSON_ARGV] [--notify-cmd CMD]
                    [--max-items-per-run N] [--max-parallel N]
                    [--max-runs-per-day N] [--max-attempts N]
                    [--reviewer-model MODEL] [--effort LEVEL]
   agent-watch tick <watch> [--full] [--only KEY] [--dry-run]
   agent-watch settle <watch> <key> --fingerprint F --verdict V [--meta JSON]
   agent-watch recheck <watch> <key> --reason TEXT
-  agent-watch pause|resume|status|account|model|install|uninstall <watch>
+  agent-watch pause|resume|status|account|model|install|uninstall|stop <watch>
   agent-watch list
 
 Command source contract
@@ -49,6 +49,21 @@ run that reaches the limit holds the key and notifies once. A new fingerprint or
 recheck clears the hold and attempt count. Failed starts consume neither limit.
 
 --prepare-cmd runs in DIR before each run; failure prevents that start.
+--launcher sets the optional launcher config field to a command as a JSON argv list,
+for example --launcher '["/path/to/launcher", "--profile", "batch"]'. Without it,
+runs use the local wrapper as before. The launcher must run the tool where run_dir
+and the watch's state are available: the brief calls agent-watch settle there.
+The engine appends one of these subcommands to the argv (without a shell):
+  start: receives {tool, model, effort, run_dir, brief, log, last, watch, key} as JSON
+    on stdin; tool is codex or claude, key is the item's slug, and log and last are
+    absolute output paths. Print exactly one nonempty run-id line and exit 0.
+  status <id>: print running, succeeded or failed and exit 0. Failure, invalid output
+    or a 10-second timeout logs ERROR and keeps the run alive to prevent duplicates.
+  stop <id>: stop the run and exit 0; failure retains its state for a later retry.
+Start and stop have a 120-second timeout. A failed start cleans up its run files.
+External run IDs and their launcher argv are stored in <slug>.run instead of .pid.
+Completion is detected on the next liveness check; a run whose state is at least
+60 seconds old chains a tick then (status supplies no completion timestamp). stop terminates runs; uninstall also removes the schedule.
 --notify-cmd receives notification text on stdin in DIR, in addition to stderr and
 macOS desktop notifications. Linux sends no desktop notification. A notification
 command failure is logged without changing tick accounting. Agent runs also use DIR.
@@ -166,6 +181,7 @@ class Watch:
             raise SystemExit(f"bad watch name {name!r}: letters, digits, '.', '_' and '-' only")
         self.name, self.dir = name, HOME / name
         self.runs = self.dir / "runs"
+        self.observe = False  # dry run: query launcher status, never remove records or chain ticks
 
     @contextlib.contextmanager
     def locked(self):
@@ -208,7 +224,57 @@ class Watch:
 
     def running(self, url):
         key = (self.prs.get(url, {}).get("last_run") or {}).get("run_key", url)
-        return our_pid(self.runs / f"{self.slug(key)}.pid") is not None
+        return self.run_alive(self.runs / f"{self.slug(key)}.pid")
+
+    def run_files(self):
+        yield from self.runs.glob("*.pid")
+        for path in self.runs.glob("*.run"):
+            if not path.with_suffix(".pid").exists():
+                yield path
+
+    def run_alive(self, path):
+        if path.suffix == ".pid" and our_pid(path) is not None:
+            return True
+        path = path.with_suffix(".run")
+        if not path.exists():
+            return False
+        with self.launcher_locked():
+            return self.external_alive(path)
+
+    @contextlib.contextmanager
+    def launcher_locked(self):
+        # Status can run outside the watch lock; it must not remove a newer run's state.
+        with open(self.dir / ".launcher.lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    def external_alive(self, path):
+        try:
+            started = path.stat().st_mtime
+            record = json.loads(path.read_text())
+            status = launcher_command(record["launcher"], "status", record["id"], timeout=10)
+            if status not in ("running", "succeeded", "failed"):
+                raise ScanError(f"invalid launcher status: {status!r}")
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, KeyError, TypeError, ScanError, subprocess.SubprocessError) as e:
+            self.log(f"ERROR launcher status {path.name}: {e}")
+            return True
+        if status == "running":
+            return True
+        if self.observe:
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        if now_utc().timestamp() - started >= CHAIN_AFTER:
+            try:
+                subprocess.Popen([str(Path(sys.argv[0]).resolve()), "tick", "--chained", self.name],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as e:
+                self.log(f"ERROR chaining {path.name}: {e}")
+        return False
 
 
 def initialize_watch(w, a, source_config):
@@ -262,6 +328,7 @@ def cmd_pause_resume(a):
 
 def cmd_tick(a, spawn=None):
     with Watch(a.watch).locked() as w:
+        w.observe = a.dry_run
         if w.paused:
             print(f"watch {w.name}: paused; tick skipped")
             return 0
@@ -310,7 +377,7 @@ def tick(w, a, spawn):
     if SOURCE.listed_slots_only:
         in_flight = sum(w.running(key) for key in listed)
     else:
-        in_flight = sum(our_pid(f) is not None for f in w.runs.glob("*.pid"))
+        in_flight = sum(w.run_alive(f) for f in w.run_files())
     recent = [t for t in w.prs.get("_runs", []) if parse_time(t) > now - dt.timedelta(hours=24)]
     started, not_started, waiting, started_urls = 0, [], [], []
     size = cfg.get("max_items_per_run", 1)
@@ -482,13 +549,13 @@ def prune_idle_runs(w, now):
             with contextlib.suppress(OSError):
                 if directory.is_symlink() or not directory.is_dir():
                     continue
-                if our_pid(w.runs / f"{directory.name}.pid") is not None:
+                if w.run_alive(w.runs / f"{directory.name}.pid"):
                     continue
                 files = list(directory.iterdir())
                 if not files or max(path.lstat().st_mtime for path in files) >= cutoff:
                     continue
                 for path in files:
-                    if path.name.endswith(".pid"):
+                    if path.name.endswith((".pid", ".run")):
                         continue
                     with contextlib.suppress(OSError):
                         path.unlink()
@@ -511,16 +578,18 @@ def codex_git_dirs(directory):
 def spawn_run(w, url, brief):
     cfg = w.config
     runner = w.runner
-    if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
-        raise FileNotFoundError(f"{runner} is not on PATH")
-    if runner == "codex":
-        if not codex_logged_in():
-            raise PermissionError("the codex CLI is logged out; run `codex login`")
-    else:
-        account = cfg.get("claude_config")
-        if not claude_logged_in(account):
-            login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
-            raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+    launcher = cfg.get("launcher")
+    if not launcher:
+        if not shutil.which(runner):  # inside the wrapper a missing CLI would fail unseen
+            raise FileNotFoundError(f"{runner} is not on PATH")
+        if runner == "codex":
+            if not codex_logged_in():
+                raise PermissionError("the codex CLI is logged out; run `codex login`")
+        else:
+            account = cfg.get("claude_config")
+            if not claude_logged_in(account):
+                login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
+                raise PermissionError(f"the claude CLI is logged out; run `{login}`")
     slug = w.slug(url)
     directory = w.runs / slug
     directory.mkdir(parents=True, exist_ok=True)
@@ -535,35 +604,53 @@ def spawn_run(w, url, brief):
     run = directory / stem
     brief_path, log_path = run.with_suffix(".brief.md"), run.with_suffix(".jsonl")
     last_path = run.with_suffix(".last.md")
-    if runner == "codex":
-        cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
-               "-c", "sandbox_workspace_write.network_access=true"]
-        for path in codex_git_dirs(cfg.get("run_dir", str(w.dir))):
-            cmd.extend(["--add-dir", path])
-        cmd.extend(["--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"])
-        env = claude_env(None)
-    else:
-        cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
-               "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
-        env = claude_env(account)
+    if not launcher:
+        if runner == "codex":
+            cmd = ["codex", "exec", "-m", cfg["reviewer_model"], "-c", f"model_reasoning_effort={cfg['effort']}",
+                   "-c", "sandbox_workspace_write.network_access=true"]
+            for path in codex_git_dirs(cfg.get("run_dir", str(w.dir))):
+                cmd.extend(["--add-dir", path])
+            cmd.extend(["--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"])
+            env = claude_env(None)
+        else:
+            cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
+                   "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
+            env = claude_env(account)
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
     # start the next tick at once: runs take a minute or two, so waiting for the schedule left
     # the slots idle most of each interval. A run shorter than CHAIN_AFTER starts none, so a
     # run that dies on start can't spin the watch; the schedule picks it up again.
-    wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
+    if not launcher:
+        wrapper = ["/bin/sh", "-c", WRAPPER, str(pidfile), str(Path(sys.argv[0]).resolve()), w.name, str(CHAIN_AFTER), *cmd]
+    runfile = pidfile.with_suffix(".run")
     try:
         brief_path.write_text(brief)
-        with open(brief_path) as stdin, open(log_path, "w") as out:
-            p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=cfg.get("run_dir", str(w.dir)),
-                                 start_new_session=True, env=env)
+        if launcher:
+            with w.launcher_locked():
+                log_path.touch()
+                run_id = launcher_command(launcher, "start", data={
+                    "tool": runner, "model": cfg["reviewer_model"], "effort": cfg["effort"],
+                    "run_dir": cfg.get("run_dir", str(w.dir)), "brief": brief,
+                    "log": str(log_path.resolve()), "last": str(last_path.resolve()),
+                    "watch": w.name, "key": slug})
+                if not run_id or len(run_id.splitlines()) != 1:
+                    raise ScanError("launcher start must print one nonempty run-id line")
+                write_json(runfile, {"launcher": launcher, "id": run_id})
+                started = now_utc().timestamp()
+                os.utime(runfile, (started, started))
+        else:
+            with open(brief_path) as stdin, open(log_path, "w") as out:
+                p = subprocess.Popen(wrapper, stdin=stdin, stdout=out, stderr=subprocess.STDOUT, cwd=cfg.get("run_dir", str(w.dir)),
+                                     start_new_session=True, env=env)
     except Exception:
-        for path in (brief_path, log_path, last_path):
+        for path in (brief_path, log_path, last_path, *((runfile,) if launcher else ())):
             with contextlib.suppress(OSError):
                 path.unlink()
         prune_runs(directory)
         raise
-    pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
+    if not launcher:
+        pidfile.write_text(f"{p.pid} {proc_start(p.pid) or ''}")
     prune_runs(directory)
     return str(log_path.relative_to(w.dir))
 
@@ -622,7 +709,7 @@ def cmd_list(a):
         w = Watch(name).load()
         cfg = w.config
         scheduled = schedule_status(w)
-        running = sum(1 for f in w.runs.glob("*.pid") if our_pid(f) is not None)
+        running = sum(w.run_alive(f) for f in w.run_files())
         print(f"{name}: reviewer {w.runner} {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
               + (f", account {cfg['claude_config']}" if cfg.get("claude_config") and w.runner == "claude" else ""))
         for line in SOURCE.describe(w, detail=False):
@@ -836,6 +923,23 @@ def cmd_uninstall(a):
         text = "".join(line for line in tab.splitlines(keepends=True) if not owns_cron_line(line, w.name))
         if text != tab:
             write_crontab(text)
+    stop_runs(w)
+    print(f"uninstalled watch {w.name}; its state stays in {w.dir}")
+    return 0
+
+
+def stop_runs(w):
+    failed = []
+    if any(w.runs.glob("*.run")):
+        with w.launcher_locked():
+            for runfile in w.runs.glob("*.run"):
+                try:
+                    record = json.loads(runfile.read_text())
+                    launcher_command(record["launcher"], "stop", record["id"])
+                    runfile.unlink()
+                except (OSError, ValueError, KeyError, TypeError, ScanError, subprocess.SubprocessError) as e:
+                    w.log(f"ERROR launcher stop {runfile.name}: {e}")
+                    failed.append(runfile.name)
     for pidfile in w.runs.glob("*.pid"):
         pid = our_pid(pidfile)
         if pid is None:
@@ -844,8 +948,27 @@ def cmd_uninstall(a):
             os.killpg(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
-    print(f"uninstalled watch {w.name}; its state stays in {w.dir}")
+    if failed:
+        raise ScanError(f"failed to stop {len(failed)} external run(s); see {w.dir / 'scan.log'}")
+
+
+def cmd_stop(a):
+    with Watch(a.watch).locked() as w:
+        stop_runs(w)
+    print(f"stopped watch {w.name}'s runs")
     return 0
+
+
+def launcher_command(argv, verb, run_id=None, data=None, timeout=120):
+    cmd = [*argv, verb, *([run_id] if run_id is not None else [])]
+    try:
+        p = subprocess.run(cmd, input=json.dumps(data) if data is not None else None,
+                           capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ScanError(str(e)) from e
+    if p.returncode:
+        raise ScanError((p.stderr or p.stdout).strip() or f"launcher {verb} exited {p.returncode}")
+    return p.stdout.strip()
 
 
 def run_shell(command, directory, stdin=None):
@@ -989,7 +1112,8 @@ def cmd_init(a):
     config = initialize_watch(w, a, {"source_cmd": a.source_cmd, "run_dir": str(directory),
                                      "prepare_cmd": a.prepare_cmd, "notify_cmd": a.notify_cmd,
                                      "max_items_per_run": a.max_items_per_run,
-                                     "max_runs_per_day": a.max_runs_per_day, "max_attempts": a.max_attempts})
+                                     "max_runs_per_day": a.max_runs_per_day, "max_attempts": a.max_attempts,
+                                     **({"launcher": a.launcher} if a.launcher is not None else {})})
     print(f"watch {w.name}: command source, reviewer {config['runner']} {config['reviewer_model']} at {a.effort} effort, state in {w.dir}")
     return 0
 
@@ -1016,6 +1140,16 @@ def cmd_recheck(a):
     return 0
 
 
+def launcher_argv(value):
+    try:
+        argv = json.loads(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("launcher must be a JSON argv list") from e
+    if not isinstance(argv, list) or not argv or any(not isinstance(arg, str) or not arg for arg in argv):
+        raise argparse.ArgumentTypeError("launcher must be a nonempty JSON list of nonempty strings")
+    return argv
+
+
 def positive(value):
     n = int(value)
     if n < 1:
@@ -1031,6 +1165,7 @@ def main(argv=None):
     i.add_argument("--source-cmd", required=True)
     i.add_argument("--run-dir", required=True)
     i.add_argument("--prepare-cmd")
+    i.add_argument("--launcher", type=launcher_argv)
     i.add_argument("--notify-cmd")
     i.add_argument("--max-items-per-run", type=positive, default=1)
     i.add_argument("--max-runs-per-day", type=positive)
@@ -1056,7 +1191,7 @@ def main(argv=None):
     r.add_argument("--reason", required=True)
     sub.add_parser("list")
     sub.add_parser("status").add_argument("watch", nargs="?")
-    for command in ("pause", "resume", "uninstall"):
+    for command in ("pause", "resume", "uninstall", "stop"):
         sub.add_parser(command).add_argument("watch")
     ins = sub.add_parser("install")
     ins.add_argument("watch")
@@ -1072,7 +1207,7 @@ def main(argv=None):
     try:
         return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "recheck": cmd_recheck,
                 "list": cmd_list, "status": cmd_status, "pause": cmd_pause_resume, "resume": cmd_pause_resume,
-                "install": cmd_install, "uninstall": cmd_uninstall, "model": cmd_model, "account": cmd_account}[a.cmd](a)
+                "install": cmd_install, "uninstall": cmd_uninstall, "stop": cmd_stop, "model": cmd_model, "account": cmd_account}[a.cmd](a)
     except ScanError as e:
         print(f"error: {e}", file=sys.stderr)
         return 5
