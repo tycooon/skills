@@ -909,6 +909,43 @@ elif verb == 'status':
         self.assertEqual(self.launcher_calls('stop'), [['run-123'], ['run-123']])
         self.assertFalse(self.runfile(w).exists())
 
+    def test_launcher_stop_failures_still_stop_other_external_and_local_runs(self):
+        for command in ('stop', 'uninstall'):
+            with self.subTest(command=command):
+                w = self.launcher()
+                for key, run_id in [('one', 'run-bad-1'), ('two', 'run-bad-2'), ('three', 'run-good')]:
+                    self.aw.write_json(self.runfile(w, key), {'launcher': self.launcher_argv, 'id': run_id})
+                self.spawn(w, 'local', '')
+                self.alive.add('local')
+
+                def stop(argv, verb, run_id):
+                    self.assertEqual((argv, verb), (self.launcher_argv, 'stop'))
+                    if run_id != 'run-good':
+                        raise self.aw.ScanError('launcher unavailable: ' + run_id)
+                    return ''
+
+                tag = self.aw.cron_tag('work')
+                with patch.object(self.aw, 'launcher_command', side_effect=stop) as external, \
+                     patch.object(self.aw.os, 'killpg') as killpg, \
+                     patch.object(self.aw, 'read_crontab', return_value='* * * * * tick ' + tag + '\n'), \
+                     patch.object(self.aw, 'write_crontab') as write_crontab:
+                    result = self.cli(command, 'work')
+                self.assertEqual(result[0], 5, result)
+                self.assertIn('failed to stop 2 external run(s)', result[2])
+                self.assertEqual({call.args[2] for call in external.call_args_list},
+                                 {'run-bad-1', 'run-bad-2', 'run-good'})
+                self.assertEqual(external.call_count, 3)
+                killpg.assert_called_once_with(4242, signal.SIGTERM)
+                if command == 'uninstall':
+                    write_crontab.assert_called_once_with('')
+                else:
+                    write_crontab.assert_not_called()
+                for key in ('one', 'two'):
+                    self.assertTrue(self.runfile(w, key).exists())
+                    log = (w.dir / 'scan.log').read_text()
+                    self.assertIn('ERROR launcher stop ' + self.runfile(w, key).name, log)
+                self.assertFalse(self.runfile(w, 'three').exists())
+
     def test_launcher_start_failure_cleans_outputs_and_consumes_no_limits(self):
         w = self.launcher(start_error='cannot launch', write_outputs=True)
         result = self.cli('tick', 'work')

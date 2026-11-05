@@ -925,12 +925,17 @@ def cmd_uninstall(a):
 
 
 def stop_runs(w):
+    failed = []
     if any(w.runs.glob("*.run")):
         with w.launcher_locked():
             for runfile in w.runs.glob("*.run"):
-                record = json.loads(runfile.read_text())
-                launcher_command(record["launcher"], "stop", record["id"])
-                runfile.unlink()
+                try:
+                    record = json.loads(runfile.read_text())
+                    launcher_command(record["launcher"], "stop", record["id"])
+                    runfile.unlink()
+                except (OSError, ValueError, KeyError, TypeError, ScanError, subprocess.SubprocessError) as e:
+                    w.log(f"ERROR launcher stop {runfile.name}: {e}")
+                    failed.append(runfile.name)
     for pidfile in w.runs.glob("*.pid"):
         pid = our_pid(pidfile)
         if pid is None:
@@ -939,6 +944,8 @@ def stop_runs(w):
             os.killpg(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
+    if failed:
+        raise ScanError(f"failed to stop {len(failed)} external run(s); see {w.dir / 'scan.log'}")
 
 
 def cmd_stop(a):
