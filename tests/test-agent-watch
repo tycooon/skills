@@ -411,6 +411,145 @@ class CommandWatch(unittest.TestCase):
         self.assertEqual(target.read_text(), before)
         self.assertIn('could not read any target', before)
 
+    def run_log(self, key, stamp, events=None):
+        w = self.aw.Watch('work').load()
+        directory = w.runs / w.slug(key)
+        directory.mkdir(exist_ok=True)
+        (directory / (stamp + '.brief.md')).write_text('Work on item')
+        log = directory / (stamp + '.jsonl')
+        if events is not None:
+            log.write_text(''.join(json.dumps(event) + '\n' for event in events))
+        return log
+
+    def failed_history(self, events):
+        self.settings['items'] = []
+        self.write()
+        return [self.run_log(key, stamp, events) for key, stamp in (
+            ('one', '20261031T095700Z'), ('two', '20261031T095800Z'),
+            ('one', '20261031T095900Z'))]
+
+    def test_finished_codex_failures_notify_once_and_appear_in_status(self):
+        logs = self.failed_history([{'type': 'turn.failed', 'error': {'message': 'Refresh token revoked'}}])
+        logs[0].write_text('{"type":"turn.failed","error":{"message":"older error"}}\n')
+        self.run_log('three', '20261031T095600Z', [{'type': 'turn.completed'}])
+        notices = self.enter(patch.object(self.aw, 'notify'))
+        for _ in range(2):
+            self.assertEqual(self.tick()[0], 0)
+            self.assertIn('last 3 runs failed: Refresh token revoked', self.state()['_alert']['problem'])
+        self.assertEqual(notices.call_count, 1)
+        self.assertIn('last 3 runs failed', self.cli('status', 'work')[1])
+
+    def test_newest_success_breaks_failures_and_clears_alert(self):
+        self.failed_history([{'type': 'turn.failed', 'error': {'message': 'runner failed'}}])
+        self.tick()
+        self.run_log('two', '20261031T100000Z', [{'type': 'turn.completed'}])
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_success_among_last_three_prevents_alert(self):
+        logs = self.failed_history([{'type': 'error', 'message': 'runner failed'}])
+        logs[1].write_text('{"type":"turn.completed"}\n')
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_claude_error_results_alert(self):
+        for event in ({'type': 'result', 'is_error': True, 'subtype': 'success', 'result': 'Login failed'},
+                      {'type': 'result', 'is_error': False, 'subtype': 'error_during_execution',
+                       'errors': ['Login failed']}):
+            with self.subTest(event=event):
+                self.failed_history([event])
+                self.tick()
+                self.assertIn('last 3 runs failed: Login failed', self.state()['_alert']['problem'])
+        self.run_log('two', '20261031T100000Z', [
+            {'type': 'result', 'is_error': True, 'subtype': 'error_during_execution'},
+            {'type': 'result', 'is_error': False, 'subtype': 'success', 'result': 'Done'}])
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_empty_missing_or_incomplete_logs_alert_without_result(self):
+        for events in (None, [], [{'type': 'turn.started'}]):
+            with self.subTest(events=events):
+                for log in self.failed_history(events):
+                    if events is None:
+                        log.unlink(missing_ok=True)
+                self.tick()
+                self.assertIn('last 3 runs failed: no result in the log', self.state()['_alert']['problem'])
+
+    def test_live_run_is_excluded_but_earlier_runs_for_same_target_count(self):
+        self.failed_history([{'type': 'turn.failed'}])
+        self.run_log('one', '20261031T100000Z', [{'type': 'turn.completed'}])
+        self.alive.add('one')
+        self.tick()
+        self.assertIn('last 3 runs failed', self.state()['_alert']['problem'])
+        self.alive.clear()
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_live_failure_does_not_reach_threshold(self):
+        self.failed_history([{'type': 'turn.failed'}])
+        self.alive.add('one')
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_run_suffixes_sort_numerically_and_message_is_short_single_line(self):
+        self.settings['items'] = []
+        self.write()
+        self.run_log('one', '20261031T095900Z-2', [{'type': 'turn.completed'}])
+        for suffix in (9, 10, 11):
+            self.run_log('one', '20261031T095900Z-' + str(suffix),
+                         [{'type': 'error', 'error': {'message': 'first\n' + 'x' * 150}}])
+        self.tick()
+        problem = self.state()['_alert']['problem']
+        self.assertIn('last 3 runs failed: first ', problem)
+        self.assertNotIn('\n', problem)
+        self.assertEqual(len(problem.split('failed: ', 1)[1].split('; see', 1)[0]), 120)
+
+    def test_only_log_tail_is_used_and_explicit_failure_beats_completion(self):
+        logs = self.failed_history([{'type': 'turn.completed'}])
+        for log in logs:
+            with log.open('a') as f:
+                f.write('x' * 200000 + '\n')
+                f.write('{"type":"error","message":"tail failure"}\n')
+                f.write('{"type":"turn.completed"}\n')
+        original = Path.open
+        class BoundedReader:
+            def __init__(self, file):
+                self.file = file
+            def __enter__(self):
+                self.file.__enter__()
+                return self
+            def __exit__(self, *args):
+                return self.file.__exit__(*args)
+            def __getattr__(self, name):
+                return getattr(self.file, name)
+            def read(self, size=-1):
+                self_test.assertGreater(size, 0)
+                self_test.assertLessEqual(size, 65536)
+                return self.file.read(size)
+        self_test = self
+        def bounded(path, *args, **kwargs):
+            file = original(path, *args, **kwargs)
+            return BoundedReader(file) if path.suffix == '.jsonl' else file
+        with patch.object(Path, 'open', bounded):
+            self.tick()
+        self.assertIn('last 3 runs failed: tail failure', self.state()['_alert']['problem'])
+
+    def test_failed_runs_alert_wins_over_failed_start_without_changing_exit_code(self):
+        self.failed_history([{'type': 'turn.failed'}])
+        self.settings['items'] = [item('one')]
+        self.settings['brief_error'] = 'unavailable'
+        self.write()
+        self.assertEqual(self.tick()[0], 5)
+        self.assertIn('last 3 runs failed', self.state()['_alert']['problem'])
+
+    def test_unread_target_alert_wins_over_failed_runs(self):
+        self.failed_history([{'type': 'turn.failed'}])
+        self.settings['list_error'] = 'unavailable'
+        self.write()
+        self.tick()
+        self.assertEqual(self.tick()[0], 5)
+        self.assertIn('could not read any target', self.state()['_alert']['problem'])
+
     def test_invalid_list_is_unreadable(self):
         for raw in ('no json', '{}', '{"items": [{}]}', '{"items": [{"key": "_tick"}]}'):
             self.settings['raw'] = raw
@@ -752,6 +891,67 @@ elif verb == 'status':
 
     def runfile(self, w, key='one'):
         return w.runs / f'{w.slug(key)}.run'
+
+    def test_launcher_failed_statuses_count_even_with_success_logs(self):
+        w = self.launcher()
+        for _ in range(3):
+            self.launch_settings['status'] = 'running'
+            self.write_launcher()
+            self.assertEqual(self.cli('tick', 'work')[0], 0)
+            log = Path(self.launcher_calls('start')[-1]['log'])
+            log.write_text('{"type":"result","subtype":"success","is_error":false}\n')
+            self.launch_settings['status'] = 'failed'
+            self.write_launcher()
+            self.assertFalse(w.running('one'))
+            self.clock += self.aw.dt.timedelta(minutes=1)
+        self.settings['items'] = []
+        self.write()
+        self.tick()
+        self.assertIn('last 3 runs failed', self.state()['_alert']['problem'])
+        self.launch_settings['status'] = 'running'
+        self.write_launcher()
+        self.settings['items'] = [item('one')]
+        self.write()
+        self.cli('tick', 'work')
+        Path(self.launcher_calls('start')[-1]['log']).write_text(
+            '{"type":"result","subtype":"success","is_error":false}\n')
+        self.launch_settings['status'] = 'succeeded'
+        self.write_launcher()
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_launcher_failure_preserves_read_only_log_and_releases_slot(self):
+        w = self.launcher()
+        self.cli('tick', 'work')
+        log = Path(self.launcher_calls('start')[-1]['log'])
+        content = '{"type":"result","subtype":"success","is_error":false}\n'
+        log.write_text(content)
+        log.chmod(0o444)
+        self.launch_settings['status'] = 'failed'
+        self.write_launcher()
+        self.assertFalse(w.running('one'))
+        self.assertFalse(self.runfile(w).exists())
+        self.assertEqual(log.read_text(), content)
+        self.assertTrue(log.with_suffix('.failed').exists())
+
+    def test_launcher_failed_status_is_observed_without_dry_run_writes(self):
+        w = self.launcher()
+        self.cli('tick', 'work')
+        directory = w.runs / w.slug('one')
+        current = Path(self.launcher_calls('start')[-1]['log'])
+        current.write_text('{"type":"turn.completed"}\n')
+        for stamp in ('20261031T095800Z', '20261031T095900Z'):
+            self.run_log('one', stamp, [{'type': 'turn.failed'}])
+        self.launch_settings['status'] = 'failed'
+        self.write_launcher()
+        before = {path: path.read_bytes() for path in directory.iterdir()}
+        state_before = self.state()
+        rc, out, _ = self.tick(None, '--dry-run')
+        self.assertEqual(rc, 0)
+        self.assertIn('last 3 runs failed', out)
+        self.assertEqual({path: path.read_bytes() for path in directory.iterdir()}, before)
+        self.assertTrue(self.runfile(w).exists())
+        self.assertEqual(self.state(), state_before)
 
     def test_launcher_start_contract_and_stored_identity(self):
         w = self.launcher()
