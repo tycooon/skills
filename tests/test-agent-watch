@@ -504,17 +504,22 @@ class CommandWatch(unittest.TestCase):
         self.assertNotIn('\n', problem)
         self.assertEqual(len(problem.split('failed: ', 1)[1].split('; see', 1)[0]), 120)
 
-    def test_only_log_tail_is_used_and_explicit_failure_beats_completion(self):
+    def test_only_log_tail_is_used_and_last_turn_failure_wins(self):
         logs = self.failed_history([{'type': 'turn.completed'}])
         for log in logs:
             with log.open('a') as f:
                 f.write('x' * 200000 + '\n')
-                f.write('{"type":"error","message":"tail failure"}\n')
                 f.write('{"type":"turn.completed"}\n')
+                f.write('{"type":"turn.failed","error":{"message":"tail failure"}}\n')
+        oversized = self.run_log('large', '20261031T095600Z', [
+            {'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'x' * 200000}])
+        beyond_cap = self.run_log('large', '20261031T095500Z', [
+            {'type': 'turn.completed', 'result': 'x' * (5 * 1024 * 1024)}])
         original = Path.open
         class BoundedReader:
             def __init__(self, file):
                 self.file = file
+                self.read_bytes = 0
             def __enter__(self):
                 self.file.__enter__()
                 return self
@@ -525,6 +530,8 @@ class CommandWatch(unittest.TestCase):
             def read(self, size=-1):
                 self_test.assertGreater(size, 0)
                 self_test.assertLessEqual(size, 65536)
+                self.read_bytes += size
+                self_test.assertLessEqual(self.read_bytes, 4 * 1024 * 1024 + 4096)
                 return self.file.read(size)
         self_test = self
         def bounded(path, *args, **kwargs):
@@ -532,7 +539,62 @@ class CommandWatch(unittest.TestCase):
             return BoundedReader(file) if path.suffix == '.jsonl' else file
         with patch.object(Path, 'open', bounded):
             self.tick()
+            self.assertTrue(self.aw.run_result(oversized)[0])
+            self.assertFalse(self.aw.run_result(beyond_cap)[0])
         self.assertIn('last 3 runs failed: tail failure', self.state()['_alert']['problem'])
+
+    def test_reconnecting_runs_finish_successfully_without_alert(self):
+        logs = self.failed_history([
+            {'type': 'error', 'message': 'Reconnecting... 1/5'},
+            {'type': 'turn.completed'}])
+        for log in logs:
+            self.assertTrue(self.aw.run_result(log)[0])
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
+
+    def test_last_terminal_turn_wins_and_retry_notices_do_not_hide_error(self):
+        for events, expected in (
+            ([{'type': 'turn.failed'}, {'type': 'turn.completed'}], True),
+            ([{'type': 'turn.completed'}, {'type': 'turn.failed'}], False),
+            ([{'type': 'turn.completed'}, {'type': 'error', 'message': 'Reconnecting...'}], True),
+            ([{'type': 'error', 'message': 'Reconnecting...'}], False),
+        ):
+            with self.subTest(events=events):
+                log = self.run_log('one', '20261031T095900Z', events)
+                self.assertEqual(self.aw.run_result(log)[0], expected)
+        log = self.run_log('one', '20261031T095900Z', [
+            {'type': 'error', 'message': 'old fatal error'},
+            {'type': 'error', 'error': {'message': 'new fatal error'}},
+            {'type': 'error', 'message': 'Reconnecting... 2/5'},
+            {'type': 'turn.failed'}])
+        self.assertEqual(self.aw.run_result(log), (False, 'new fatal error'))
+
+    def test_oversized_final_records_use_leading_outcome_fields(self):
+        for event, expected in (
+            ({'type': 'result', 'subtype': 'success', 'is_error': False}, True),
+            ({'type': 'result', 'subtype': 'success', 'is_error': True}, False),
+            ({'type': 'result', 'subtype': 'error_during_execution', 'is_error': False}, False),
+            ({'type': 'turn.completed'}, True),
+            ({'type': 'turn.failed'}, False),
+        ):
+            for prefix, ending in (('', '\n'), ('{"type":"turn.failed"}\n', ''),
+                                   ('x' * 100000 + '\n', '\n\n')):
+                with self.subTest(event=event, prefix=len(prefix), ending=ending):
+                    log = self.run_log('one', '20261031T095900Z', [])
+                    log.write_text(prefix + json.dumps(dict(event, result='x' * 200000)) + ending)
+                    self.assertEqual(self.aw.run_result(log)[0], expected)
+
+    def test_oversized_header_does_not_take_outcome_keys_from_payload(self):
+        log = self.run_log('one', '20261031T095900Z', [
+            {'type': 'result', 'result': '"subtype":"success","is_error":false' + 'x' * 200000,
+             'subtype': 'error_during_execution', 'is_error': True}])
+        self.assertFalse(self.aw.run_result(log)[0])
+
+    def test_three_oversized_successful_results_do_not_alert(self):
+        self.failed_history([{'type': 'result', 'subtype': 'success', 'is_error': False,
+                              'result': 'x' * 200000}])
+        self.tick()
+        self.assertEqual(self.state()['_alert'], {})
 
     def test_failed_runs_alert_wins_over_failed_start_without_changing_exit_code(self):
         self.failed_history([{'type': 'turn.failed'}])
