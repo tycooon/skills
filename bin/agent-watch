@@ -106,6 +106,10 @@ from pathlib import Path
 HOME = Path(os.environ.get("AGENT_WATCH_HOME", "~/.local/state/agent-watch")).expanduser()
 TOOL = "agent-watch"
 UNREAD_TICKS_BEFORE_ALERT = 2
+FAILED_RUNS_BEFORE_ALERT = 3
+RUN_LOG_TAIL_BYTES = 65536
+RUN_LOG_SCAN_BYTES = 4 * 1024 * 1024
+RUN_LOG_HEADER_BYTES = 4096
 _logged_in = {}
 _codex_logged_in = None
 CHAIN_AFTER = 60
@@ -182,6 +186,7 @@ class Watch:
         self.name, self.dir = name, HOME / name
         self.runs = self.dir / "runs"
         self.observe = False  # dry run: query launcher status, never remove records or chain ticks
+        self.failed_logs = set()
 
     @contextlib.contextmanager
     def locked(self):
@@ -262,6 +267,18 @@ class Watch:
             return True
         if status == "running":
             return True
+        if status == "failed":
+            artifacts = run_artifacts(self.runs / path.stem)
+            if artifacts:
+                latest = artifacts[max(artifacts)][0]
+                log = latest.parent / (latest.name.split(".", 1)[0] + ".jsonl")
+                self.failed_logs.add(log)
+                if not self.observe:
+                    try:
+                        # Keep the terminal failure without changing launcher-owned output.
+                        log.with_suffix(".failed").touch()
+                    except OSError as e:
+                        self.log(f"ERROR recording launcher completion {path.name}: {e}")
         if self.observe:
             return False
         try:
@@ -378,6 +395,7 @@ def tick(w, a, spawn):
         in_flight = sum(w.running(key) for key in listed)
     else:
         in_flight = sum(w.run_alive(f) for f in w.run_files())
+    run_problem = failed_runs_problem(w)
     recent = [t for t in w.prs.get("_runs", []) if parse_time(t) > now - dt.timedelta(hours=24)]
     started, not_started, waiting, started_urls = 0, [], [], []
     size = cfg.get("max_items_per_run", 1)
@@ -435,6 +453,8 @@ def tick(w, a, spawn):
         problem = f"watch {w.name}: nothing left to watch; run `{TOOL} uninstall {w.name}`"
     elif all_unread and unread.get("ticks", 0) >= UNREAD_TICKS_BEFORE_ALERT:
         problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `{TOOL} status {w.name}`"
+    elif run_problem:
+        problem = run_problem
     elif not_started:
         kind = "" if cfg.get("source_cmd") else "review "
         problem = f"watch {w.name}: {len(not_started)} {kind}run(s) failed to start; see `{TOOL} status {w.name}`"
@@ -526,20 +546,133 @@ def codex_logged_in():
     return _codex_logged_in
 
 
-def prune_runs(directory):
+def run_artifacts(directory):
+    runs = {}
     with contextlib.suppress(OSError):
         if directory.is_symlink():
-            return
-        runs = {}
+            return runs
         for path in directory.iterdir():
-            match = re.fullmatch(r"(\d{8}T\d{6}Z)(?:-(\d+))?\.(?:brief\.md|jsonl|last\.md)", path.name)
+            match = re.fullmatch(r"(\d{8}T\d{6}Z)(?:-(\d+))?\.(?:brief\.md|jsonl|last\.md|failed)", path.name)
             if match:
                 key = (match[1], int(match[2] or 1))
                 runs.setdefault(key, []).append(path)
-        for key in sorted(runs, reverse=True)[RUNS_TO_KEEP:]:
-            for path in runs[key]:
-                with contextlib.suppress(OSError):
-                    path.unlink()
+    return runs
+
+
+def final_record_header(f, offset, size):
+    floor = max(0, size - RUN_LOG_SCAN_BYTES)
+    start = None
+    while offset > floor:
+        chunk_start = max(floor, offset - RUN_LOG_TAIL_BYTES)
+        f.seek(chunk_start)
+        chunk = f.read(offset - chunk_start)
+        newline = chunk.rfind(b"\n")
+        if newline >= 0:
+            start = chunk_start + newline + 1
+            break
+        offset = chunk_start
+    if start is None:
+        if offset:
+            return None
+        start = 0
+    f.seek(start)
+    prefix = f.read(min(RUN_LOG_HEADER_BYTES, size - start)).decode("utf-8", errors="replace").lstrip()
+    if not prefix.startswith("{"):
+        return None
+    # Anchored scalar fields cannot mistake keys inside the result text for outcome fields.
+    field = re.compile(r'\s*"((?:[^"\\]|\\.)*)"\s*:\s*'
+                       r'("(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([,}])')
+    event, pos = {}, 1
+    while match := field.match(prefix, pos):
+        if match[1] in ("type", "subtype", "is_error"):
+            event[match[1]] = json.loads(match[2])
+        pos = match.end()
+        if match[3] == "}":
+            break
+    if event.get("type") == "result" and not {"subtype", "is_error"} <= event.keys():
+        return None
+    return event
+
+
+def run_result(log):
+    try:
+        with log.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            offset = max(0, size - RUN_LOG_TAIL_BYTES)
+            f.seek(offset)
+            tail = f.read(RUN_LOG_TAIL_BYTES)
+            header = None
+            if offset and b"\n" not in tail.rstrip(b"\r\n"):
+                header = final_record_header(f, offset, size)
+            lines = tail.decode("utf-8", errors="replace").splitlines()
+        if offset:
+            lines = lines[1:]
+        if header:
+            lines.append(json.dumps(header))
+    except OSError:
+        return False, "no result in the log"
+    completed, error = False, None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("type")
+        if kind in ("turn.failed", "turn.completed"):
+            completed = kind == "turn.completed"
+        if kind in ("turn.failed", "error"):
+            detail = event.get("error") or event
+            message = detail.get("message") if isinstance(detail, dict) else detail
+            if message and not str(message).lstrip().lower().startswith("reconnecting"):
+                error = message
+        elif kind == "result":
+            completed = event.get("is_error") is not True and event.get("subtype") == "success"
+            if not completed:
+                error = event.get("result") or next(iter(event.get("errors") or []), None) or error
+    message = (" ".join(str(error).split())[:120] if error else "") or "no result in the log"
+    return completed, message
+
+
+def failed_runs_problem(w):
+    runs = []
+    try:
+        directories = list(w.runs.iterdir())
+    except OSError:
+        return None
+    for directory in directories:
+        artifacts = run_artifacts(directory)
+        if not artifacts:
+            continue
+        latest = max(artifacts)
+        alive = w.run_alive(w.runs / f"{directory.name}.pid")
+        for started, paths in artifacts.items():
+            if alive and started == latest:
+                continue
+            path = paths[0]
+            log = directory / (path.name.split(".", 1)[0] + ".jsonl")
+            runs.append((started, log))
+    recent = sorted(runs, reverse=True)[:FAILED_RUNS_BEFORE_ALERT]
+    if len(recent) < FAILED_RUNS_BEFORE_ALERT:
+        return None
+    newest_error = None
+    for _, log in recent:
+        success, error = run_result(log)
+        if success and log not in w.failed_logs and not log.with_suffix(".failed").exists():
+            return None
+        if newest_error is None:
+            newest_error = error
+    return (f"watch {w.name}: the last {FAILED_RUNS_BEFORE_ALERT} runs failed: {newest_error}; "
+            f"see `{TOOL} status {w.name}`")
+
+
+def prune_runs(directory):
+    runs = run_artifacts(directory)
+    for key in sorted(runs, reverse=True)[RUNS_TO_KEEP:]:
+        for path in runs[key]:
+            with contextlib.suppress(OSError):
+                path.unlink()
 
 
 def prune_idle_runs(w, now):
