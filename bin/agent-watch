@@ -181,6 +181,7 @@ class Watch:
             raise SystemExit(f"bad watch name {name!r}: letters, digits, '.', '_' and '-' only")
         self.name, self.dir = name, HOME / name
         self.runs = self.dir / "runs"
+        self.observe = False  # dry run: query launcher status, never remove records or chain ticks
 
     @contextlib.contextmanager
     def locked(self):
@@ -261,6 +262,8 @@ class Watch:
             return True
         if status == "running":
             return True
+        if self.observe:
+            return False
         try:
             path.unlink()
         except FileNotFoundError:
@@ -325,6 +328,7 @@ def cmd_pause_resume(a):
 
 def cmd_tick(a, spawn=None):
     with Watch(a.watch).locked() as w:
+        w.observe = a.dry_run
         if w.paused:
             print(f"watch {w.name}: paused; tick skipped")
             return 0
