@@ -16,7 +16,7 @@
 # on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
 # setup script) the SessionStart pull. bin/wait-pr-ready, which babysit-pr,
 # release and codex run as a background waiter, goes into ~/.claude/bin as well,
-# and so do bin/review-scan and its engine bin/agent-watch. review-scan loads
+# and so do bin/gh-review-thread, bin/review-scan and its engine bin/agent-watch. review-scan loads
 # both its engine and wait-pr-ready from beside itself. The codex and
 # remote-claude skills and their host picker live in a separate private repo
 # with its own setup, which installs them beside these skills.
@@ -94,6 +94,7 @@ memory="$HOME/.claude/bin/claude-memory"
 mkdir -p "$(dirname "$memory")"
 install -m 0755 "$repo_root/bin/claude-memory" "$memory"
 install -m 0755 "$repo_root/bin/wait-pr-ready" "$(dirname "$memory")/wait-pr-ready"
+install -m 0755 "$repo_root/bin/gh-review-thread" "$(dirname "$memory")/gh-review-thread"
 install -m 0755 "$repo_root/bin/agent-watch" "$(dirname "$memory")/agent-watch"
 install -m 0755 "$repo_root/bin/review-scan" "$(dirname "$memory")/review-scan"
 if $cloud; then
