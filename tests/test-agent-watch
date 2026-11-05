@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -711,6 +712,291 @@ for line in brief.splitlines():
         with patch.object(self.aw, 'run_shell', side_effect=run):
             self.assertEqual(self.tick()[0], 5)
         self.assertEqual(self.started, [])
+
+    def launcher(self, **settings):
+        script = self.root / 'launcher.py'
+        script.write_text('''import json, pathlib, sys
+control = pathlib.Path(sys.argv[1])
+settings = json.loads(control.read_text())
+verb = sys.argv[2]
+data = json.load(sys.stdin) if verb == 'start' else sys.argv[3:]
+with control.with_suffix('.calls').open('a') as calls:
+    calls.write(json.dumps([verb, data]) + '\\n')
+if verb == 'start' and settings.get('write_outputs'):
+    for field in ('log', 'last'):
+        pathlib.Path(data[field]).write_text('partial output')
+if settings.get(verb + '_error'):
+    print(settings[verb + '_error'], file=sys.stderr)
+    sys.exit(1)
+if verb == 'start':
+    print(settings.get('id', 'run-123'))
+elif verb == 'status':
+    statuses = settings.get('statuses', [])
+    status = statuses.pop(0) if statuses else settings.get('status', 'running')
+    control.write_text(json.dumps(settings))
+    print(status)
+''')
+        self.launch_control = self.root / 'launcher-control.json'
+        self.launch_settings = settings
+        self.write_launcher()
+        self.launcher_argv = [sys.executable, str(script), str(self.launch_control)]
+        self.assertEqual(self.init('--launcher', json.dumps(self.launcher_argv))[0], 0)
+        return self.aw.Watch('work').load()
+
+    def write_launcher(self):
+        self.launch_control.write_text(json.dumps(self.launch_settings))
+
+    def launcher_calls(self, verb):
+        path = self.launch_control.with_suffix('.calls')
+        return [data for kind, data in map(json.loads, path.read_text().splitlines()) if kind == verb]
+
+    def runfile(self, w, key='one'):
+        return w.runs / f'{w.slug(key)}.run'
+
+    def test_launcher_start_contract_and_stored_identity(self):
+        w = self.launcher()
+        with patch.object(self.aw.shutil, 'which', return_value=None), \
+             patch.object(self.aw, 'claude_logged_in', side_effect=AssertionError('local auth')):
+            result = self.cli('tick', 'work')
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(w.config['launcher'], self.launcher_argv)
+        self.assertEqual(json.loads(self.runfile(w).read_text()),
+                         {'launcher': self.launcher_argv, 'id': 'run-123'})
+        self.assertFalse(list(w.runs.glob('*.pid')))
+        data, = self.launcher_calls('start')
+        self.assertEqual(set(data), {'tool', 'model', 'effort', 'run_dir', 'brief', 'log', 'last', 'watch', 'key'})
+        self.assertEqual({k: data[k] for k in ('tool', 'model', 'effort', 'run_dir', 'watch', 'key')},
+                         dict(tool='claude', model='sonnet', effort='high', run_dir=str(self.root),
+                              watch='work', key=w.slug('one')))
+        self.assertIn('agent-watch settle work one --fingerprint v1 --verdict', data['brief'])
+        for field, suffix in [('log', '.jsonl'), ('last', '.last.md')]:
+            self.assertTrue(Path(data[field]).is_absolute())
+            self.assertEqual(Path(data[field]).parent, w.runs / w.slug('one'))
+            self.assertTrue(data[field].endswith(suffix))
+
+    def test_launcher_codex_payload_does_not_require_local_auth_or_checkout(self):
+        self.launcher()
+        self.assertEqual(self.init('--launcher', json.dumps(self.launcher_argv),
+                                   '--reviewer-model', 'gpt-6-astra')[0], 0)
+        with patch.object(self.aw.shutil, 'which', return_value=None), \
+             patch.object(self.aw, 'codex_logged_in', side_effect=AssertionError('local auth')), \
+             patch.object(self.aw, 'codex_git_dirs', side_effect=AssertionError('local checkout')):
+            result = self.cli('tick', 'work')
+        self.assertEqual(result[0], 0, result)
+        data, = self.launcher_calls('start')
+        self.assertEqual((data['tool'], data['model'], data['effort']), ('codex', 'gpt-6-astra', 'high'))
+
+    def test_launcher_scripted_statuses_release_run(self):
+        w = self.launcher(statuses=['running', 'succeeded'])
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        self.assertTrue(w.running('one'))
+        self.assertFalse(w.running('one'))
+        self.assertFalse(self.runfile(w).exists())
+        self.assertEqual(self.launcher_calls('status'), [['run-123'], ['run-123']])
+
+    def test_launcher_stale_pidfile_does_not_double_count_external_run(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        self.runfile(w).with_suffix('.pid').write_text('123 old start')
+        self.assertIn('1 run(s) in flight', self.cli('list')[1])
+        self.assertEqual(len(list(w.run_files())), 1)
+
+    def test_launcher_pruning_preserves_outputs_until_run_finishes(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        directory = w.runs / w.slug('one')
+        old = (self.clock - self.aw.dt.timedelta(days=self.aw.RUN_RETENTION_DAYS + 1)).timestamp()
+        for path in directory.iterdir():
+            os.utime(path, (old, old))
+        self.aw.prune_idle_runs(w, self.clock)
+        self.assertTrue(directory.exists())
+        self.assertTrue(list(directory.iterdir()))
+        self.launch_settings['status'] = 'succeeded'
+        self.write_launcher()
+        self.aw.prune_idle_runs(w, self.clock)
+        self.assertFalse(self.runfile(w).exists())
+        self.assertFalse(directory.exists())
+
+    def test_launcher_uninstall_stops_external_run_and_keeps_watch_state(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        with patch.object(self.aw, 'read_crontab', return_value=''), \
+             patch.object(self.aw, 'write_crontab'):
+            self.assertEqual(self.cli('uninstall', 'work')[0], 0)
+        self.assertEqual(self.launcher_calls('stop'), [['run-123']])
+        self.assertFalse(self.runfile(w).exists())
+        self.assertTrue((w.dir / 'config.json').exists())
+        self.assertTrue((w.dir / 'prs.json').exists())
+
+    def test_launcher_start_rejects_empty_or_multiline_run_id(self):
+        for run_id in ('', 'first\nsecond'):
+            with self.subTest(run_id=run_id):
+                w = self.launcher(id=run_id)
+                self.assertEqual(self.cli('tick', 'work')[0], 5)
+                self.assertFalse(self.runfile(w).exists())
+                self.assertFalse(list((w.runs / w.slug('one')).iterdir()))
+                self.assertNotIn('attempts', self.state()['one'])
+
+    def test_launcher_run_occupies_slot_and_appears_in_status(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        self.settings['items'] = [item('two')]
+        self.write()
+        result = self.cli('tick', 'work')
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(len(self.launcher_calls('start')), 1)
+        self.assertEqual(self.state()['_tick']['waiting'][0][0], 'two')
+        self.assertTrue(w.running('one'))
+        self.assertIn('running (1)', self.cli('status', 'work')[1])
+        self.assertIn('1 run(s) in flight', self.cli('list')[1])
+
+    def test_launcher_finished_status_removes_state_and_frees_slot(self):
+        for status in ('succeeded', 'failed'):
+            with self.subTest(status=status):
+                w = self.launcher()
+                self.assertEqual(self.cli('tick', 'work')[0], 0)
+                self.launch_settings['status'] = status
+                self.write_launcher()
+                self.assertFalse(w.running('one'))
+                self.assertFalse(self.runfile(w).exists())
+                self.launch_settings['status'] = 'running'
+                self.write_launcher()
+                self.assertEqual(self.cli('tick', 'work')[0], 0)
+                self.assertTrue(self.runfile(w).exists())
+                self.assertEqual(len(self.launcher_calls('start')), 2 if status == 'succeeded' else 4)
+                self.runfile(w).unlink()
+
+    def test_launcher_status_failure_and_invalid_status_keep_run_alive(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        for settings in ({'status_error': 'launcher unavailable'}, {'status': 'unknown'}):
+            with self.subTest(settings=settings):
+                self.launch_settings = settings
+                self.write_launcher()
+                self.assertTrue(w.running('one'))
+                self.assertTrue(self.runfile(w).exists())
+                self.assertIn('ERROR', (w.dir / 'scan.log').read_text())
+                self.assertEqual(self.cli('tick', 'work')[0], 0)
+                self.assertEqual(len(self.launcher_calls('start')), 1)
+
+    def test_launcher_status_timeout_is_ten_seconds_and_keeps_run_alive(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        original = subprocess.run
+        def timeout(command, *args, **kwargs):
+            if command == self.launcher_argv + ['status', 'run-123']:
+                self.assertEqual(kwargs['timeout'], 10)
+                raise subprocess.TimeoutExpired(command, 10)
+            return original(command, *args, **kwargs)
+        with patch.object(self.aw.subprocess, 'run', side_effect=timeout):
+            self.assertTrue(w.running('one'))
+        self.assertTrue(self.runfile(w).exists())
+        self.assertIn('ERROR', (w.dir / 'scan.log').read_text())
+
+    def test_launcher_stop_uses_recorded_command_and_keeps_state_on_failure(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        config = json.loads((w.dir / 'config.json').read_text())
+        config.pop('launcher')
+        self.aw.write_json(w.dir / 'config.json', config)
+        self.launch_settings['stop_error'] = 'cannot stop'
+        self.write_launcher()
+        self.assertEqual(self.cli('stop', 'work')[0], 5)
+        self.assertTrue(self.runfile(w).exists())
+        self.launch_settings.clear()
+        self.write_launcher()
+        self.assertEqual(self.cli('stop', 'work')[0], 0)
+        self.assertEqual(self.launcher_calls('stop'), [['run-123'], ['run-123']])
+        self.assertFalse(self.runfile(w).exists())
+
+    def test_launcher_start_failure_cleans_outputs_and_consumes_no_limits(self):
+        w = self.launcher(start_error='cannot launch', write_outputs=True)
+        result = self.cli('tick', 'work')
+        self.assertEqual(result[0], 5, result)
+        self.assertIn('cannot launch', result[1])
+        self.assertFalse(self.runfile(w).exists())
+        self.assertFalse(list(w.runs.glob('*.pid')))
+        self.assertEqual(list((w.runs / w.slug('one')).iterdir()), [])
+        self.assertEqual(self.state().get('_runs'), [])
+        self.assertNotIn('attempts', self.state()['one'])
+
+    def test_launcher_overlapping_completion_checks_chain_once(self):
+        w = self.launcher()
+        self.assertEqual(self.cli('tick', 'work')[0], 0)
+        stamp = self.clock.timestamp() - self.aw.CHAIN_AFTER
+        os.utime(self.runfile(w), (stamp, stamp))
+        entered, second_attempted, release = threading.Event(), threading.Event(), threading.Event()
+        results, errors = {}, []
+        original_lock = self.aw.Watch.launcher_locked
+
+        @contextlib.contextmanager
+        def observed_lock(watch):
+            if threading.current_thread().name == 'second-check':
+                second_attempted.set()
+            with original_lock(watch):
+                yield
+
+        def terminal_status(*args, **kwargs):
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError('completion check was not released')
+            return 'succeeded'
+
+        def check(label):
+            try:
+                results[label] = self.aw.Watch('work').load().running('one')
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=check, args=(label,), name=label + '-check', daemon=True)
+                   for label in ('first', 'second')]
+        with patch.object(self.aw.Watch, 'launcher_locked', observed_lock), \
+             patch.object(self.aw, 'launcher_command', side_effect=terminal_status) as status, \
+             patch.object(self.aw.subprocess, 'Popen') as chain:
+            try:
+                threads[0].start()
+                self.assertTrue(entered.wait(2), 'first completion check did not reach status')
+                threads[1].start()
+                self.assertTrue(second_attempted.wait(2), 'second completion check did not attempt the lock')
+                self.assertEqual(status.call_count, 1)
+            finally:
+                release.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(2)
+            self.assertFalse(any(thread.is_alive() for thread in threads), 'completion checks did not finish')
+            self.assertEqual(errors, [])
+            self.assertEqual(results, {'first': False, 'second': False})
+            status.assert_called_once_with(self.launcher_argv, 'status', 'run-123', timeout=10)
+            chain.assert_called_once()
+        self.assertFalse(self.runfile(w).exists())
+
+    def test_launcher_finished_long_run_chains_once_and_short_run_does_not(self):
+        w = self.launcher()
+        original = subprocess.Popen
+        chained = []
+        def capture(command, *args, **kwargs):
+            if command[1:3] == ['tick', '--chained']:
+                chained.append((command, kwargs))
+                return None
+            return original(command, *args, **kwargs)
+        for age in (self.aw.CHAIN_AFTER - 1, self.aw.CHAIN_AFTER):
+            self.launch_settings['status'] = 'running'
+            self.write_launcher()
+            self.assertEqual(self.cli('tick', 'work')[0], 0)
+            stamp = self.clock.timestamp() - age
+            os.utime(self.runfile(w), (stamp, stamp))
+            self.launch_settings['status'] = 'succeeded'
+            self.write_launcher()
+            with patch.object(self.aw.subprocess, 'Popen', side_effect=capture):
+                self.assertFalse(w.running('one'))
+                self.assertFalse(w.running('one'))
+            self.assertEqual(len(chained), int(age >= self.aw.CHAIN_AFTER))
+        command, kwargs = chained[0]
+        self.assertEqual(command, [str(Path(sys.argv[0]).resolve()), 'tick', '--chained', 'work'])
+        self.assertTrue(kwargs['start_new_session'])
+        self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
+        self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
 
     def test_linux_schedules_of_both_tools_do_not_remove_each_other(self):
         loader = importlib.machinery.SourceFileLoader('review_scan', str(SCRIPT.with_name('review-scan')))
