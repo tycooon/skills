@@ -56,7 +56,11 @@ command failure is logged without changing tick accounting. Agent runs also use 
 State: $AGENT_WATCH_HOME (default ~/.local/state/agent-watch)/<watch>/prs.json.
 Model IDs select Claude or Codex, as in review-scan. Account/model commands and
 former-agent history work the same way.
-Codex runs in a git work tree grant sandbox write access to its git dir and the common dir's objects, refs and logs, discovered after preparation at each launch. This avoids per-command git write approvals and weakens git containment; see the --add-dir paragraph in the [Codex skill, step 2](../codex/SKILL.md#2-launch) for the security trade-off.
+Codex runs in a git work tree grant sandbox write access to its git dir and the common dir's objects, refs and logs, discovered after preparation at each launch. This avoids per-command git write approvals and weakens git containment. The main
+checkout's config and hooks stay read-only, but the worktree's git dir holds commondir
+and config.worktree, so a sandboxed command can point git at a config it wrote (with
+core.fsmonitor, core.hooksPath or an alias), and that code runs unsandboxed at the next
+git call anyone makes in the worktree outside the sandbox.
 Paused ticks do no work; in-flight runs can
 still settle. Rechecks queue work for the next tick. install uses launchd on macOS
 and writes an idempotent tagged crontab entry on Linux; uninstall keeps state.
