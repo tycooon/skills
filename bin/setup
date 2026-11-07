@@ -51,6 +51,7 @@ targets=(
   "$HOME/.codex/skills"
   "$HOME/.zcode/skills"
   "$HOME/.opencode/skills"
+  "$HOME/.gemini/config/skills"
 )
 
 # Collect skill directories (those holding a SKILL.md).
