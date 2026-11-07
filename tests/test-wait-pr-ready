@@ -875,9 +875,26 @@ class Loop(unittest.TestCase):
         mark = out.rsplit("activity ", 1)[1].strip()
         self.assertEqual(mark, "2026-10-15T10:00:00Z")
         newer = ready_pr(updatedAt="2026-10-15T10:30:00Z")
-        code, _, waits = self.run_main([ready_pr(), ready_pr(), newer], args=["--after", mark])
+        code, _, waits = self.run_main([ready_pr(), ready_pr(), newer], args=["--refused", mark])
         self.assertEqual(code, 0)
         self.assertEqual(len(waits), 2)
+
+    def test_after_never_holds_back_a_ready(self):
+        # A session arms the waiter with the time of its own PR read; a PR that is
+        # already ready then must exit at once, not wait for activity that never comes.
+        for url in (URL, GL_URL):
+            with self.subTest(url=url):
+                code, out, waits = self.run_main([ready_pr()], url=url, args=["--after", "2026-10-15T10:00:30Z"], start="2026-10-15T10:01:00Z")
+                self.assertEqual(code, 0, out)
+                self.assertEqual(waits, [])
+
+    def test_refused_is_a_usage_error_with_until_review_or_in_the_future(self):
+        for args in (["--until-review", "--refused", "2026-10-15T10:00:00Z"], ["--refused", "2026-10-15T10:10:00Z"]):
+            with self.subTest(args=args):
+                err = io.StringIO()
+                code, out, waits = self.run_main([], args=args, stderr=err)
+                self.assertEqual(code, 2)
+                self.assertEqual(waits, [])
 
     def test_future_after_is_a_usage_error_before_any_pr_read(self):
         for url in (URL, GL_URL):
@@ -900,7 +917,8 @@ class Loop(unittest.TestCase):
                         later = w.iso(w.ts(mark) + 1)
                         initial = ready_pr(updatedAt=mark, reviews={"nodes": [review("review-bot", "APPROVED", "AI reviewer: Claude.", at=mark)]})
                         newer = ready_pr(updatedAt=later, reviews={"nodes": [review("review-bot", "APPROVED", "AI reviewer: Claude.", at=later)]})
-                        code, _, waits = self.run_main([initial, newer], url=url, args=[*mode, "--after", mark])
+                        flag = "--after" if mode else "--refused"
+                        code, _, waits = self.run_main([initial, newer], url=url, args=[*mode, flag, mark])
                         self.assertEqual(code, 14 if mode else 0)
                         self.assertEqual(waits, [60])
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wait until a GitHub PR or GitLab MR is ready to merge, then exit with the reason.
 
-  wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]... [--after TIME] [--known-conflict]
+  wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]... [--after TIME] [--refused MARK] [--known-conflict]
   wait-pr-ready <pr-url> --until-review [--head SHA] [--reviewer LOGIN]... [--after TIME]
 
 Run it as one background shell command: the agent's session resumes when it
@@ -22,7 +22,7 @@ P2/P3 severity tag carries the "non-blocking" marker and its author and identity
 APPROVED review also remains non-blocking for compatibility.
 
 Exit codes:
-  0  ready; the line ends with the PR's activity mark, for --after
+  0  ready; the line ends with the PR's activity mark, for --refused
   10 merged
   11 closed without merging
   12 the head moved away from the one being watched
@@ -76,9 +76,10 @@ Options:
                     account's formal approval on the head doesn't approve, but
                     wakes with exit 14, naming the account, since it likely
                     means LOGIN is the wrong one.
-  --after TIME      report ready, or a CI failure, only once the PR has activity
-                    newer than TIME (ISO 8601): the mark of a ready that a
-                    recheck refused, or of a failure the last round left as it was.
+  --after TIME      report a CI failure only once the PR has activity newer
+                    than TIME (ISO 8601): the mark of a failure the last round
+                    left as it was. It never holds back a ready: a PR that is
+                    already ready when the waiter starts exits 0 at once.
                     In both modes, an open thread awaits the author only when
                     its last comment is newer than TIME. Re-arm with the printed
                     activity mark when a thread is left open on purpose.
@@ -88,6 +89,11 @@ Options:
                     read, never a typed future time. More than 60 seconds ahead
                     of startup UTC is a usage error before any PR read; the
                     allowance covers small clock differences.
+  --refused MARK    report ready only once the PR has activity newer than MARK:
+                    the mark an exit 0 printed for a ready that the session's
+                    recheck then refused (a host merge block, a go-signal the
+                    recheck disagreed with). Never a read time: the PR would
+                    stay held until something on it moves. Readiness mode only.
   --until-review    don't wait for readiness: exit 14 on an open thread awaiting
                     the author, or the first review, comment or review thread
                     the first read didn't have. With --reviewer, also as soon as
@@ -1018,13 +1024,19 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     parser.add_argument("--reviewer", action="append", default=[])
     parser.add_argument("--after", type=ts, default=0.0,
                         help="ISO 8601 mark from a previous exit or your own PR read; never a typed future time (60s clock-skew allowance)")
+    parser.add_argument("--refused", type=ts, default=0.0,
+                        help="activity mark of a ready the session's recheck refused; ready is held until newer activity")
     parser.add_argument("--until-review", action="store_true")
     parser.add_argument("--known-conflict", action="store_true")
     args = parser.parse_args(argv)
 
     started = now()
-    if args.after > started + AFTER_CLOCK_SKEW:
-        print(f"error: --after {iso(args.after)} is more than {AFTER_CLOCK_SKEW}s ahead of current UTC time {iso(started)}", file=sys.stderr)
+    for flag in ("after", "refused"):
+        if getattr(args, flag) > started + AFTER_CLOCK_SKEW:
+            print(f"error: --{flag} {iso(getattr(args, flag))} is more than {AFTER_CLOCK_SKEW}s ahead of current UTC time {iso(started)}", file=sys.stderr)
+            return 2
+    if args.refused and args.until_review:
+        print("error: --refused holds back a ready, which --until-review never reports", file=sys.stderr)
         return 2
 
     host = forge(args.url)
@@ -1135,9 +1147,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             elif oldest is not None and now() - oldest < RUN_SETTLE:
                 ready = False
                 reasons.append(f"runs for this head are under {RUN_SETTLE // 60} min old; another workflow may still start")
-        if ready and mark <= args.after:
+        if ready and mark <= args.refused:
             ready = False
-            reasons.append(f"no activity since {iso(args.after)}")
+            reasons.append(f"ready was refused at {iso(args.refused)}; no activity since")
         if ready:
             return (0, f"ready: {args.url} at {head}: " + "; ".join(reasons) + f"; activity {iso(mark)}"), mark
         # A run that ended unsuccessfully clears by no one's hand, as a failed check doesn't.
