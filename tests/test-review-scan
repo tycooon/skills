@@ -29,6 +29,7 @@ def load_module():
 
 
 rs = load_module()
+REAL_POSTING_LOGIN = rs.posting_login
 A, B = "a" * 40, "b" * 40
 PR1 = "https://github.com/acme/app/pull/1"
 PR2 = "https://github.com/acme/app/pull/2"
@@ -753,6 +754,36 @@ class ScheduledTokens(Base):
         self.assertEqual(len(self.spawned), 2)
         self.assertEqual(len(self.logins), 1)  # two PRs, one lookup
 
+    def test_posting_login_runs_the_host_cli_and_parses_its_json(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append((cmd, kw["env"]))
+            body = {"login": "gh-bot"} if cmd[0] == "gh" else {"username": "gl-bot"}
+            return rs.subprocess.CompletedProcess(cmd, 0, json.dumps(body), "")
+
+        with patch.object(rs.subprocess, "run", side_effect=run):
+            self.assertEqual(REAL_POSTING_LOGIN(PR1, "tg"), "gh-bot")
+            self.assertEqual(REAL_POSTING_LOGIN("https://git.example.com/g/p/-/merge_requests/3", "tl"), "gl-bot")
+        (gh, gh_env), (glab, glab_env) = calls
+        self.assertEqual(gh, ["gh", "api", "user"])
+        self.assertEqual(gh_env["GH_TOKEN"], "tg")
+        self.assertEqual(glab, ["glab", "api", "--hostname", "git.example.com", "user"])
+        self.assertEqual(glab_env["GITLAB_TOKEN"], "tl")
+        for bad in (rs.subprocess.CompletedProcess([], 1, "{}", ""), rs.subprocess.CompletedProcess([], 0, "no json", ""),
+                    rs.subprocess.CompletedProcess([], 0, "[]", "")):
+            with patch.object(rs.subprocess, "run", return_value=bad):
+                self.assertIsNone(REAL_POSTING_LOGIN(PR1, "t"))
+
+    def test_the_login_cache_is_per_host_for_a_shared_variable(self):
+        urls = ["https://gl-a.example.com/g/p/-/merge_requests/1", "https://gl-b.example.com/g/p/-/merge_requests/1"]
+        w = rs.Watch(self.watch).load()
+        rows = [{"url": u, "token": "SHARED", "author": "dev"} for u in urls]
+        with patch.dict(os.environ, {"SHARED": "x"}):
+            for r in rows * 2:
+                rs.engine.SOURCE.preflight(w, r)
+        self.assertEqual([u for u, _ in self.logins], urls)
+
     def test_a_dry_run_reports_a_missing_token_without_recording_it(self):
         with patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": ""}):
             code, out = self.cli("tick", self.watch, "--dry-run")
@@ -767,7 +798,7 @@ class ScheduledTokens(Base):
         brief = self.spawned[0][1]
         self.assertIn("Posting account: `bot`, the login of `$PR_REVIEW_GH_TOKEN`", brief)
         self.assertIn("prints anything but `bot`", brief)
-        self.assertIn("is the PR author (`dev`)", brief)
+        self.assertNotIn("PR author", brief)
         self.assertIn("gh api user", brief)
         self.assertIn("History accounts", brief)
         self.assertIn("review-bot", brief.split("History accounts")[1])
