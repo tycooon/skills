@@ -946,7 +946,110 @@ class Loop(unittest.TestCase):
         code, out, waits = self.run_main([approved], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
         self.assertEqual(code, 14, out)
         self.assertIn("review-bot's approval is already on", out)
+        self.assertEqual(out, f"review activity: review-bot's approval is already on {URL} at {HEAD}\n")
         self.assertEqual(waits, [])
+
+    def test_until_review_exits_on_a_carried_approval_by_findings(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        for answered, resolved in ((True, False), (False, True)):
+            with self.subTest(answered=answered, resolved=resolved):
+                thread = finding_thread("R1", "src/a.rs", answered=answered)
+                thread["isResolved"] = resolved
+                pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                              reviewThreads={"totalCount": 1, "nodes": [thread]})
+                original_hunks = w.changed_hunks
+                w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+                try:
+                    code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+                finally:
+                    w.changed_hunks = original_hunks
+                self.assertEqual(code, 14, out)
+                self.assertIn("approval of", out)
+                self.assertIn("covers", out)
+                self.assertIn(f"review activity: review-bot's approval of {OLD[:12]} covers {URL} at {HEAD}; all findings answered or resolved, 10/30 later changed lines", out)
+                self.assertEqual(waits, [])
+
+    def test_until_review_carried_approval_over_line_cap_keeps_waiting(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True)]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 31, 0)]}
+        try:
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.changed_hunks = original_hunks
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_unanswered_finding_keeps_waiting_and_preserves_owed_thread_exit(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        thread = finding_thread("R1", "src/a.rs", answered=False)
+        thread["comments"]["nodes"][0]["createdAt"] = "2026-10-15T10:00:00Z"
+        thread["replies"]["nodes"][0]["createdAt"] = "2026-10-15T10:00:00Z"
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [thread]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+        try:
+            # When --after is past the thread, owed_threads does not trigger, and the waiter keeps waiting.
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)],
+                                             args=["--until-review", "--reviewer", "review-bot", "--head", HEAD, "--after", "2026-10-15T10:05:00Z"],
+                                             start="2026-10-15T10:05:00Z")
+            self.assertEqual(code, 12, out)
+            self.assertEqual(len(waits), 2)
+
+            # Without --after past the thread, owed-thread exit behaves as before.
+            code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+            self.assertEqual(code, 14, out)
+            self.assertIn("an open thread awaits the author", out)
+            self.assertEqual(waits, [])
+        finally:
+            w.changed_hunks = original_hunks
+
+    def test_until_review_carried_approval_by_base_sync_exits(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 0, "nodes": []})
+        original_lines = w.authored_lines
+        w.authored_lines = lambda owner, name, base, sha: ["+same"]
+        try:
+            code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.authored_lines = original_lines
+        self.assertEqual(code, 14, out)
+        self.assertIn("approval of", out)
+        self.assertIn("covers", out)
+        self.assertIn(f"review activity: review-bot's approval of {OLD[:12]} covers {URL} at {HEAD}, a base-sync of {HEAD[:12]}", out)
+        self.assertEqual(waits, [])
+
+    def test_until_review_carried_approval_by_unlisted_approver_keeps_waiting(self):
+        approve = {**review("other-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True, opener="other-bot")]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+        try:
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.changed_hunks = original_hunks
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_carried_approval_with_role_qualified_identity_keeps_waiting(self):
+        for qualifier in ("Codex handoff", "session reviewer"):
+            with self.subTest(qualifier=qualifier):
+                body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {OLD}."
+                approve = {**review("review-bot", "APPROVED", body, sha=OLD), "id": "R1"}
+                pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                              reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True)]})
+                original_hunks = w.changed_hunks
+                w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+                try:
+                    code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+                finally:
+                    w.changed_hunks = original_hunks
+                self.assertEqual(code, 12, out)
+                self.assertEqual(len(waits), 2)
 
     def test_until_review_keeps_waiting_on_a_listed_findings_verdict_already_on_the_head(self):
         # The session argued the finding back without pushing; it waits for the answer.
