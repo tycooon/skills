@@ -59,6 +59,12 @@ class Base(unittest.TestCase):
         rs.engine.now_utc = lambda: rs.parse_time("2026-10-23T12:00:00Z")
         self.notified = []
         rs.engine.notify = self.notified.append
+        env = patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": "t", "PR_REVIEW_GITLAB_TOKEN": "t"})
+        env.start()
+        self.addCleanup(env.stop)
+        sched = patch.object(rs.engine, "is_scheduled", return_value=False)  # the host's crontab is not under test
+        sched.start()
+        self.addCleanup(sched.stop)
         self.watch = f"w{self.id().split('.')[-1]}"
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--reviewer-model", "sonnet")
 
@@ -697,6 +703,52 @@ class Nudge(Base):
         self.assertNotIn(self.watch, miss)
 
 
+class ScheduledTokens(Base):
+    def test_nudge_on_an_installed_watch_runs_the_login_shell_with_only(self):
+        started = []
+        with patch.object(rs.engine, "is_scheduled", return_value=True), \
+                patch.dict(os.environ, {"GH_TOKEN": "agent"}), \
+                patch.object(rs.subprocess, "Popen", side_effect=lambda cmd, **kw: started.append((cmd, kw))):
+            self.assertEqual(self.cli("nudge", PR1, "--head", B)[0], 0)
+        (cmd, kw), = [c for c in started if f"tick {self.watch} " in c[0][2]]
+        self.assertEqual(cmd[1], "-lc")
+        self.assertTrue(cmd[0].endswith(("/zsh", "/bash")))
+        self.assertTrue(cmd[2].startswith("exec ") and f"tick {self.watch} --only {PR1}" in cmd[2])
+        self.assertNotIn("GH_TOKEN", kw["env"])
+
+    def test_tick_with_an_empty_token_starts_no_run_and_records_the_error(self):
+        for var, value in (("PR_REVIEW_GH_TOKEN", ""), ("PR_REVIEW_GH_TOKEN", None)):
+            with patch.dict(os.environ, {var: value or ""}):
+                if value is None:
+                    os.environ.pop(var)
+                code, out = self.cli("tick", self.watch)
+            self.assertEqual(code, 5)
+            self.assertEqual(self.spawned, [])
+        self.assertIn(f"watch {self.watch}: no review run started: $PR_REVIEW_GH_TOKEN is unset or empty", out)
+        self.assertIn("PR_REVIEW_GH_TOKEN", self.prs()["_alert"]["problem"])
+        self.assertIn("ERROR: watch " + self.watch, (rs.HOME / self.watch / "scan.log").read_text())
+        _, status = self.cli("status", self.watch)
+        self.assertIn("PR_REVIEW_GH_TOKEN", status)
+
+    def test_a_target_token_variable_is_the_one_checked(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--token", "acme/app=ACME_TOKEN")
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("$ACME_TOKEN", out)
+        with patch.dict(os.environ, {"ACME_TOKEN": "x"}):
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(len(self.spawned), 2)
+
+    def test_brief_names_the_posting_account_apart_from_the_history(self):
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        self.assertIn("Posting account: the login of `$PR_REVIEW_GH_TOKEN`", brief)
+        self.assertIn("gh api user", brief)
+        self.assertIn("History accounts", brief)
+        self.assertIn("review-bot", brief.split("History accounts")[1])
+        self.assertNotIn("Accounts that post as you", brief)
+
+
 class PausedNudge(Base):
     def setUp(self):
         home = patch.object(rs.engine, "HOME", Path(TMP.name) / self.id().split(".")[-1])
@@ -1019,7 +1071,8 @@ class TargetToken(Base):
     def test_a_target_token_reaches_the_brief_and_status(self):
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot",
                  "--token", "acme/app=PR_REVIEW_TOKEN_ACME")
-        self.cli("tick", self.watch)
+        with patch.dict(os.environ, {"PR_REVIEW_TOKEN_ACME": "x"}):
+            self.cli("tick", self.watch)
         self.assertIn("`$PR_REVIEW_TOKEN_ACME`", self.spawned[0][1])
         self.assertIn('`PR_REVIEW_GH_TOKEN="$PR_REVIEW_TOKEN_ACME"` exported', self.spawned[0][1])
         _, out = self.cli("status", self.watch)
