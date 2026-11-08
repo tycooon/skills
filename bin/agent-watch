@@ -128,10 +128,20 @@ class ScanError(RuntimeError):
     pass
 
 
-class MissingToken(ScanError):
+class PostingBlocked(ScanError):
+    """A run's posting identity can't be established; `reason` completes "no review run started: …"."""
+    def __init__(self, variable, reason):
+        super().__init__(reason)
+        self.variable, self.reason = variable, reason
+
+    def problem(self, w):
+        return f"watch {w.name}: no review run started: {self.reason}"
+
+
+class MissingToken(PostingBlocked):
     def __init__(self, variable):
-        super().__init__(f"${variable} is unset or empty")
-        self.variable = variable
+        super().__init__(variable, f"${variable} is unset or empty, so a run would post from whatever account "
+                                   "`gh` is logged in as; export it in the scheduled tick's login shell")
 
 
 def now_utc():
@@ -414,23 +424,29 @@ def tick(w, a, spawn):
                 accounting.append(f"{key}: owed ({reason}), waiting for a free slot")
                 waiting.append([key, reason])
             continue
-        if a.dry_run:
-            accounting.extend(f"{key}: would start a run ({reason})" for key, _, reason, _ in batch)
-            continue
         key = batch[0][0]
         try:
             for item in batch:
                 SOURCE.preflight(w, item[1])
+        except PostingBlocked as e:
+            if a.dry_run:
+                accounting.append(f"{key}: owed, would not start a run: {e.problem(w)}")
+                continue
+            not_started.append(key)
+            blocked.setdefault(e.variable, e.problem(w))
+            for k, _, reason, _ in batch:
+                accounting.append(f"{k}: owed ({reason}), run FAILED to start ({e.reason})")
+            continue
+        if a.dry_run:
+            accounting.extend(f"{key}: would start a run ({reason})" for key, _, reason, _ in batch)
+            continue
+        try:
             if cfg.get("prepare_cmd"):
                 shell_command(cfg["prepare_cmd"], cfg["run_dir"])
             brief = SOURCE.brief(w, batch, listed, now)
             log = spawn(w, key, brief)
         except (OSError, ScanError, subprocess.SubprocessError) as e:
             not_started.append(key)
-            if isinstance(e, MissingToken):
-                blocked.setdefault(e.variable, f"watch {w.name}: no review run started: ${e.variable} is unset or empty, "
-                                               "so a run would post from whatever account `gh` is logged in as; "
-                                               f"export it in the scheduled tick's login shell")
             for k, _, reason, _ in batch:
                 accounting.append(f"{k}: owed ({reason}), run FAILED to start ({e})")
             continue

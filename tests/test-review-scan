@@ -62,6 +62,10 @@ class Base(unittest.TestCase):
         env = patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": "t", "PR_REVIEW_GITLAB_TOKEN": "t"})
         env.start()
         self.addCleanup(env.stop)
+        self.logins = []
+        login = patch.object(rs, "posting_login", side_effect=lambda url, token: self.logins.append((url, token)) or "bot")
+        login.start()
+        self.addCleanup(login.stop)
         sched = patch.object(rs.engine, "is_scheduled", return_value=False)  # the host's crontab is not under test
         sched.start()
         self.addCleanup(sched.stop)
@@ -739,10 +743,31 @@ class ScheduledTokens(Base):
             self.assertEqual(self.cli("tick", self.watch)[0], 0)
         self.assertEqual(len(self.spawned), 2)
 
+    def test_an_unresolvable_login_starts_no_run_and_resolves_once_per_tick(self):
+        with patch.object(rs, "posting_login", return_value=None):
+            code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("does not resolve to a login", out)
+        self.assertIn("$PR_REVIEW_GH_TOKEN does not resolve", self.prs()["_alert"]["problem"])
+        self.cli("tick", self.watch)
+        self.assertEqual(len(self.spawned), 2)
+        self.assertEqual(len(self.logins), 1)  # two PRs, one lookup
+
+    def test_a_dry_run_reports_a_missing_token_without_recording_it(self):
+        with patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": ""}):
+            code, out = self.cli("tick", self.watch, "--dry-run")
+        self.assertIn("would not start a run", out)
+        self.assertIn("$PR_REVIEW_GH_TOKEN is unset or empty", out)
+        self.assertNotIn("would start a run", out)
+        self.assertNotIn("_alert", self.prs() if (rs.HOME / self.watch / "prs.json").exists() else {})
+        self.assertEqual(self.notified, [])
+
     def test_brief_names_the_posting_account_apart_from_the_history(self):
         self.cli("tick", self.watch)
         brief = self.spawned[0][1]
-        self.assertIn("Posting account: the login of `$PR_REVIEW_GH_TOKEN`", brief)
+        self.assertIn("Posting account: `bot`, the login of `$PR_REVIEW_GH_TOKEN`", brief)
+        self.assertIn("prints anything but `bot`", brief)
+        self.assertIn("is the PR author (`dev`)", brief)
         self.assertIn("gh api user", brief)
         self.assertIn("History accounts", brief)
         self.assertIn("review-bot", brief.split("History accounts")[1])

@@ -286,6 +286,20 @@ def posting_variable(r):
     return r.get("token") or ("PR_REVIEW_GH_TOKEN" if GH_PR.match(r["url"]) else "PR_REVIEW_GITLAB_TOKEN")
 
 
+def posting_login(url, token):
+    """The login a token posts as on this PR's host, or None when it can't be resolved."""
+    if GH_PR.match(url):
+        cmd, env = ["gh", "api", "user", "--jq", ".login"], {"GH_TOKEN": token}
+    else:
+        host = urllib.parse.urlparse(url).hostname
+        cmd, env = ["glab", "api", "--hostname", host, "user", "--jq", ".username"], {"GITLAB_TOKEN": token}
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env={**os.environ, **env})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.strip() or None if p.returncode == 0 else None
+
+
 def build_brief(w, r, rec, reason, siblings, now):
     cfg = w.config
     prev = rec.get("last_run")
@@ -299,10 +313,10 @@ def build_brief(w, r, rec, reason, siblings, now):
         f"- Why this run: {reason}.",
         f"- Head when the scan listed it: `{r['head']}`; base branch `{r['base']}`; author `{r['author']}`.",
         f"- Run start time, for `settle --since`: `{engine.iso(now)}`.",
-        f"- Posting account: the login of `${posting_variable(r)}`. Before your first post, run "
-        f"`GH_TOKEN=\"${posting_variable(r)}\" gh api user --jq .login` (GitLab: the same token against `/user`) "
-        "and stop without posting if it fails or prints a login that is not that bot's. Never post from "
-        "an ambient `gh` login.",
+        f"- Posting account: `{r['posting_login']}`, the login of `${posting_variable(r)}`, resolved by the scan. "
+        f"Before your first post, run `GH_TOKEN=\"${posting_variable(r)}\" gh api user --jq .login` (GitLab: the same token "
+        f"against `/user`) and stop without posting if it fails or prints anything but `{r['posting_login']}`. "
+        f"Also stop without posting if that login is the PR author (`{r['author']}`). Never post from an ambient `gh` login.",
         f"- History accounts (every account whose past posts count as yours, the posting account and the owner's own "
         f"among them): {', '.join(cfg['own'])}.",
     ]
@@ -541,8 +555,16 @@ class PRSource:
 
     def preflight(self, w, row):
         variable = posting_variable(row)
-        if not os.environ.get(variable):
+        token = os.environ.get(variable)
+        if not token:
             raise engine.MissingToken(variable)
+        cache = w.__dict__.setdefault("_posting_logins", {})  # per command, so once per tick
+        if variable not in cache:
+            cache[variable] = posting_login(row["url"], token)
+        if not cache[variable]:
+            raise engine.PostingBlocked(variable, f"${variable} does not resolve to a login "
+                                                  "(the token is rejected or the host is unreachable)")
+        row["posting_login"] = cache[variable]
 
     def describe(self, w, detail):
         for t in w.config["targets"]:
