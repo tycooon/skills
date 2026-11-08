@@ -27,6 +27,13 @@ A PR that has not changed costs nothing: no agent runs. The run follows review-o
 nothing but our own posts landed while the run was working, and only once the PR shows
 the verdict the run claims: an approval of ours at the head, or an open thread of ours.
 
+A nudge on a scheduled watch runs its tick through the schedule's own login shell (`zsh -lc` on a Mac,
+`bash -lc` under cron) with `--only`, so the posting tokens come from the profile as in a scheduled tick.
+(`launchctl kickstart` is not used: it cannot pass `--only`.) An unscheduled watch's tick is a direct child.
+Either way a tick starts no review run for a target whose posting token variable (`PR_REVIEW_GH_TOKEN`,
+`PR_REVIEW_GITLAB_TOKEN` or the target's `--token` variable) is unset or empty: it logs an ERROR naming the
+variable and the watch, and `status` shows it, rather than letting `gh` fall back to the owner's login.
+
 `pause` persists across configuration and schedule changes: every tick skips work, including manual and dry-run ticks, and nudges queue rechecks without starting a tick. Reviews already in flight can finish and settle. `resume` keeps the schedule unchanged and leaves scanning to the next tick; use `tick` for an immediate scan. An unscheduled watch stays unscheduled.
 
 A watch never stops on its own. A single tick that cannot read any target is logged but not alerted; the second consecutive unreadable tick sends a desktop notification. A review run failing to start or nothing being left to watch alerts immediately. `status` shows the same problem until it clears.
@@ -274,6 +281,30 @@ def owed_reason(rec, row, full):
     return None
 
 
+def posting_variable(r):
+    """The environment variable holding the token a run on this row posts with."""
+    return r.get("token") or ("PR_REVIEW_GH_TOKEN" if GH_PR.match(r["url"]) else "PR_REVIEW_GITLAB_TOKEN")
+
+
+def posting_login(url, token):
+    """The login a token posts as on this PR's host, or None when it can't be resolved."""
+    if GH_PR.match(url):
+        cmd, env, field = ["gh", "api", "user"], {"GH_TOKEN": token}, "login"
+    else:
+        cmd = ["glab", "api", "--hostname", urllib.parse.urlparse(url).hostname, "user"]
+        env, field = {"GITLAB_TOKEN": token}, "username"
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env={**os.environ, **env})
+        login = json.loads(p.stdout).get(field) if p.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return None
+    return login or None
+
+
+def posting_host(url):
+    return "github" if GH_PR.match(url) else urllib.parse.urlparse(url).hostname
+
+
 def build_brief(w, r, rec, reason, siblings, now):
     cfg = w.config
     prev = rec.get("last_run")
@@ -287,7 +318,12 @@ def build_brief(w, r, rec, reason, siblings, now):
         f"- Why this run: {reason}.",
         f"- Head when the scan listed it: `{r['head']}`; base branch `{r['base']}`; author `{r['author']}`.",
         f"- Run start time, for `settle --since`: `{engine.iso(now)}`.",
-        f"- Accounts that post as you: {', '.join(cfg['own'])}.",
+        f"- Posting account: `{r['posting_login']}`, the login of `${posting_variable(r)}`, resolved by the scan. "
+        f"Before your first post, run `GH_TOKEN=\"${posting_variable(r)}\" gh api user --jq .login` (GitLab: the same token "
+        f"against `/user`) and stop without posting if it fails or prints anything but `{r['posting_login']}`. "
+        "Never post from an ambient `gh` login.",
+        f"- History accounts (every account whose past posts count as yours, the posting account and the owner's own "
+        f"among them): {', '.join(cfg['own'])}.",
     ]
     if w.runner == "codex":
         lines.append("- This run is in Codex's workspace-write sandbox: a fetch into a shared clone is refused; "
@@ -302,7 +338,7 @@ def build_brief(w, r, rec, reason, siblings, now):
     if r.get("filter"):
         lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
     if r.get("token"):
-        default = "PR_REVIEW_GH_TOKEN" if GH_PR.match(r["url"]) else "PR_REVIEW_GITLAB_TOKEN"
+        default = posting_variable({"url": r["url"]})
         # Under the default name, so every posting command and helper that reads it gets this target's token.
         lines.append(f"- Post on this target with the token in `${r['token']}`: run every posting command, helper "
                      f"scripts included, with `{default}=\"${r['token']}\"` exported, never with the default value.")
@@ -448,12 +484,21 @@ def cmd_nudge(a):
             w.prs.setdefault(a.url, {}).setdefault("recheck", []).append(f"nudge after a push of {a.head[:12]}")
             w.save()
             paused = w.paused
+            tokens = [t["token"] for t in w.config["targets"] if t.get("token")]
         hit += 1
         if paused:
             print(f"watch {w.name}: paused; recheck queued for the next tick after resume")
         else:
-            subprocess.Popen([str(Path(sys.argv[0]).resolve()), "tick", w.name, "--only", a.url], start_new_session=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if engine.is_scheduled(w.name):
+                # The scheduled tick's own login shell, so the tokens come from where its runs get them;
+                # not `launchctl kickstart`, which cannot carry --only. Variables the caller holds are
+                # dropped so the profile is their only source.
+                cmd = engine.scheduled_tick_argv(w, "--only", a.url)
+                env = {k: v for k, v in os.environ.items() if k not in (
+                    "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN", "PR_REVIEW_GH_TOKEN", "PR_REVIEW_GITLAB_TOKEN", *tokens)}
+            else:
+                cmd, env = [str(Path(sys.argv[0]).resolve()), "tick", w.name, "--only", a.url], None
+            subprocess.Popen(cmd, start_new_session=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print(f"nudged watch {w.name}")
     if not hit:
         print("no review watch covers this PR")
@@ -512,6 +557,20 @@ class PRSource:
 
     def covers(self, spec, key):
         return covers(spec, key)
+
+    def preflight(self, w, row):
+        variable = posting_variable(row)
+        token = os.environ.get(variable)
+        if not token:
+            raise engine.MissingToken(variable)
+        cache = w.__dict__.setdefault("_posting_logins", {})  # per command, so once per tick
+        key = (variable, posting_host(row["url"]))
+        if key not in cache:
+            cache[key] = posting_login(row["url"], token)
+        if not cache[key]:
+            raise engine.PostingBlocked(variable, f"${variable} does not resolve to a login "
+                                                  "(the token is rejected or the host is unreachable)")
+        row["posting_login"] = cache[key]
 
     def describe(self, w, detail):
         for t in w.config["targets"]:

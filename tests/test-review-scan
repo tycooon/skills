@@ -29,6 +29,7 @@ def load_module():
 
 
 rs = load_module()
+REAL_POSTING_LOGIN = rs.posting_login
 A, B = "a" * 40, "b" * 40
 PR1 = "https://github.com/acme/app/pull/1"
 PR2 = "https://github.com/acme/app/pull/2"
@@ -59,6 +60,16 @@ class Base(unittest.TestCase):
         rs.engine.now_utc = lambda: rs.parse_time("2026-10-23T12:00:00Z")
         self.notified = []
         rs.engine.notify = self.notified.append
+        env = patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": "t", "PR_REVIEW_GITLAB_TOKEN": "t"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.logins = []
+        login = patch.object(rs, "posting_login", side_effect=lambda url, token: self.logins.append((url, token)) or "bot")
+        login.start()
+        self.addCleanup(login.stop)
+        sched = patch.object(rs.engine, "is_scheduled", return_value=False)  # the host's crontab is not under test
+        sched.start()
+        self.addCleanup(sched.stop)
         self.watch = f"w{self.id().split('.')[-1]}"
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--reviewer-model", "sonnet")
 
@@ -697,6 +708,103 @@ class Nudge(Base):
         self.assertNotIn(self.watch, miss)
 
 
+class ScheduledTokens(Base):
+    def test_nudge_on_an_installed_watch_runs_the_login_shell_with_only(self):
+        started = []
+        with patch.object(rs.engine, "is_scheduled", return_value=True), \
+                patch.dict(os.environ, {"GH_TOKEN": "agent"}), \
+                patch.object(rs.subprocess, "Popen", side_effect=lambda cmd, **kw: started.append((cmd, kw))):
+            self.assertEqual(self.cli("nudge", PR1, "--head", B)[0], 0)
+        (cmd, kw), = [c for c in started if f"tick {self.watch} " in c[0][2]]
+        self.assertEqual(cmd[1], "-lc")
+        self.assertTrue(cmd[0].endswith(("/zsh", "/bash")))
+        self.assertTrue(cmd[2].startswith("exec ") and f"tick {self.watch} --only {PR1}" in cmd[2])
+        self.assertNotIn("GH_TOKEN", kw["env"])
+
+    def test_tick_with_an_empty_token_starts_no_run_and_records_the_error(self):
+        for var, value in (("PR_REVIEW_GH_TOKEN", ""), ("PR_REVIEW_GH_TOKEN", None)):
+            with patch.dict(os.environ, {var: value or ""}):
+                if value is None:
+                    os.environ.pop(var)
+                code, out = self.cli("tick", self.watch)
+            self.assertEqual(code, 5)
+            self.assertEqual(self.spawned, [])
+        self.assertIn(f"watch {self.watch}: no review run started: $PR_REVIEW_GH_TOKEN is unset or empty", out)
+        self.assertIn("PR_REVIEW_GH_TOKEN", self.prs()["_alert"]["problem"])
+        self.assertIn("ERROR: watch " + self.watch, (rs.HOME / self.watch / "scan.log").read_text())
+        _, status = self.cli("status", self.watch)
+        self.assertIn("PR_REVIEW_GH_TOKEN", status)
+
+    def test_a_target_token_variable_is_the_one_checked(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--token", "acme/app=ACME_TOKEN")
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("$ACME_TOKEN", out)
+        with patch.dict(os.environ, {"ACME_TOKEN": "x"}):
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(len(self.spawned), 2)
+
+    def test_an_unresolvable_login_starts_no_run_and_resolves_once_per_tick(self):
+        with patch.object(rs, "posting_login", return_value=None):
+            code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("does not resolve to a login", out)
+        self.assertIn("$PR_REVIEW_GH_TOKEN does not resolve", self.prs()["_alert"]["problem"])
+        self.cli("tick", self.watch)
+        self.assertEqual(len(self.spawned), 2)
+        self.assertEqual(len(self.logins), 1)  # two PRs, one lookup
+
+    def test_posting_login_runs_the_host_cli_and_parses_its_json(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append((cmd, kw["env"]))
+            body = {"login": "gh-bot"} if cmd[0] == "gh" else {"username": "gl-bot"}
+            return rs.subprocess.CompletedProcess(cmd, 0, json.dumps(body), "")
+
+        with patch.object(rs.subprocess, "run", side_effect=run):
+            self.assertEqual(REAL_POSTING_LOGIN(PR1, "tg"), "gh-bot")
+            self.assertEqual(REAL_POSTING_LOGIN("https://git.example.com/g/p/-/merge_requests/3", "tl"), "gl-bot")
+        (gh, gh_env), (glab, glab_env) = calls
+        self.assertEqual(gh, ["gh", "api", "user"])
+        self.assertEqual(gh_env["GH_TOKEN"], "tg")
+        self.assertEqual(glab, ["glab", "api", "--hostname", "git.example.com", "user"])
+        self.assertEqual(glab_env["GITLAB_TOKEN"], "tl")
+        for bad in (rs.subprocess.CompletedProcess([], 1, "{}", ""), rs.subprocess.CompletedProcess([], 0, "no json", ""),
+                    rs.subprocess.CompletedProcess([], 0, "[]", "")):
+            with patch.object(rs.subprocess, "run", return_value=bad):
+                self.assertIsNone(REAL_POSTING_LOGIN(PR1, "t"))
+
+    def test_the_login_cache_is_per_host_for_a_shared_variable(self):
+        urls = ["https://gl-a.example.com/g/p/-/merge_requests/1", "https://gl-b.example.com/g/p/-/merge_requests/1"]
+        w = rs.Watch(self.watch).load()
+        rows = [{"url": u, "token": "SHARED", "author": "dev"} for u in urls]
+        with patch.dict(os.environ, {"SHARED": "x"}):
+            for r in rows * 2:
+                rs.engine.SOURCE.preflight(w, r)
+        self.assertEqual([u for u, _ in self.logins], urls)
+
+    def test_a_dry_run_reports_a_missing_token_without_recording_it(self):
+        with patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": ""}):
+            code, out = self.cli("tick", self.watch, "--dry-run")
+        self.assertIn("would not start a run", out)
+        self.assertIn("$PR_REVIEW_GH_TOKEN is unset or empty", out)
+        self.assertNotIn("would start a run", out)
+        self.assertNotIn("_alert", self.prs() if (rs.HOME / self.watch / "prs.json").exists() else {})
+        self.assertEqual(self.notified, [])
+
+    def test_brief_names_the_posting_account_apart_from_the_history(self):
+        self.cli("tick", self.watch)
+        brief = self.spawned[0][1]
+        self.assertIn("Posting account: `bot`, the login of `$PR_REVIEW_GH_TOKEN`", brief)
+        self.assertIn("prints anything but `bot`", brief)
+        self.assertNotIn("PR author", brief)
+        self.assertIn("gh api user", brief)
+        self.assertIn("History accounts", brief)
+        self.assertIn("review-bot", brief.split("History accounts")[1])
+        self.assertNotIn("Accounts that post as you", brief)
+
+
 class PausedNudge(Base):
     def setUp(self):
         home = patch.object(rs.engine, "HOME", Path(TMP.name) / self.id().split(".")[-1])
@@ -1019,7 +1127,8 @@ class TargetToken(Base):
     def test_a_target_token_reaches_the_brief_and_status(self):
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot",
                  "--token", "acme/app=PR_REVIEW_TOKEN_ACME")
-        self.cli("tick", self.watch)
+        with patch.dict(os.environ, {"PR_REVIEW_TOKEN_ACME": "x"}):
+            self.cli("tick", self.watch)
         self.assertIn("`$PR_REVIEW_TOKEN_ACME`", self.spawned[0][1])
         self.assertIn('`PR_REVIEW_GH_TOKEN="$PR_REVIEW_TOKEN_ACME"` exported', self.spawned[0][1])
         _, out = self.cli("status", self.watch)

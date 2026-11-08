@@ -128,6 +128,22 @@ class ScanError(RuntimeError):
     pass
 
 
+class PostingBlocked(ScanError):
+    """A run's posting identity can't be established; `reason` completes "no review run started: …"."""
+    def __init__(self, variable, reason):
+        super().__init__(reason)
+        self.variable, self.reason = variable, reason
+
+    def problem(self, w):
+        return f"watch {w.name}: no review run started: {self.reason}"
+
+
+class MissingToken(PostingBlocked):
+    def __init__(self, variable):
+        super().__init__(variable, f"${variable} is unset or empty, so a run would post from whatever account "
+                                   "`gh` is logged in as; export it in the scheduled tick's login shell")
+
+
 def now_utc():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -398,6 +414,7 @@ def tick(w, a, spawn):
     run_problem = failed_runs_problem(w)
     recent = [t for t in w.prs.get("_runs", []) if parse_time(t) > now - dt.timedelta(hours=24)]
     started, not_started, waiting, started_urls = 0, [], [], []
+    blocked = {}
     size = cfg.get("max_items_per_run", 1)
     for offset in range(0, len(owed), size):
         batch = owed[offset:offset + size]
@@ -407,10 +424,22 @@ def tick(w, a, spawn):
                 accounting.append(f"{key}: owed ({reason}), waiting for a free slot")
                 waiting.append([key, reason])
             continue
+        key = batch[0][0]
+        try:
+            for item in batch:
+                SOURCE.preflight(w, item[1])
+        except PostingBlocked as e:
+            if a.dry_run:
+                accounting.append(f"{key}: owed, would not start a run: {e.problem(w)}")
+                continue
+            not_started.append(key)
+            blocked.setdefault(e.variable, e.problem(w))
+            for k, _, reason, _ in batch:
+                accounting.append(f"{k}: owed ({reason}), run FAILED to start ({e.reason})")
+            continue
         if a.dry_run:
             accounting.extend(f"{key}: would start a run ({reason})" for key, _, reason, _ in batch)
             continue
-        key = batch[0][0]
         try:
             if cfg.get("prepare_cmd"):
                 shell_command(cfg["prepare_cmd"], cfg["run_dir"])
@@ -438,6 +467,8 @@ def tick(w, a, spawn):
         SOURCE.finish(w, finished, accounting)
         if cfg.get("source_cmd"):
             w.prs["_runs"] = recent + [iso(now)] * started
+    for message in blocked.values():
+        w.log(f"ERROR: {message}")
     for line in accounting:
         w.log(line)
         print(line)
@@ -453,6 +484,8 @@ def tick(w, a, spawn):
         problem = f"watch {w.name}: nothing left to watch; run `{TOOL} uninstall {w.name}`"
     elif all_unread and unread.get("ticks", 0) >= UNREAD_TICKS_BEFORE_ALERT:
         problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `{TOOL} status {w.name}`"
+    elif blocked:
+        problem = "; ".join(blocked.values())
     elif run_problem:
         problem = run_problem
     elif not_started:
@@ -1006,13 +1039,23 @@ def plist_path(name):
     return Path("~/Library/LaunchAgents").expanduser() / f"com.github.tycooon.{TOOL}.{name}.plist"
 
 
-def cmd_install(a):
-    w = Watch(a.watch).load()
-    exe = Path(sys.argv[0]).resolve()
-    command = [str(exe), "tick", w.name]
+def tick_script(w, *extra):
+    """The shell line a scheduled tick runs, with `extra` tick flags appended."""
+    command = [str(Path(sys.argv[0]).resolve()), "tick", w.name, *extra]
     if w.config.get("source_cmd"):
         command = ["env", f"AGENT_WATCH_HOME={w.dir.parent.resolve()}", *command]
-    script = "exec " + shlex.join(command)
+    return "exec " + shlex.join(command)
+
+
+def scheduled_tick_argv(w, *extra):
+    """The scheduled tick's own command line (the plist's, or the crontab entry's): a login shell,
+    which is where the posting tokens come from. `launchctl kickstart` would drop `extra`."""
+    return ["/bin/zsh" if sys.platform == "darwin" else "/bin/bash", "-lc", tick_script(w, *extra)]
+
+
+def cmd_install(a):
+    w = Watch(a.watch).load()
+    script = tick_script(w)
     if sys.platform != "darwin":
         log = shlex.quote(str(w.dir / "cron.log"))
         line = (f"*/{max(1, a.interval // 60)} * * * * /bin/bash -lc {shlex.quote(script)} >> {log} 2>&1 "
@@ -1225,6 +1268,9 @@ class CommandSource:
 
     def covers(self, spec, key):
         return True
+
+    def preflight(self, w, row):
+        """Raise ScanError (MissingToken for a posting token) to refuse starting a run for this row."""
 
     def describe(self, w, detail):
         yield f"source command: {w.config['source_cmd']}"
