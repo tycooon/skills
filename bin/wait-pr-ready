@@ -1044,10 +1044,13 @@ def evaluate(pr, *, no_ci, reviewers, same_authored_lines, hunks_between=None):
 
 def review_count(pr):
     # GitHub counts a thread reply as a review; a GitLab read counts its replies apart.
-    # Agent-marked plain comments are no activity. totalCount can exceed the fetched nodes
-    # (the query takes the last 50 comments), and only those nodes can be tested.
-    marked = sum(agent_marked(c) for c in pr["comments"]["nodes"])
-    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "comments", "reviewThreads")) + pr.get("threadReplies", 0) - marked
+    # Plain comments are read apart, by comment_keys: their totalCount moves with agent notes.
+    return sum(pr[k].get("totalCount", len(pr[k]["nodes"])) for k in ("reviews", "reviewThreads")) + pr.get("threadReplies", 0)
+
+
+def comment_keys(pr):
+    """Keys of the fetched plain comments that are not agent-marked."""
+    return {(((c["author"] or {}).get("login")), c["createdAt"]) for c in pr["comments"]["nodes"] if not agent_marked(c)}
 
 
 def newest_review_time(pr):
@@ -1157,8 +1160,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
                 return (14, f"review activity: an open thread awaits the author on {args.url} at {head}: {url}{count}; activity {iso(mark)}"), mark
         if state["reviews"] is None:
             state["reviews"] = review_count(pr)
+            state["comments"] = comment_keys(pr)
             state["seen"] = {key for key, *_ in posts(pr)}
-        new_reviews = review_count(pr) > state["reviews"]
+        new_reviews = review_count(pr) > state["reviews"] or bool(comment_keys(pr) - state["comments"])
         gates = {
             "reviewers": {login_key(r) for r in args.reviewer},
             "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at),

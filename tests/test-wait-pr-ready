@@ -1452,6 +1452,25 @@ class Loop(unittest.TestCase):
                 code_out, out, _ = self.run_main([self.pending_pr(), landed, ready_pr(comments=landed["comments"])])
                 self.assertEqual(code_out, code, out)
 
+    def test_a_marked_note_past_the_comment_window_is_no_activity(self):
+        # 60 comments exist and the query fetches the newest 50; the oldest fetched one (#10) is
+        # marked. A new note pushes it out of the window while totalCount rises by one.
+        def thread(total, new_body=None):
+            bodies = {i: (w.AGENT_MARKER if i == 10 else f"c{i}") for i in range(total)}
+            if new_body is not None:
+                bodies[total] = new_body
+            seen = sorted(bodies)[-50:]
+            return {"totalCount": len(bodies), "nodes": [comment("alice", bodies[i], at=f"2026-10-15T08:{i:02d}:00Z") for i in seen]}
+        for body, expected in (("note\n" + w.AGENT_MARKER, None), ("note", 14)):
+            for args in ([], ["--until-review"]):
+                with self.subTest(body=body, args=args):
+                    first, landed = self.pending_pr(comments=thread(60)), self.pending_pr(comments=thread(60, body))
+                    reads = [first, landed, landed] if not args else [first] + [landed] * 200
+                    if not args and expected is None:
+                        reads.append(ready_pr(comments=landed["comments"]))
+                    code, out, _ = self.run_main(reads, args=args)
+                    self.assertEqual(code, expected or (0 if not args else 13), out)
+
     def test_until_review_after_ignores_a_newer_agent_marked_comment(self):
         for body, code in (("note\n" + w.AGENT_MARKER, 13), ("note", 14)):
             with self.subTest(body=body):
