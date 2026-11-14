@@ -1405,9 +1405,9 @@ class ClaudeAccounts(WatchCase):
                       {'type': 'result', 'is_error': False, 'result': cases[0][0]},
                       {'type': 'result', 'is_error': True, 'result': {'message': cases[0][0]}}):
             log.write_text(json.dumps(event) + '\n')
-            self.assertIsNone(self.aw.claude_usage_limit(log, now))
+            self.assertIsNone(self.aw.claude_usage_limit(log))
         log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': cases[0][0]}) + '\n')
-        self.assertEqual(self.aw.claude_usage_limit(log, now)['until'], cases[0][1])
+        self.assertEqual(self.aw.claude_usage_limit(log)['until'], cases[0][1])
 
     def ended_limit(self, account='default'):
         w = self.aw.Watch('work').load()
@@ -1487,8 +1487,10 @@ class ClaudeAccounts(WatchCase):
 
 
     def test_reset_rollover_zone_and_invalid_values(self):
-        cases = [("You've hit your weekly limit · resets Oct 12, 12am (UTC)", '2027-10-12T00:00:00Z'),
-                 ("usage limit reached; resets Nov 12, 2025 12am (UTC)", '2026-10-31T11:00:00Z'),
+        ended = self.aw.parse_time('2026-10-13T10:00:00Z')
+        self.assertEqual(self.aw.iso(self.aw.usage_reset("You've hit your weekly limit · resets Oct 12, 12am (UTC)", ended)),
+                         '2027-10-12T00:00:00Z')
+        cases = [("usage limit reached; resets Nov 12, 2025 12am (UTC)", '2025-11-12T00:00:00Z'),
                  ("usage limit reached; resets 3pm", '2026-10-31T15:00:00Z'),
                  ("usage limit reached; resets 3pm (America/New_York)", '2026-10-31T19:00:00Z'),
                  ("usage limit reached; resets 13pm (UTC)", '2026-10-31T11:00:00Z'),
@@ -1520,11 +1522,11 @@ class ClaudeAccounts(WatchCase):
         log = self.root / 'large.jsonl'
         event = json.dumps({'type': 'result', 'is_error': True, 'result': 'usage limit reached'})
         log.write_text(event + '\n' + json.dumps({'type': 'tool', 'text': 'x' * (2 * self.aw.RUN_LOG_TAIL_BYTES)}) + '\n')
-        self.assertIsNone(self.aw.claude_usage_limit(log, self.clock))
+        self.assertIsNone(self.aw.claude_usage_limit(log))
         log.write_text('x' * (2 * self.aw.RUN_LOG_TAIL_BYTES) + '\n' + event + '\n')
-        self.assertIsNotNone(self.aw.claude_usage_limit(log, self.clock))
+        self.assertIsNotNone(self.aw.claude_usage_limit(log))
         log.unlink()
-        self.assertIsNone(self.aw.claude_usage_limit(log, self.clock))
+        self.assertIsNone(self.aw.claude_usage_limit(log))
         ended = self.ended_limit()
         ended.unlink()
         w = self.aw.Watch('work').load()
@@ -1650,6 +1652,42 @@ class ClaudeAccounts(WatchCase):
         self.assertFalse(self.started)
         self.assertEqual(self.state()['one']['attempts']['count'], 0)
         self.assertEqual(len(self.state()['_runs']), 1)
+
+
+    def test_delayed_tick_does_not_roll_expired_reset_forward(self):
+        ended = self.aw.parse_time('2026-11-14T14:59:00Z')
+        cases = [("usage limit reached; resets 3pm (UTC)", '2026-11-14T15:01:00Z'),
+                 ("You've hit your weekly limit · resets Nov 14, 3pm (UTC)", '2026-11-14T15:01:00Z'),
+                 ("usage limit reached", '2026-11-14T16:01:00Z'),
+                 ("usage limit reached; resets Nov 14, 2026 3pm (UTC)", '2026-11-14T15:01:00Z')]
+        for text, tick_at in cases:
+            with self.subTest(text=text):
+                log = self.ended_limit()
+                log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': text}) + '\n')
+                os.utime(log, (ended.timestamp(), ended.timestamp()))
+                w = self.aw.Watch('work').load()
+                self.aw.examine_account_runs(w, self.aw.parse_time(tick_at))
+                self.assertFalse(w.prs['_accounts'])
+                self.assertTrue(w.prs['one']['last_run']['usage_limit'])
+                self.assertEqual(w.prs['one']['attempts']['count'], 0)
+
+    def test_future_reset_uses_result_timestamp_before_log_mtime(self):
+        self.clock = self.aw.parse_time('2026-11-14T15:01:00Z')
+        ended = self.aw.parse_time('2026-11-14T14:59:00Z')
+        for stamp in (self.aw.iso(ended), ended.timestamp(), ended.timestamp() * 1000):
+            for tick_at, expected in [('2026-11-14T15:01:00Z', None),
+                                      ('2026-11-14T14:59:30Z', '2026-11-14T15:00:00Z')]:
+                with self.subTest(stamp=stamp, tick_at=tick_at):
+                    log = self.ended_limit()
+                    log.write_text(json.dumps({'type': 'result', 'is_error': True, 'timestamp': stamp,
+                                              'result': 'usage limit reached; resets 3pm (UTC)'}) + '\n')
+                    os.utime(log, (self.clock.timestamp(), self.clock.timestamp()))
+                    w = self.aw.Watch('work').load()
+                    self.aw.examine_account_runs(w, self.aw.parse_time(tick_at))
+                    if expected:
+                        self.assertEqual(w.prs['_accounts']['default']['until'], expected)
+                    else:
+                        self.assertFalse(w.prs['_accounts'])
 
 
 if __name__ == '__main__':

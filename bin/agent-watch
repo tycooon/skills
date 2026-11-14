@@ -684,15 +684,15 @@ CLAUDE_CLOCK = re.compile(r'resets (?:(' + '|'.join(MONTHS) + r')[a-z]*\.? (\d{1
                           r'(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([A-Za-z_/+-]+)\))?', re.I)
 
 
-def usage_reset(text, now):
-    fallback = now + dt.timedelta(hours=1)
+def usage_reset(text, ended):
+    fallback = ended + dt.timedelta(hours=1)
     try:
         if match := CLAUDE_EPOCH.search(text):
             epoch = int(match[1])
             reset = dt.datetime.fromtimestamp(epoch / 1000 if epoch > 10**11 else epoch, dt.timezone.utc)
         elif match := CLAUDE_CLOCK.search(text):
             month, day, year, hour, minute, ampm, zone = match.groups()
-            local = now.astimezone(ZoneInfo(zone) if zone else dt.timezone.utc)
+            local = ended.astimezone(ZoneInfo(zone) if zone else dt.timezone.utc)
             hour = int(hour)
             if not 1 <= hour <= 12:
                 return fallback
@@ -706,12 +706,12 @@ def usage_reset(text, now):
             reset = reset.astimezone(dt.timezone.utc)
         else:
             return fallback
-        return reset if reset > now else fallback
+        return reset
     except (ValueError, OverflowError, OSError, KeyError):
         return fallback
 
 
-def claude_usage_limit(log, now, events=None):
+def claude_usage_limit(log, events=None):
     if events is None:
         try:
             events = run_log_events(log)
@@ -721,7 +721,20 @@ def claude_usage_limit(log, now, events=None):
         text = event.get("result")
         if (event.get("type") == "result" and event.get("is_error") is True
                 and isinstance(text, str) and CLAUDE_LIMIT.search(text)):
-            return {"until": iso(usage_reset(text, now)), "detail": " ".join(text.split())[:300], "run": str(log)}
+            try:
+                stamp = event.get("timestamp")
+                if type(stamp) in (int, float):
+                    ended = dt.datetime.fromtimestamp(stamp / 1000 if stamp > 10**11 else stamp, dt.timezone.utc)
+                else:
+                    ended = parse_time(stamp)
+                if ended.tzinfo is None:
+                    ended = ended.replace(tzinfo=dt.timezone.utc)
+            except (AttributeError, ValueError, TypeError, OverflowError, OSError):
+                try:
+                    ended = dt.datetime.fromtimestamp(log.stat().st_mtime, dt.timezone.utc)
+                except OSError:
+                    return None
+            return {"until": iso(usage_reset(text, ended)), "detail": " ".join(text.split())[:300], "run": str(log)}
     return None
 
 
@@ -747,7 +760,7 @@ def examine_account_runs(w, now):
                 events = run_log_events(log)
             except OSError:
                 events = []
-            examined[log] = claude_usage_limit(log, now, events=events)
+            examined[log] = claude_usage_limit(log, events=events)
             outcomes[str(log)] = {"result": events_result(events), "usage_limit": bool(examined[log])}
         hold = examined[log]
         run["account_examined"] = True
@@ -755,7 +768,8 @@ def examine_account_runs(w, now):
             continue
         run["usage_limit"] = True
         previous = w.prs["_accounts"].get(run["account"])
-        if run["account"] in ids and (not previous or hold["until"] > previous["until"]):
+        if (run["account"] in ids and parse_time(hold["until"]) > now
+                and (not previous or hold["until"] > previous["until"])):
             w.prs["_accounts"][run["account"]] = hold
         attempts = rec.get("attempts", {})
         if attempts.get("fingerprint") == run.get("fingerprint") and attempts.get("count", 0):
