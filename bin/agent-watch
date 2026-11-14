@@ -9,7 +9,8 @@
   agent-watch tick <watch> [--full] [--only KEY] [--dry-run]
   agent-watch settle <watch> <key> --fingerprint F --verdict V [--meta JSON]
   agent-watch recheck <watch> <key> --reason TEXT
-  agent-watch pause|resume|status|account|model|install|uninstall|stop <watch>
+  agent-watch account <watch> [ACCOUNT ...]  (default, config directory, or token file)
+  agent-watch pause|resume|status|model|install|uninstall|stop <watch>
   agent-watch list
 
 Command source contract
@@ -47,6 +48,7 @@ waiting for either cap appear in tick accounting and status. --max-attempts coun
 successful starts per key at its current fingerprint (default unlimited); an ended
 run that reaches the limit holds the key and notifies once. A new fingerprint or
 recheck clears the hold and attempt count. Failed starts consume neither limit.
+Claude runs ending at their usage limit refund their per-item attempt but still count toward the daily run cap.
 
 --prepare-cmd runs in DIR before each run; failure prevents that start.
 --launcher sets the optional launcher config field to a command as a JSON argv list,
@@ -70,7 +72,15 @@ command failure is logged without changing tick accounting. Agent runs also use 
 
 State: $AGENT_WATCH_HOME (default ~/.local/state/agent-watch)/<watch>/prs.json.
 Model IDs select Claude or Codex, as in review-scan. Account/model commands and
-former-agent history work the same way.
+former-agent history work the same way. account accepts an ordered list of default,
+config directories or token files containing one CLAUDE_CODE_OAUTH_TOKEN assignment
+(optionally export and quoted). Legacy claude_config remains readable; account writes
+claude_accounts instead. Local Claude runs use the first authenticated account whose
+usage-limit hold has expired, preferring earlier accounts again after reset. Holds
+live in prs.json, and only terminal result errors count; all held accounts notify
+once until recovery. default preserves the inherited environment; explicit accounts
+remove an inherited OAuth token, and token files also remove CLAUDE_CONFIG_DIR.
+Token files are read at every start; their values are never stored in watch state.
 Codex runs in a git work tree grant sandbox write access to its git dir and the common dir's objects, refs and logs, discovered after preparation at each launch. This avoids per-command git write approvals and weakens git containment. The main
 checkout's config and hooks stay read-only, but the worktree's git dir holds commondir
 and config.worktree, so a sandboxed command can point git at a config it wrote (with
@@ -102,6 +112,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 HOME = Path(os.environ.get("AGENT_WATCH_HOME", "~/.local/state/agent-watch")).expanduser()
 TOOL = "agent-watch"
@@ -318,7 +329,7 @@ def initialize_watch(w, a, source_config):
     config = {**source_config, "reviewer_model": model, "effort": a.effort,
               "max_parallel": a.max_parallel, "created": iso(now_utc())}
     if previous:
-        for key in ("claude_config", "former_agents", "created"):
+        for key in ("claude_accounts", "claude_config", "former_agents", "created"):
             if key in previous:
                 config[key] = previous[key]
         config["runner"] = previous.get("runner", "claude")
@@ -377,8 +388,11 @@ def cmd_tick(a, spawn=None):
 
 def tick(w, a, spawn):
     cfg, now = w.config, now_utc()
+    w.account_problems = []
     if not a.dry_run:
+        examine_account_runs(w, now)
         prune_idle_runs(w, now)
+    account_wait = accounts_waiting(w) if w.runner == "claude" and not cfg.get("launcher") else None
     listed, failed, accounting, finished = SOURCE.list(w, now)
     all_unread = bool(failed) and len(failed) == len(SOURCE.targets(w))
     owed = []
@@ -418,6 +432,10 @@ def tick(w, a, spawn):
     size = cfg.get("max_items_per_run", 1)
     for offset in range(0, len(owed), size):
         batch = owed[offset:offset + size]
+        if account_wait:
+            for key, row, reason, attempt in batch:
+                accounting.append(f"{key}: owed ({reason}), {account_wait}")
+            continue
         cap = cfg.get("max_runs_per_day")
         if in_flight + started >= cfg["max_parallel"] or (cap and len(recent) + started >= cap):
             for key, row, reason, attempt in batch:
@@ -457,6 +475,8 @@ def tick(w, a, spawn):
             if cfg.get("source_cmd"):
                 run["run_key"] = key
                 rec["attempts"] = {"fingerprint": row[SOURCE.version_field], "count": attempt}
+            if w.runner == "claude" and not cfg.get("launcher") and getattr(w, "run_account", None):
+                run["account"] = w.run_account
             if log is not None:
                 run["log"] = log
             rec["last_run"] = run
@@ -486,6 +506,10 @@ def tick(w, a, spawn):
         problem = f"watch {w.name}: could not read any target ({', '.join(failed)}); see `{TOOL} status {w.name}`"
     elif blocked:
         problem = "; ".join(blocked.values())
+    elif account_wait:
+        problem = f"watch {w.name}: {account_wait}"
+    elif w.account_problems:
+        problem = f"watch {w.name}: " + "; ".join(w.account_problems)
     elif run_problem:
         problem = run_problem
     elif not_started:
@@ -497,11 +521,14 @@ def tick(w, a, spawn):
         kept_urls = set(listed) | {k for k in (w.prs.get("_tick") or {}).get("kept_urls", [])
                                    if any(SOURCE.covers(spec, k) for spec in failed)}
         w.prs["_tick"] = {"at": iso(now), "kept": len(listed), "started": started, "started_urls": started_urls,
-                          "waiting": waiting, "kept_urls": sorted(kept_urls)}
+                          "waiting": waiting, "kept_urls": sorted(kept_urls),
+                          "account_waiting": [[key, reason] for key, _, reason, _ in owed] if account_wait else []}
         if cfg.get("source_cmd"):
             w.prs["_tick"].update(accounting=accounting, held=held)
         alert = w.prs.setdefault("_alert", {})
-        same_problem = problem and alert.get("problem") == problem
+        account_episode = bool(account_wait and problem == f"watch {w.name}: {account_wait}")
+        same_problem = problem and (alert.get("problem") == problem or
+                                    (account_episode and alert.get("kind") == "accounts_held"))
         since = (alert.get("since") or iso(now)) if same_problem else iso(now)
         if all_unread and problem:
             since = unread["since"]
@@ -510,6 +537,8 @@ def tick(w, a, spawn):
         alert.clear()
         if problem:
             alert.update(problem=problem, since=since)
+            if account_episode:
+                alert["kind"] = "accounts_held"
         w.save()
     return 5 if failed or not_started else 0
 
@@ -538,32 +567,206 @@ def finish_settle(w, key, record, log_line, message, rechecks=()):
     return 0
 
 
-def claude_env(config_dir):
-    """The environment a run gets: the CLI's own login, or the one in config_dir."""
+def claude_accounts(config):
+    if "claude_accounts" in config:
+        return config["claude_accounts"]
+    path = config.get("claude_config")
+    return [{"kind": "config_dir", "path": path}] if path else [{"kind": "default"}]
+
+
+def account_id(account):
+    return account.get("path", "default")
+
+
+def claude_env(account=None):
     env = dict(os.environ)
+    if account is None or account == {"kind": "default"}:
+        return env
+    if isinstance(account, str):
+        account = {"kind": "config_dir", "path": account}
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     env.pop("CLAUDE_CONFIG_DIR", None)
-    if config_dir:
-        env["CLAUDE_CONFIG_DIR"] = config_dir
+    path = account["path"]
+    if account["kind"] == "config_dir":
+        env["CLAUDE_CONFIG_DIR"] = path
+    else:
+        try:
+            token_path = Path(path)
+            if not token_path.is_file():
+                raise OSError()
+            content = token_path.read_text()
+        except (OSError, UnicodeError):
+            raise ScanError(f"Claude token file {path} is missing or unreadable") from None
+        match = re.fullmatch(r"\s*(?:export[ \t]+)?CLAUDE_CODE_OAUTH_TOKEN[ \t]*=[ \t]*(?:'([^'\r\n]+)'|\"([^\"\r\n]+)\"|([^\s'\"]+))[ \t]*\n?", content)
+        if not match:
+            raise ScanError(f"Claude token file {path} must contain one CLAUDE_CODE_OAUTH_TOKEN assignment")
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = next(value for value in match.groups() if value is not None)
     return env
 
 
-def claude_auth_status(config_dir=None):
+def codex_env():
+    env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
+    return env
+
+
+def claude_auth_status(account=None):
     p = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, timeout=30,
-                       env=claude_env(config_dir))
+                       env=claude_env(account))
     return json.loads(p.stdout)
 
 
-def claude_logged_in(config_dir=None):
-    """Whether the claude CLI has a login in config_dir (None: its default one), read once per
-    process. Its login is separate from the desktop app's, and a logged-out CLI fails every run
-    in its first second, so the tick checks before starting any. An unreadable status is not
-    taken as logged out: the run's own log says why."""
-    if config_dir not in _logged_in:
+def claude_logged_in(account=None):
+    """Cache each account's login per process; unreadable status must not block runs."""
+    key = account_id(account) if isinstance(account, dict) else account
+    if key not in _logged_in:
         try:
-            _logged_in[config_dir] = claude_auth_status(config_dir).get("loggedIn") is not False
+            _logged_in[key] = claude_auth_status(account).get("loggedIn") is not False
         except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
-            _logged_in[config_dir] = True
-    return _logged_in[config_dir]
+            _logged_in[key] = True
+    return _logged_in[key]
+
+
+def account_login(account):
+    if account["kind"] == "token_file":
+        return f"refresh the Claude token file {account['path']}"
+    login = (f"CLAUDE_CONFIG_DIR={shlex.quote(account['path'])} " if account["kind"] == "config_dir" else "")
+    return f"run `{login}claude auth login`"
+
+
+def account_holds(w, now=None):
+    now = now or now_utc()
+    holds = w.prs.get("_accounts", {})
+    ids = {account_id(a) for a in claude_accounts(w.config)}
+    return {key: hold for key, hold in holds.items() if key in ids and parse_time(hold["until"]) > now}
+
+
+def accounts_waiting(w):
+    accounts, holds = claude_accounts(w.config), account_holds(w)
+    if all(account_id(a) in holds for a in accounts):
+        detail = ", ".join(f"{account_id(a)} until {holds[account_id(a)]['until']}" for a in accounts)
+        return f"waiting for a Claude account ({detail})"
+    return None
+
+
+def pick_claude_account(w):
+    holds = account_holds(w)
+    w.account_problems = []
+    for account in claude_accounts(w.config):
+        name = account_id(account)
+        if name in holds:
+            continue
+        try:
+            env = claude_env(account)
+            logged_in = claude_logged_in(account)
+        except ScanError as e:
+            w.account_problems.append(str(e))
+            continue
+        if not logged_in:
+            w.account_problems.append(f"the claude CLI is logged out (account {name}); {account_login(account)}")
+            continue
+        for prior in claude_accounts(w.config):
+            if account_id(prior) == name:
+                break
+            hold = holds.get(account_id(prior))
+            if hold:
+                message = f"account {account_id(prior)} out of usage until {hold['until']}; runs use {name}"
+                if not w.observe:
+                    w.log(message)
+        w.run_account = name
+        return account, env
+    if waiting := accounts_waiting(w):
+        raise ScanError(waiting)
+    raise PermissionError("; ".join(w.account_problems))
+
+
+# Keep these error-channel patterns in step with the cluster launcher's quota detection.
+CLAUDE_LIMIT = re.compile(r"usage limit reached|limit reached\s*[|∙·]|You(?:'|’)ve hit your (?:[\w' ]{1,40} )?limit"
+                          r"|reached your (?:[\w ]{1,30} )?usage limit", re.I)
+CLAUDE_EPOCH = re.compile(r'limit reached\|(\d{9,13})')
+MONTHS = ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
+CLAUDE_CLOCK = re.compile(r'resets (?:(' + '|'.join(MONTHS) + r')[a-z]*\.? (\d{1,2})(?:,? (\d{4}))?,? )?'
+                          r'(\d{1,2})(?::(\d{2}))?\s*([ap]m)(?:\s*\(([A-Za-z_/+-]+)\))?', re.I)
+
+
+def usage_reset(text, now):
+    fallback = now + dt.timedelta(hours=1)
+    try:
+        if match := CLAUDE_EPOCH.search(text):
+            epoch = int(match[1])
+            reset = dt.datetime.fromtimestamp(epoch / 1000 if epoch > 10**11 else epoch, dt.timezone.utc)
+        elif match := CLAUDE_CLOCK.search(text):
+            month, day, year, hour, minute, ampm, zone = match.groups()
+            local = now.astimezone(ZoneInfo(zone) if zone else dt.timezone.utc)
+            hour = int(hour)
+            if not 1 <= hour <= 12:
+                return fallback
+            hour = hour % 12 + (12 if ampm.lower() == 'pm' else 0)
+            reset = local.replace(year=int(year) if year else local.year,
+                                  month=MONTHS.index(month.lower()) + 1 if month else local.month,
+                                  day=int(day) if day else local.day, hour=hour, minute=int(minute or 0),
+                                  second=0, microsecond=0)
+            if reset <= local and not year:
+                reset = reset.replace(year=reset.year + 1) if month else reset + dt.timedelta(days=1)
+            reset = reset.astimezone(dt.timezone.utc)
+        else:
+            return fallback
+        return reset if reset > now else fallback
+    except (ValueError, OverflowError, OSError, KeyError):
+        return fallback
+
+
+def claude_usage_limit(log, now, events=None):
+    if events is None:
+        try:
+            events = run_log_events(log)
+        except OSError:
+            return None
+    for event in reversed(events):
+        text = event.get("result")
+        if (event.get("type") == "result" and event.get("is_error") is True
+                and isinstance(text, str) and CLAUDE_LIMIT.search(text)):
+            return {"until": iso(usage_reset(text, now)), "detail": " ".join(text.split())[:300], "run": str(log)}
+    return None
+
+
+def examine_account_runs(w, now):
+    if w.runner != "claude" or w.config.get("launcher"):
+        return
+    w.prs["_accounts"] = account_holds(w, now)
+    latest_logs = {str(w.dir / rec["last_run"]["log"]) for key, rec in w.prs.items()
+                   if not key.startswith("_") and (rec.get("last_run") or {}).get("log")}
+    outcomes = {log: result for log, result in w.prs.get("_run_results", {}).items()
+                if log in latest_logs or Path(log).is_file()}
+    examined = {}
+    ids = {account_id(a) for a in claude_accounts(w.config)}
+    for key, rec in list(w.prs.items()):
+        if key.startswith("_"):
+            continue
+        run = rec.get("last_run") or {}
+        if not run.get("account") or run.get("account_examined") or not run.get("log") or w.running(key):
+            continue
+        log = w.dir / run["log"]
+        if log not in examined:
+            try:
+                events = run_log_events(log)
+            except OSError:
+                events = []
+            examined[log] = claude_usage_limit(log, now, events=events)
+            outcomes[str(log)] = {"result": events_result(events), "usage_limit": bool(examined[log])}
+        hold = examined[log]
+        run["account_examined"] = True
+        if not hold:
+            continue
+        run["usage_limit"] = True
+        previous = w.prs["_accounts"].get(run["account"])
+        if run["account"] in ids and (not previous or hold["until"] > previous["until"]):
+            w.prs["_accounts"][run["account"]] = hold
+        attempts = rec.get("attempts", {})
+        if attempts.get("fingerprint") == run.get("fingerprint") and attempts.get("count", 0):
+            attempts["count"] -= 1
+            attempts.pop("notified", None)
+    w.prs["_run_results"] = outcomes
 
 
 def codex_logged_in():
@@ -572,7 +775,7 @@ def codex_logged_in():
     if _codex_logged_in is None:
         try:
             p = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30,
-                               env=claude_env(None))
+                               env=codex_env())
             _codex_logged_in = p.returncode == 0
         except (OSError, subprocess.SubprocessError):
             _codex_logged_in = True
@@ -627,31 +830,42 @@ def final_record_header(f, offset, size):
     return event
 
 
-def run_result(log):
-    try:
-        with log.open("rb") as f:
-            size = f.seek(0, os.SEEK_END)
-            offset = max(0, size - RUN_LOG_TAIL_BYTES)
-            f.seek(offset)
-            tail = f.read(RUN_LOG_TAIL_BYTES)
-            header = None
-            if offset and b"\n" not in tail.rstrip(b"\r\n"):
-                header = final_record_header(f, offset, size)
-            lines = tail.decode("utf-8", errors="replace").splitlines()
-        if offset:
-            lines = lines[1:]
-        if header:
-            lines.append(json.dumps(header))
-    except OSError:
-        return False, "no result in the log"
-    completed, error = False, None
+def run_log_events(log):
+    with log.open("rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        offset = max(0, size - RUN_LOG_TAIL_BYTES)
+        f.seek(offset)
+        tail = f.read(RUN_LOG_TAIL_BYTES)
+        header = None
+        if offset and b"\n" not in tail.rstrip(b"\r\n"):
+            header = final_record_header(f, offset, size)
+        lines = tail.decode("utf-8", errors="replace").splitlines()
+    if offset:
+        lines = lines[1:]
+    events = []
     for line in lines:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(event, dict):
-            continue
+        if isinstance(event, dict):
+            events.append(event)
+    if header:
+        events.append(header)
+    return events
+
+
+def run_result(log):
+    try:
+        events = run_log_events(log)
+    except OSError:
+        return False, "no result in the log"
+    return events_result(events)
+
+
+def events_result(events):
+    completed, error = False, None
+    for event in events:
         kind = event.get("type")
         if kind in ("turn.failed", "turn.completed"):
             completed = kind == "turn.completed"
@@ -691,7 +905,11 @@ def failed_runs_problem(w):
         return None
     newest_error = None
     for _, log in recent:
-        success, error = run_result(log)
+        # Quota exhaustion is handled by account fallback, not the failed-run alert.
+        outcome = w.prs.get("_run_results", {}).get(str(log))
+        if outcome and outcome["usage_limit"]:
+            return None
+        success, error = outcome["result"] if outcome else run_result(log)
         if success and log not in w.failed_logs and not log.with_suffix(".failed").exists():
             return None
         if newest_error is None:
@@ -752,10 +970,7 @@ def spawn_run(w, url, brief):
             if not codex_logged_in():
                 raise PermissionError("the codex CLI is logged out; run `codex login`")
         else:
-            account = cfg.get("claude_config")
-            if not claude_logged_in(account):
-                login = f"CLAUDE_CONFIG_DIR={account} claude auth login" if account else "claude auth login"
-                raise PermissionError(f"the claude CLI is logged out; run `{login}`")
+            account, env = pick_claude_account(w)
     slug = w.slug(url)
     directory = w.runs / slug
     directory.mkdir(parents=True, exist_ok=True)
@@ -777,11 +992,10 @@ def spawn_run(w, url, brief):
             for path in codex_git_dirs(cfg.get("run_dir", str(w.dir))):
                 cmd.extend(["--add-dir", path])
             cmd.extend(["--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"])
-            env = claude_env(None)
+            env = codex_env()
         else:
             cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
                    "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]
-            env = claude_env(account)
     pidfile = w.runs / f"{slug}.pid"
     # The shell outlives the run to remove its pidfile, so a finished run leaves none, and to
     # start the next tick at once: runs take a minute or two, so waiting for the schedule left
@@ -877,7 +1091,7 @@ def cmd_list(a):
         scheduled = schedule_status(w)
         running = sum(w.run_alive(f) for f in w.run_files())
         print(f"{name}: reviewer {w.runner} {cfg['reviewer_model']}, {scheduled}, {running} run(s) in flight"
-              + (f", account {cfg['claude_config']}" if cfg.get("claude_config") and w.runner == "claude" else ""))
+              + (f", account {', '.join(account_id(a) for a in claude_accounts(cfg))}" if w.runner == "claude" else ""))
         for line in SOURCE.describe(w, detail=False):
             print(line)
         problem = w.prs.get("_alert", {}).get("problem")
@@ -886,46 +1100,63 @@ def cmd_list(a):
     return 0
 
 
+def print_accounts(w, auth=False, heading=True):
+    holds = account_holds(w)
+    if heading:
+        print(f"watch {w.name}: " + ", ".join(account_id(a) for a in claude_accounts(w.config)))
+    for account in claude_accounts(w.config):
+        name, hold = account_id(account), holds.get(account_id(account))
+        print(f"  {name}: " + (f"out of usage until {hold['until']} ({hold['detail']})" if hold else "available"))
+        if auth:
+            try:
+                status = claude_auth_status(account)
+            except (OSError, ScanError, subprocess.SubprocessError, ValueError):
+                status = {}
+            if isinstance(status, dict) and status.get("loggedIn"):
+                print(f"    logged in as {status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})")
+            else:
+                print(f"    not logged in yet: {account_login(account)}; until then the tick reports its runs as failing to start")
+
+
 def cmd_account(a):
-    """Show or switch the Claude account a watch's runs use: a config directory with its own
-    login (`claude auth login` under CLAUDE_CONFIG_DIR), or `default`, the CLI's own login.
-    Runs already going finish on the account they started with."""
-    w = Watch(a.watch)
-    cfg = w.load().config
+    """Set ordered Claude accounts; running agents keep the account they started with."""
+    w = Watch(a.watch).load()
     if w.runner == "codex":
-        if a.config is not None:
+        if a.config:
             raise SystemExit("Codex runs use the codex CLI's own login; run `codex login`")
         print(f"watch {a.watch}: the codex CLI login")
         return 0
-    if a.config is None:
-        print(f"watch {a.watch}: {cfg.get('claude_config') or 'default'}")
-        return 0
-    target = None
-    if a.config != "default":
-        target = str(Path(a.config).expanduser().resolve())
-        d, home = Path(target), Path("~/.claude").expanduser()
-        if d == home.resolve():
-            raise SystemExit("that is the default login's directory; use `default` instead")
-        d.mkdir(parents=True, exist_ok=True)
-        for name in SHARED:
-            link, src = d / name, home / name
-            if src.exists() and not link.exists() and not link.is_symlink():
-                link.symlink_to(src)
-                print(f"linked {link} -> {src}")
-    try:
-        status = claude_auth_status(target)
-    except (OSError, subprocess.SubprocessError, ValueError) as e:
-        status = {"error": str(e)}
-    with w.locked() as w:
-        w.config["claude_config"] = target
-        write_json(w.dir / "config.json", w.config)
-    who = f"{status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})"
-    print(f"watch {a.watch}: runs from now on use {target or 'the default login'}")
-    if status.get("loggedIn"):
-        print(f"  logged in as {who}")
-    else:
-        login = f"CLAUDE_CONFIG_DIR={target} claude auth login" if target else "claude auth login"
-        print(f"  not logged in yet: run `{login}`; until then the tick reports its runs as failing to start")
+    if a.config:
+        accounts = []
+        for value in a.config:
+            if value == "default":
+                account = {"kind": "default"}
+            else:
+                d, home = Path(value).expanduser().resolve(), Path("~/.claude").expanduser()
+                if d == home.resolve():
+                    raise SystemExit("that is the default login's directory; use `default` instead")
+                if d.is_file():
+                    account = {"kind": "token_file", "path": str(d)}
+                    if d.stat().st_mode & 0o044:
+                        print(f"WARNING: Claude token file {d} is readable by group or other users", file=sys.stderr)
+                else:
+                    if d.exists() and not d.is_dir():
+                        raise SystemExit(f"Claude account {d} must be a directory or regular token file")
+                    d.mkdir(parents=True, exist_ok=True)
+                    for name in SHARED:
+                        link, src = d / name, home / name
+                        if src.exists() and not link.exists() and not link.is_symlink():
+                            link.symlink_to(src)
+                            print(f"linked {link} -> {src}")
+                    account = {"kind": "config_dir", "path": str(d)}
+            if account not in accounts:
+                accounts.append(account)
+        with w.locked() as w:
+            w.config["claude_accounts"] = accounts
+            w.config.pop("claude_config", None)
+            write_json(w.dir / "config.json", w.config)
+        print(f"watch {a.watch}: runs from now on use accounts in priority order")
+    print_accounts(w, auth=True)
     return 0
 
 
@@ -969,8 +1200,18 @@ def cmd_status(a, limit=15):
         return cmd_list(a)
     w = Watch(a.watch).load()
     cfg, now = w.config, now_utc()
-    account = "the codex CLI login" if w.runner == "codex" else cfg.get("claude_config") or "the claude CLI default login"
+    account = "the codex CLI login" if w.runner == "codex" else ", ".join(account_id(a) for a in claude_accounts(cfg))
     print(f"account: {account}")
+    if w.runner == "claude" and not cfg.get("launcher"):
+        print_accounts(w, heading=False)
+        w.observe = True
+        try:
+            selected, _ = pick_claude_account(w)
+            print(f"new runs use {account_id(selected)}")
+        except (ScanError, OSError) as e:
+            print(str(e))
+        for problem in w.account_problems:
+            print(problem)
     print(f"watch {w.name}: reviewer {w.runner} {cfg['reviewer_model']} ({cfg['effort']}), max {cfg['max_parallel']} runs, "
           f"{SOURCE.policy(w)}{schedule_status(w)}")
     for line in SOURCE.describe(w, detail=True):
@@ -1030,6 +1271,8 @@ def cmd_status(a, limit=15):
 
     section("running", running)
     section("waiting for a slot", waiting)
+    section("waiting for a Claude account", [f"{key}: owed ({reason}), {accounts_waiting(w) or 'account available; next tick retries'}"
+                                            for key, reason in (tick or {}).get("account_waiting", []) if key not in busy])
     section("ended without settling", ended)
     section("settled, newest first", settled)
     return 0
@@ -1381,7 +1624,7 @@ def main(argv=None):
     mod.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     acc = sub.add_parser("account")
     acc.add_argument("watch")
-    acc.add_argument("config", nargs="?")
+    acc.add_argument("config", nargs="*", metavar="ACCOUNT")
     a = p.parse_args(argv)
     try:
         return {"init": cmd_init, "tick": cmd_tick, "settle": cmd_settle, "recheck": cmd_recheck,
