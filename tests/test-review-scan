@@ -1239,7 +1239,7 @@ class Account(Base):
         self.assertEqual(rs.claude_env(str(d))["CLAUDE_CONFIG_DIR"], str(d))
         os.environ["CLAUDE_CONFIG_DIR"] = "/elsewhere"
         try:
-            self.assertEqual(rs.claude_env(None)["CLAUDE_CONFIG_DIR"], "/elsewhere")
+            self.assertNotIn("CLAUDE_CONFIG_DIR", rs.claude_env(None))
         finally:
             del os.environ["CLAUDE_CONFIG_DIR"]
 
@@ -1290,7 +1290,7 @@ class AccountFallback(Base):
             _, out = self.cli('account', self.watch, 'default', str(token))
         self.assertNotIn('private-test-value', out)
         self.assertEqual(seen[0]['CLAUDE_CODE_OAUTH_TOKEN'], 'original')
-        self.assertEqual(seen[0]['CLAUDE_CONFIG_DIR'], '/inherited')
+        self.assertNotIn('CLAUDE_CONFIG_DIR', seen[0])
         self.assertEqual(seen[1]['CLAUDE_CODE_OAUTH_TOKEN'], 'private-test-value')
         self.assertNotIn('CLAUDE_CONFIG_DIR', seen[1])
 

@@ -78,8 +78,9 @@ config directories or token files containing one CLAUDE_CODE_OAUTH_TOKEN assignm
 claude_accounts instead. Local Claude runs use the first authenticated account whose
 usage-limit hold has expired, preferring earlier accounts again after reset. Holds
 live in prs.json, and only terminal result errors count; all held accounts notify
-once until recovery. default preserves the inherited environment; explicit accounts
-remove an inherited OAuth token, and token files also remove CLAUDE_CONFIG_DIR.
+once until recovery. default uses the inherited login with any inherited
+CLAUDE_CONFIG_DIR removed; explicit accounts remove an inherited OAuth token,
+and token files also remove CLAUDE_CONFIG_DIR.
 Token files are read at every start; their values are never stored in watch state.
 Codex runs in a git work tree grant sandbox write access to its git dir and the common dir's objects, refs and logs, discovered after preparation at each launch. This avoids per-command git write approvals and weakens git containment. The main
 checkout's config and hooks stay read-only, but the worktree's git dir holds commondir
@@ -580,12 +581,12 @@ def account_id(account):
 
 def claude_env(account=None):
     env = dict(os.environ)
+    env.pop("CLAUDE_CONFIG_DIR", None)
     if account is None or account == {"kind": "default"}:
         return env
     if isinstance(account, str):
         account = {"kind": "config_dir", "path": account}
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-    env.pop("CLAUDE_CONFIG_DIR", None)
     path = account["path"]
     if account["kind"] == "config_dir":
         env["CLAUDE_CONFIG_DIR"] = path
@@ -601,12 +602,6 @@ def claude_env(account=None):
         if not match:
             raise ScanError(f"Claude token file {path} must contain one CLAUDE_CODE_OAUTH_TOKEN assignment")
         env["CLAUDE_CODE_OAUTH_TOKEN"] = next(value for value in match.groups() if value is not None)
-    return env
-
-
-def codex_env():
-    env = dict(os.environ)
-    env.pop("CLAUDE_CONFIG_DIR", None)
     return env
 
 
@@ -775,7 +770,7 @@ def codex_logged_in():
     if _codex_logged_in is None:
         try:
             p = subprocess.run(["codex", "login", "status"], capture_output=True, text=True, timeout=30,
-                               env=codex_env())
+                               env=claude_env(None))
             _codex_logged_in = p.returncode == 0
         except (OSError, subprocess.SubprocessError):
             _codex_logged_in = True
@@ -992,7 +987,7 @@ def spawn_run(w, url, brief):
             for path in codex_git_dirs(cfg.get("run_dir", str(w.dir))):
                 cmd.extend(["--add-dir", path])
             cmd.extend(["--approve-for-me", "--skip-git-repo-check", "--json", "-o", str(last_path), "-"])
-            env = codex_env()
+            env = claude_env(None)
         else:
             cmd = ["claude", "-p", "--model", cfg["reviewer_model"], "--effort", cfg["effort"],
                    "--permission-mode", "auto", "--output-format", "stream-json", "--verbose"]

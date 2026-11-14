@@ -1359,10 +1359,13 @@ class ClaudeAccounts(WatchCase):
         self.aw.write_json(w.dir / 'config.json', w.config)
         return w
 
-    def test_legacy_default_preserves_environment(self):
+    def test_legacy_default_strips_only_inherited_config_dir(self):
         self.assertEqual(self.aw.claude_accounts({'claude_config': None}), [{'kind': 'default'}])
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/inherited', 'CLAUDE_CODE_OAUTH_TOKEN': 'inherited'}):
-            self.assertEqual(self.aw.claude_env(None), dict(os.environ))
+            expected = dict(os.environ)
+            del expected['CLAUDE_CONFIG_DIR']
+            for account in (None, {'kind': 'default'}):
+                self.assertEqual(self.aw.claude_env(account), expected)
             env = self.aw.claude_env({'kind': 'config_dir', 'path': '/chosen'})
         self.assertEqual(env['CLAUDE_CONFIG_DIR'], '/chosen')
         self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN', env)
