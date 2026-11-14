@@ -1209,7 +1209,7 @@ class ChainTick(unittest.TestCase):
 class Account(Base):
     def switch(self, config):
         real = rs.claude_auth_status
-        rs.engine.claude_auth_status = lambda d=None: {"loggedIn": d is not None, "email": "me@x", "orgName": "Team", "subscriptionType": "team"}
+        rs.engine.claude_auth_status = lambda d=None: {"loggedIn": d is not None and d != {"kind": "default"}, "email": "me@x", "orgName": "Team", "subscriptionType": "team"}
         try:
             return self.cli("account", self.watch, config)
         finally:
@@ -1223,25 +1223,76 @@ class Account(Base):
         code, out = self.switch(str(d))
         self.assertEqual(code, 0)
         self.assertIn("logged in as me@x (Team, team)", out)
-        self.assertEqual(self.config()["claude_config"], str(d.resolve()))
+        self.assertEqual(self.config()["claude_accounts"], [{"kind": "config_dir", "path": str(d.resolve())}])
         for name in rs.SHARED:
             if (Path("~/.claude").expanduser() / name).exists():
                 self.assertTrue((d / name).is_symlink(), name)
         _, out = self.switch("default")
-        self.assertIsNone(self.config()["claude_config"])
+        self.assertEqual(self.config()["claude_accounts"], [{"kind": "default"}])
         self.assertIn("not logged in yet: run `claude auth login`", out)
 
     def test_runs_get_the_account_s_config_dir_and_init_keeps_it(self):
         d = Path(tempfile.mkdtemp(dir=TMP.name))
         self.switch(str(d))
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot")
-        self.assertEqual(self.config()["claude_config"], str(d.resolve()))
+        self.assertEqual(self.config()["claude_accounts"], [{"kind": "config_dir", "path": str(d.resolve())}])
         self.assertEqual(rs.claude_env(str(d))["CLAUDE_CONFIG_DIR"], str(d))
         os.environ["CLAUDE_CONFIG_DIR"] = "/elsewhere"
         try:
             self.assertNotIn("CLAUDE_CONFIG_DIR", rs.claude_env(None))
         finally:
             del os.environ["CLAUDE_CONFIG_DIR"]
+
+
+class AccountFallback(Base):
+    def test_limit_ended_review_stays_owed_and_starts_next_account(self):
+        w = rs.Watch(self.watch).load()
+        backup = str(w.dir / 'backup')
+        w.config['claude_accounts'] = [{'kind': 'default'}, {'kind': 'config_dir', 'path': backup}]
+        rs.engine.write_json(w.dir / 'config.json', w.config)
+        log = w.runs / 'limit.jsonl'
+        log.write_text(json.dumps({'type': 'result', 'is_error': True,
+                                  'result': 'Claude AI usage limit reached|1792764000'}) + '\n')
+        w.prs[PR1] = {'last_run': {'started': '2026-10-23T11:59:00Z', 'head': A, 'reason': 'never reviewed',
+                                   'account': 'default', 'log': str(log)}}
+        w.save()
+        with patch.object(rs.engine, 'claude_logged_in', return_value=True), \
+             patch.object(rs.shutil, 'which', return_value='/bin/claude'), \
+             patch.object(rs.engine, 'proc_start', return_value='start'), \
+             patch.object(rs.engine.subprocess, 'Popen') as popen, \
+             patch.object(rs.engine, 'our_pid', return_value=None):
+            popen.return_value.pid = 4242
+            rc, out = self.cli('tick', self.watch, spawn=rs.spawn_run)
+        self.assertEqual(rc, 0)
+        self.assertIn('started a run (never reviewed', out)
+        self.assertEqual(self.prs()[PR1]['last_run']['account'], backup)
+        self.assertNotIn('settled', self.prs()[PR1])
+        self.assertTrue(rs.owed_reason(self.prs()[PR1], row(PR1), False))
+        self.assertFalse(self.notified)
+        with patch.object(rs.engine, 'claude_logged_in', return_value=True), \
+             patch.object(rs.engine, 'our_pid', return_value=None):
+            _, status = self.cli('status', self.watch)
+        self.assertIn('account: default, ' + backup, status)
+        self.assertIn('default: out of usage until', status)
+        self.assertIn('new runs use ' + backup, status)
+
+    def test_token_account_cli_dispatch_and_auth_environment(self):
+        w = rs.Watch(self.watch).load()
+        token = w.dir / 'env-team'
+        token.write_text('CLAUDE_CODE_OAUTH_TOKEN=private-test-value\n')
+        token.chmod(0o600)
+        seen = []
+        def auth(cmd, **kwargs):
+            seen.append(kwargs['env'])
+            return rs.subprocess.CompletedProcess(cmd, 0, stdout='{"loggedIn":true}', stderr='')
+        with patch.object(rs.subprocess, 'run', side_effect=auth), \
+             patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/inherited', 'CLAUDE_CODE_OAUTH_TOKEN': 'original'}):
+            _, out = self.cli('account', self.watch, 'default', str(token))
+        self.assertNotIn('private-test-value', out)
+        self.assertEqual(seen[0]['CLAUDE_CODE_OAUTH_TOKEN'], 'original')
+        self.assertNotIn('CLAUDE_CONFIG_DIR', seen[0])
+        self.assertEqual(seen[1]['CLAUDE_CODE_OAUTH_TOKEN'], 'private-test-value')
+        self.assertNotIn('CLAUDE_CONFIG_DIR', seen[1])
 
 
 class Model(Base):

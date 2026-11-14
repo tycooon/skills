@@ -12,7 +12,7 @@
   review-scan nudge <pr-url> --head SHA
   review-scan list
   review-scan status [<watch>]
-  review-scan account <watch> [CONFIG_DIR | default]
+  review-scan account <watch> [ACCOUNT ...]
   review-scan model <watch> [MODEL] [--effort LEVEL]
   review-scan install <watch> [--interval SECONDS]
   review-scan uninstall <watch>
@@ -628,7 +628,7 @@ def main(argv=None):
     mod.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     acc = sub.add_parser("account", help="show or switch the Claude account the watch's runs use")
     acc.add_argument("watch")
-    acc.add_argument("config", nargs="?", help="a claude config directory with its own login, or `default`")
+    acc.add_argument("config", nargs="*", metavar="ACCOUNT", help="priority order: default, config directories, or token files")
     sub.add_parser("status").add_argument("watch", nargs="?", help="omit to list every watch")
     sub.add_parser("pause", help="pause new reviews; runs in flight can finish").add_argument("watch")
     sub.add_parser("resume", help="resume reviews on the next tick; schedule unchanged").add_argument("watch")

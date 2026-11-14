@@ -43,7 +43,7 @@ def item(key, fingerprint='v1'):
     return dict(key=key, fingerprint=fingerprint, title=key, payload={'value': key})
 
 
-class CommandWatch(unittest.TestCase):
+class WatchCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -117,6 +117,8 @@ class CommandWatch(unittest.TestCase):
         self.alive.add('one')
         return active
 
+
+class CommandWatch(WatchCase):
     def test_fingerprint_lifecycle_and_contract(self):
         self.assertEqual(self.tick()[0], 0)
         self.assertEqual(len(self.started), 1)
@@ -1348,6 +1350,344 @@ elif verb == 'status':
                 self.assertEqual(rs.main(['uninstall', 'review']), 0)
             self.assertEqual(tab[0], '# user entry\n')
 
+
+
+class ClaudeAccounts(WatchCase):
+    def configure(self, accounts):
+        w = self.aw.Watch('work').load()
+        w.config['claude_accounts'] = accounts
+        self.aw.write_json(w.dir / 'config.json', w.config)
+        return w
+
+    def test_legacy_default_strips_only_inherited_config_dir(self):
+        self.assertEqual(self.aw.claude_accounts({'claude_config': None}), [{'kind': 'default'}])
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/inherited', 'CLAUDE_CODE_OAUTH_TOKEN': 'inherited'}):
+            expected = dict(os.environ)
+            del expected['CLAUDE_CONFIG_DIR']
+            for account in (None, {'kind': 'default'}):
+                self.assertEqual(self.aw.claude_env(account), expected)
+            env = self.aw.claude_env({'kind': 'config_dir', 'path': '/chosen'})
+        self.assertEqual(env['CLAUDE_CONFIG_DIR'], '/chosen')
+        self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN', env)
+
+    def test_token_list_cli_rotation_and_safe_output(self):
+        token = self.root / 'env-team'
+        token.write_text("export CLAUDE_CODE_OAUTH_TOKEN='secret-one'\n")
+        with patch.object(self.aw, 'claude_auth_status', return_value={'loggedIn': True}):
+            rc, out, err = self.cli('account', 'work', 'default', str(token))
+        self.assertEqual(rc, 0)
+        self.assertNotIn('secret-one', out + err)
+        accounts = self.aw.Watch('work').load().config['claude_accounts']
+        self.assertEqual(accounts, [{'kind': 'default'}, {'kind': 'token_file', 'path': str(token)}])
+        self.assertNotIn('claude_config', self.aw.Watch('work').load().config)
+        for value in ('CLAUDE_CODE_OAUTH_TOKEN=secret-two', 'export CLAUDE_CODE_OAUTH_TOKEN="secret-three"'):
+            token.write_text(value + '\n')
+            with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': '/inherited'}):
+                env = self.aw.claude_env(accounts[1])
+            self.assertNotIn('CLAUDE_CONFIG_DIR', env)
+            self.assertEqual(env['CLAUDE_CODE_OAUTH_TOKEN'], value.split('=', 1)[1].strip('"'))
+        token.unlink()
+        with self.assertRaisesRegex(self.aw.ScanError, 'env-team'):
+            self.aw.claude_env(accounts[1])
+
+    def test_limit_reset_formats_and_error_channel(self):
+        now = self.clock
+        cases = [("Claude AI usage limit reached|1793451600000", '2026-10-31T13:00:00Z'),
+                 ("You've hit your weekly limit · resets Nov 12, 12am (UTC)", '2026-11-12T00:00:00Z'),
+                 ("You've hit your limit · resets Oct 12, 2027 12am (UTC)", '2027-10-12T00:00:00Z'),
+                 ("usage limit reached; resets 9am (UTC)", '2026-11-01T09:00:00Z'),
+                 ("usage limit reached|1", '2026-10-31T11:00:00Z')]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.aw.iso(self.aw.usage_reset(text, now)), expected)
+        log = self.root / 'run.jsonl'
+        for event in ({'type': 'assistant', 'result': cases[0][0]},
+                      {'type': 'result', 'is_error': False, 'result': cases[0][0]},
+                      {'type': 'result', 'is_error': True, 'result': {'message': cases[0][0]}}):
+            log.write_text(json.dumps(event) + '\n')
+            self.assertIsNone(self.aw.claude_usage_limit(log))
+        log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': cases[0][0]}) + '\n')
+        self.assertEqual(self.aw.claude_usage_limit(log)['until'], cases[0][1])
+
+    def ended_limit(self, account='default'):
+        w = self.aw.Watch('work').load()
+        log = w.runs / 'ended.jsonl'
+        log.write_text(json.dumps({'type': 'result', 'is_error': True,
+                                  'result': "Claude AI usage limit reached|1793451600"}) + '\n')
+        w.prs['one'] = {'last_run': {'started': self.aw.iso(self.clock), 'fingerprint': 'v1',
+                                   'account': account, 'log': str(log)},
+                        'attempts': {'fingerprint': 'v1', 'count': 1}}
+        w.save()
+        return log
+
+    def test_limit_falls_back_refunds_attempt_and_returns_after_expiry(self):
+        self.init('--max-attempts', '1')
+        self.configure([{'kind': 'default'}, {'kind': 'config_dir', 'path': str(self.root)}])
+        log = self.ended_limit()
+        real_popen = self.aw.subprocess.Popen
+        with patch.object(self.aw, 'claude_logged_in', return_value=True), \
+             patch.object(self.aw.shutil, 'which', return_value='/bin/claude'), \
+             patch.object(self.aw, 'proc_start', return_value='start'), \
+             patch.object(self.aw.subprocess, 'Popen') as popen:
+            fake = popen.return_value
+            fake.pid = 4242
+            popen.side_effect = lambda cmd, *a, **kw: fake if cmd[:3] == ['/bin/sh', '-c', self.aw.WRAPPER] else real_popen(cmd, *a, **kw)
+            rc, out, _ = self.cli('tick', 'work')
+        self.assertEqual(rc, 0, out)
+        state = self.state()
+        self.assertEqual(state['one']['last_run']['account'], str(self.root))
+        self.assertEqual(state['one']['attempts']['count'], 1)
+        self.assertEqual(state['_accounts']['default']['run'], str(log))
+        self.assertIn('account default out of usage until', (self.aw.HOME / 'work' / 'scan.log').read_text())
+        self.clock = self.aw.parse_time('2026-10-31T14:00:00Z')
+        with patch.object(self.aw, 'claude_logged_in', return_value=True):
+            w = self.aw.Watch('work').load()
+            self.aw.examine_account_runs(w, self.clock)
+            account, _ = self.aw.pick_claude_account(w)
+        self.assertEqual(account, {'kind': 'default'})
+        self.assertNotIn('default', w.prs['_accounts'])
+
+    def test_all_held_notifies_once_and_recovers(self):
+        w = self.configure([{'kind': 'default'}, {'kind': 'config_dir', 'path': str(self.root)}])
+        w.prs['_accounts'] = {a: {'until': '2026-10-31T13:00:00Z', 'detail': 'usage limit', 'run': 'old'}
+                              for a in ('default', str(self.root))}
+        w.save()
+        with patch.object(self.aw, 'notify_watch') as notify:
+            for _ in range(2):
+                rc, out, _ = self.tick()
+                self.assertIn('waiting for a Claude account (default until', out)
+                self.assertIn(str(self.root) + ' until', out)
+            self.assertEqual(notify.call_count, 1)
+            self.assertFalse(self.started)
+            self.clock += self.aw.dt.timedelta(hours=4)
+            self.tick()
+            self.assertNotIn('problem', self.state()['_alert'])
+            self.assertEqual(len(self.started), 1)
+
+    def test_logged_out_and_missing_token_skip_without_holds(self):
+        missing = str(self.root / 'missing')
+        w = self.configure([{'kind': 'token_file', 'path': missing}, {'kind': 'default'},
+                            {'kind': 'config_dir', 'path': str(self.root)}])
+        with patch.object(self.aw, 'claude_logged_in', side_effect=lambda a: a != {'kind': 'default'}):
+            account, env = self.aw.pick_claude_account(w)
+        self.assertEqual(account['path'], str(self.root))
+        self.assertIn('logged out', '; '.join(w.account_problems))
+        self.assertIn(missing, '; '.join(w.account_problems))
+        self.assertFalse(w.prs.get('_accounts'))
+
+    def test_examine_once_even_when_log_unreadable(self):
+        log = self.ended_limit()
+        w = self.aw.Watch('work').load()
+        with patch.object(self.aw, 'claude_usage_limit', wraps=self.aw.claude_usage_limit) as detect:
+            self.aw.examine_account_runs(w, self.clock)
+            self.aw.examine_account_runs(w, self.clock)
+        self.assertEqual(detect.call_count, 1)
+        self.assertTrue(w.prs['one']['last_run']['account_examined'])
+        self.assertTrue(w.prs['one']['last_run']['usage_limit'])
+
+
+    def test_reset_rollover_zone_and_invalid_values(self):
+        ended = self.aw.parse_time('2026-10-13T10:00:00Z')
+        self.assertEqual(self.aw.iso(self.aw.usage_reset("You've hit your weekly limit · resets Oct 12, 12am (UTC)", ended)),
+                         '2027-10-12T00:00:00Z')
+        cases = [("usage limit reached; resets Nov 12, 2025 12am (UTC)", '2025-11-12T00:00:00Z'),
+                 ("usage limit reached; resets 3pm", '2026-10-31T15:00:00Z'),
+                 ("usage limit reached; resets 3pm (America/New_York)", '2026-10-31T19:00:00Z'),
+                 ("usage limit reached; resets 13pm (UTC)", '2026-10-31T11:00:00Z'),
+                 ("usage limit reached; resets 3pm (Invalid/Zone)", '2026-10-31T11:00:00Z'),
+                 ("usage limit reached", '2026-10-31T11:00:00Z')]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(self.aw.iso(self.aw.usage_reset(text, self.clock)), expected)
+
+    def test_invalid_token_is_never_echoed_or_executed(self):
+        path = self.root / 'env'
+        secret = 'not-a-valid-assignment-secret'
+        path.write_text(secret)
+        account = {'kind': 'token_file', 'path': str(path)}
+        with self.assertRaises(self.aw.ScanError) as error:
+            self.aw.claude_env(account)
+        self.assertNotIn(secret, str(error.exception))
+        with patch.object(self.aw, 'claude_auth_status', side_effect=ValueError(secret)):
+            rc, out, err = self.cli('account', 'work', str(path))
+        self.assertNotIn(secret, out + err)
+        self.assertIn('readable by group or other', err)
+        path.chmod(0o600)
+        path.write_text('CLAUDE_CODE_OAUTH_TOKEN="$(touch forbidden)"')
+        env = self.aw.claude_env(account)
+        self.assertEqual(env['CLAUDE_CODE_OAUTH_TOKEN'], '$(touch forbidden)')
+        self.assertFalse((self.root / 'forbidden').exists())
+
+    def test_read_only_tail_and_unreadable_log_are_not_limits(self):
+        log = self.root / 'large.jsonl'
+        event = json.dumps({'type': 'result', 'is_error': True, 'result': 'usage limit reached'})
+        log.write_text(event + '\n' + json.dumps({'type': 'tool', 'text': 'x' * (2 * self.aw.RUN_LOG_TAIL_BYTES)}) + '\n')
+        self.assertIsNone(self.aw.claude_usage_limit(log))
+        log.write_text('x' * (2 * self.aw.RUN_LOG_TAIL_BYTES) + '\n' + event + '\n')
+        self.assertIsNotNone(self.aw.claude_usage_limit(log))
+        log.unlink()
+        self.assertIsNone(self.aw.claude_usage_limit(log))
+        ended = self.ended_limit()
+        ended.unlink()
+        w = self.aw.Watch('work').load()
+        with patch.object(self.aw, 'claude_usage_limit', wraps=self.aw.claude_usage_limit) as detect:
+            self.aw.examine_account_runs(w, self.clock)
+            self.aw.examine_account_runs(w, self.clock)
+        self.assertEqual(detect.call_count, 1)
+        self.assertFalse(w.prs['_accounts'])
+
+    def test_batch_live_runs_and_removed_accounts(self):
+        self.ended_limit()
+        w = self.aw.Watch('work').load()
+        w.prs['two'] = json.loads(json.dumps(w.prs['one']))
+        w.prs['two']['last_run']['run_key'] = 'one'
+        w.save()
+        self.alive.add('one')
+        with patch.object(self.aw, 'claude_usage_limit', wraps=self.aw.claude_usage_limit) as detect:
+            self.aw.examine_account_runs(w, self.clock)
+            self.assertEqual(detect.call_count, 0)
+            self.alive.clear()
+            self.aw.examine_account_runs(w, self.clock)
+            self.assertEqual(detect.call_count, 1)
+        for key in ('one', 'two'):
+            self.assertEqual(w.prs[key]['attempts']['count'], 0)
+        w.config['claude_accounts'] = [{'kind': 'config_dir', 'path': str(self.root)}]
+        self.aw.examine_account_runs(w, self.clock)
+        self.assertEqual(w.prs['_accounts'], {})
+
+    def test_hold_updates_do_not_notify_again_during_episode(self):
+        self.ended_limit()
+        self.tick()
+        w = self.aw.Watch('work').load()
+        w.prs['_accounts']['default']['until'] = '2026-10-31T14:00:00Z'
+        w.save()
+        with patch.object(self.aw, 'notify_watch') as notify:
+            self.tick()
+        notify.assert_not_called()
+        with patch.object(self.aw, 'claude_auth_status', return_value={'loggedIn': True}):
+            _, out, _ = self.cli('account', 'work')
+        self.assertIn('out of usage until 2026-10-31T14:00:00Z', out)
+
+    def test_fallback_reports_logged_out_entry_as_problem(self):
+        self.configure([{'kind': 'default'}, {'kind': 'config_dir', 'path': str(self.root)}])
+        real_popen = self.aw.subprocess.Popen
+        with patch.object(self.aw, 'claude_logged_in', side_effect=lambda a: a['kind'] != 'default'), \
+             patch.object(self.aw.shutil, 'which', return_value='/bin/claude'), \
+             patch.object(self.aw, 'proc_start', return_value='start'), \
+             patch.object(self.aw.subprocess, 'Popen') as popen, \
+             patch.object(self.aw, 'notify_watch') as notify:
+            fake = popen.return_value
+            fake.pid = 4242
+            popen.side_effect = lambda cmd, *a, **kw: fake if cmd[:3] == ['/bin/sh', '-c', self.aw.WRAPPER] else real_popen(cmd, *a, **kw)
+            rc, out, _ = self.cli('tick', 'work')
+        self.assertEqual(rc, 0)
+        self.assertIn('logged out (account default)', out)
+        self.assertEqual(self.state()['one']['last_run']['account'], str(self.root))
+        notify.assert_called_once()
+        self.assertFalse(self.state().get('_accounts'))
+
+    def test_launcher_bypasses_local_accounts(self):
+        w = self.configure([{'kind': 'token_file', 'path': '/missing-token'}])
+        w.config['launcher'] = ['launcher']
+        self.aw.write_json(w.dir / 'config.json', w.config)
+        w.prs['_accounts'] = {'/missing-token': {'until': '2026-11-01T00:00:00Z', 'detail': 'limit'}}
+        w.save()
+        self.assertEqual(self.tick()[0], 0)
+        self.assertEqual(len(self.started), 1)
+        self.assertNotIn('account', self.state()['one']['last_run'])
+
+    def test_init_keeps_new_and_legacy_accounts(self):
+        accounts = [{'kind': 'default'}, {'kind': 'token_file', 'path': '/token'}]
+        self.configure(accounts)
+        self.init()
+        self.assertEqual(self.aw.Watch('work').load().config['claude_accounts'], accounts)
+        w = self.aw.Watch('work').load()
+        del w.config['claude_accounts']
+        w.config['claude_config'] = str(self.root)
+        self.aw.write_json(w.dir / 'config.json', w.config)
+        self.init()
+        self.assertEqual(self.aw.claude_accounts(self.aw.Watch('work').load().config),
+                         [{'kind': 'config_dir', 'path': str(self.root)}])
+
+    def test_quota_failures_do_not_trigger_failed_runs_alert(self):
+        w = self.aw.Watch('work').load()
+        logs = []
+        for n in range(3):
+            directory = w.runs / str(n)
+            directory.mkdir()
+            log = directory / '20261031T100000Z.jsonl'
+            log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': 'usage limit reached'}) + '\n')
+            logs.append(str(log))
+        w.prs['_run_results'] = {log: {'result': [False, 'usage limit reached'], 'usage_limit': True} for log in logs}
+        with patch.object(self.aw, 'run_result', side_effect=AssertionError('limited log reread')):
+            self.assertIsNone(self.aw.failed_runs_problem(w))
+
+
+    def test_examined_success_and_error_logs_are_not_read_again(self):
+        w = self.aw.Watch('work').load()
+        for n in range(3):
+            key = str(n)
+            directory = w.runs / w.slug(key)
+            directory.mkdir()
+            log = directory / '20261031T100000Z.jsonl'
+            log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': 'ordinary failure'}) + '\n')
+            w.prs[key] = {'last_run': {'account': 'default', 'log': str(log), 'started': self.aw.iso(self.clock)}}
+        with patch.object(self.aw, 'run_log_events', wraps=self.aw.run_log_events) as read:
+            self.aw.examine_account_runs(w, self.clock)
+            self.assertIn('ordinary failure', self.aw.failed_runs_problem(w))
+            self.aw.examine_account_runs(w, self.clock)
+            self.assertIn('ordinary failure', self.aw.failed_runs_problem(w))
+        self.assertEqual(read.call_count, 3)
+
+
+    def test_limit_refund_keeps_daily_start_cap(self):
+        self.init('--max-runs-per-day', '1', '--max-attempts', '1')
+        self.configure([{'kind': 'default'}, {'kind': 'config_dir', 'path': str(self.root)}])
+        self.ended_limit()
+        w = self.aw.Watch('work').load()
+        w.prs['_runs'] = [self.aw.iso(self.clock)]
+        w.save()
+        _, out, _ = self.tick()
+        self.assertIn('waiting for a free slot', out)
+        self.assertFalse(self.started)
+        self.assertEqual(self.state()['one']['attempts']['count'], 0)
+        self.assertEqual(len(self.state()['_runs']), 1)
+
+
+    def test_delayed_tick_does_not_roll_expired_reset_forward(self):
+        ended = self.aw.parse_time('2026-11-14T14:59:00Z')
+        cases = [("usage limit reached; resets 3pm (UTC)", '2026-11-14T15:01:00Z'),
+                 ("You've hit your weekly limit · resets Nov 14, 3pm (UTC)", '2026-11-14T15:01:00Z'),
+                 ("usage limit reached", '2026-11-14T16:01:00Z'),
+                 ("usage limit reached; resets Nov 14, 2026 3pm (UTC)", '2026-11-14T15:01:00Z')]
+        for text, tick_at in cases:
+            with self.subTest(text=text):
+                log = self.ended_limit()
+                log.write_text(json.dumps({'type': 'result', 'is_error': True, 'result': text}) + '\n')
+                os.utime(log, (ended.timestamp(), ended.timestamp()))
+                w = self.aw.Watch('work').load()
+                self.aw.examine_account_runs(w, self.aw.parse_time(tick_at))
+                self.assertFalse(w.prs['_accounts'])
+                self.assertTrue(w.prs['one']['last_run']['usage_limit'])
+                self.assertEqual(w.prs['one']['attempts']['count'], 0)
+
+    def test_future_reset_uses_result_timestamp_before_log_mtime(self):
+        self.clock = self.aw.parse_time('2026-11-14T15:01:00Z')
+        ended = self.aw.parse_time('2026-11-14T14:59:00Z')
+        for stamp in (self.aw.iso(ended), ended.timestamp(), ended.timestamp() * 1000):
+            for tick_at, expected in [('2026-11-14T15:01:00Z', None),
+                                      ('2026-11-14T14:59:30Z', '2026-11-14T15:00:00Z')]:
+                with self.subTest(stamp=stamp, tick_at=tick_at):
+                    log = self.ended_limit()
+                    log.write_text(json.dumps({'type': 'result', 'is_error': True, 'timestamp': stamp,
+                                              'result': 'usage limit reached; resets 3pm (UTC)'}) + '\n')
+                    os.utime(log, (self.clock.timestamp(), self.clock.timestamp()))
+                    w = self.aw.Watch('work').load()
+                    self.aw.examine_account_runs(w, self.aw.parse_time(tick_at))
+                    if expected:
+                        self.assertEqual(w.prs['_accounts']['default']['until'], expected)
+                    else:
+                        self.assertFalse(w.prs['_accounts'])
 
 
 if __name__ == '__main__':
