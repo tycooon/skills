@@ -32,7 +32,8 @@ A nudge on a scheduled watch runs its tick through the schedule's own login shel
 (`launchctl kickstart` is not used: it cannot pass `--only`.) An unscheduled watch's tick is a direct child.
 Either way a tick starts no review run for a target whose posting token variable (`PR_REVIEW_GH_TOKEN`,
 `PR_REVIEW_GITLAB_TOKEN` or the target's `--token` variable) is unset or empty: it logs an ERROR naming the
-variable and the watch, and `status` shows it, rather than letting `gh` fall back to the owner's login.
+variable and the watch, and `status` shows it. If the token resolves to a login but can't access the PR's
+project, the run uses the owner's default CLI login when it is one of the watch's `--own` accounts.
 
 `pause` persists across configuration and schedule changes: every tick skips work, including manual and dry-run ticks, and nudges queue rechecks without starting a tick. Reviews already in flight can finish and settle. `resume` keeps the schedule unchanged and leaves scanning to the next tick; use `tick` for an immediate scan. An unscheduled watch stays unscheduled.
 
@@ -286,23 +287,94 @@ def posting_variable(r):
     return r.get("token") or ("PR_REVIEW_GH_TOKEN" if GH_PR.match(r["url"]) else "PR_REVIEW_GITLAB_TOKEN")
 
 
-def posting_login(url, token):
-    """The login a token posts as on this PR's host, or None when it can't be resolved."""
+GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+GL_TOKEN_VARS = ("GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN")
+
+
+def posting_api(url, endpoint, token):
     if GH_PR.match(url):
-        cmd, env, field = ["gh", "api", "user"], {"GH_TOKEN": token}, "login"
+        cmd, token_var = ["gh", "api"], GH_TOKEN_VARS[0]
     else:
-        cmd = ["glab", "api", "--hostname", urllib.parse.urlparse(url).hostname, "user"]
-        env, field = {"GITLAB_TOKEN": token}, "username"
+        cmd, token_var = ["glab", "api", "--hostname", posting_host(url)], GL_TOKEN_VARS[0]
+    env = os.environ.copy()
+    if token is None:
+        for variable in (*GH_TOKEN_VARS, *GL_TOKEN_VARS):
+            env.pop(variable, None)
+    else:
+        env[token_var] = token
+    return subprocess.run([*cmd, endpoint], capture_output=True, text=True, timeout=30, env=env)
+
+
+def posting_login(url, token):
+    """The login used by the token, or by the CLI's default credentials if token is None."""
+    field = "login" if GH_PR.match(url) else "username"
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env={**os.environ, **env})
+        p = posting_api(url, "user", token)
         login = json.loads(p.stdout).get(field) if p.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
         return None
     return login or None
 
 
+def default_login(url):
+    return posting_login(url, None)
+
+
 def posting_host(url):
     return "github" if GH_PR.match(url) else urllib.parse.urlparse(url).hostname
+
+
+def posting_project(url):
+    if m := GH_PR.match(url):
+        return m[1]
+    if m := GL_MR.match(url):
+        return m[2]
+    return None
+
+
+def posting_reach(url, token):
+    """Return whether the token can fetch the project, or None if the result is inconclusive."""
+    project = posting_project(url)
+    if project is None:
+        return None
+    endpoint = f"repos/{project}" if GH_PR.match(url) else "projects/" + urllib.parse.quote(project, safe="")
+    try:
+        p = posting_api(url, endpoint, token)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if p.returncode == 0:
+        return True
+    if re.search(r"(?m)(?:^\s*(?:glab:\s*)?|\bHTTP\s+)(?:403|404)\b|\b(?:403 Forbidden|404 (?:Project )?Not Found)\b",
+                 f"{p.stdout}\n{p.stderr}"):
+        return False
+    return None
+
+
+def posting_account(r):
+    login = r["posting_login"]
+    if fallback := r.get("posting_fallback"):
+        if GH_PR.match(r["url"]):
+            cli, variables, check, project = "gh", GH_TOKEN_VARS, "gh api user --jq .login", "repository"
+        else:
+            cli, variables, project = "glab", GL_TOKEN_VARS, "project"
+            check = f"glab api --hostname {posting_host(r['url'])} user | jq -r .username"
+        unset = "env " + " ".join(f"-u {variable}" for variable in variables)
+        return (
+            f"- Posting account: `{login}`, the default `{cli}` login on this host, because "
+            f"`${fallback['variable']}` (`{fallback['bot']}`) has no access to this {project}. "
+            f"Prefix every posting command, including helper scripts, with `{unset}`. "
+            f"Before your first post, run `{unset} {check}` and stop without posting if it fails or prints "
+            f"anything but `{login}`. Keep the identity line in every body, since attribution lives there. "
+            "This account may be the PR's author. GitHub refuses self-approval, so for a clean verdict on your own "
+            "PR use review-pr's APPROVED comment fallback."
+        )
+    variable = posting_variable(r)
+    return (
+        f"- Posting account: `{login}`, the login of `${variable}`, resolved by the scan. "
+        f"Before your first post, run `GH_TOKEN=\"${variable}\" gh api user --jq .login` (GitLab: the same token "
+        f"against `/user`) and stop without posting if it fails or prints anything but `{login}`. "
+        "Never post from an ambient `gh` login."
+    )
 
 
 def build_brief(w, r, rec, reason, siblings, now):
@@ -318,10 +390,7 @@ def build_brief(w, r, rec, reason, siblings, now):
         f"- Why this run: {reason}.",
         f"- Head when the scan listed it: `{r['head']}`; base branch `{r['base']}`; author `{r['author']}`.",
         f"- Run start time, for `settle --since`: `{engine.iso(now)}`.",
-        f"- Posting account: `{r['posting_login']}`, the login of `${posting_variable(r)}`, resolved by the scan. "
-        f"Before your first post, run `GH_TOKEN=\"${posting_variable(r)}\" gh api user --jq .login` (GitLab: the same token "
-        f"against `/user`) and stop without posting if it fails or prints anything but `{r['posting_login']}`. "
-        "Never post from an ambient `gh` login.",
+        posting_account(r),
         f"- History accounts (every account whose past posts count as yours, the posting account and the owner's own "
         f"among them): {', '.join(cfg['own'])}.",
     ]
@@ -337,7 +406,7 @@ def build_brief(w, r, rec, reason, siblings, now):
                      f"`{former['agent']} (Codex handoff)` stays someone else's, as review-pr's *Whose comment it is* says.")
     if r.get("filter"):
         lines.append(f"- This target carries a filter: {r['filter']!r}. If the PR falls outside it, settle without reviewing.")
-    if r.get("token"):
+    if r.get("token") and not r.get("posting_fallback"):
         default = posting_variable({"url": r["url"]})
         # Under the default name, so every posting command and helper that reads it gets this target's token.
         lines.append(f"- Post on this target with the token in `${r['token']}`: run every posting command, helper "
@@ -542,6 +611,9 @@ class PRSource:
         return listed, failed, accounting, finished
 
     def finish(self, w, finished, accounting):
+        fallbacks = list(w.__dict__.get("_posting_fallbacks", {}).values())
+        w.prs["_posting_fallbacks"] = fallbacks
+        accounting.extend(fallbacks)
         for t in finished:
             w.config["targets"].remove(t)
             accounting.append(f"{t['spec']}: merged or closed, left the watch")
@@ -564,18 +636,45 @@ class PRSource:
         if not token:
             raise engine.MissingToken(variable)
         cache = w.__dict__.setdefault("_posting_logins", {})  # per command, so once per tick
-        key = (variable, posting_host(row["url"]))
+        url = row["url"]
+        host = posting_host(url)
+        key = (variable, host)
         if key not in cache:
-            cache[key] = posting_login(row["url"], token)
-        if not cache[key]:
+            cache[key] = posting_login(url, token)
+        bot = cache[key]
+        if not bot:
             raise engine.PostingBlocked(variable, f"${variable} does not resolve to a login "
-                                                  "(the token is rejected or the host is unreachable)")
-        row["posting_login"] = cache[key]
+                                        "(the token is rejected or the host is unreachable)")
+        row["posting_login"] = bot
+        project = posting_project(url)
+        reach = w.__dict__.setdefault("_posting_reach", {})
+        reach_key = (variable, host, project)
+        if reach_key not in reach:
+            reach[reach_key] = posting_reach(url, token)
+        if reach[reach_key] is not False:
+            return
+        defaults = w.__dict__.setdefault("_default_posting_logins", {})
+        if host not in defaults:
+            defaults[host] = default_login(url)
+        login = defaults[host]
+        project_name = project if GH_PR.match(url) else f"{host}/{project}"
+        denial = f"${variable} ({bot}) has no access"
+        if not login:
+            raise engine.PostingBlocked(variable, f"{denial} to {project_name} and the default login does not resolve")
+        if login not in w.config["own"]:
+            raise engine.PostingBlocked(variable, f"{denial} to {project_name} and the default login {login} is not in --own")
+        row["posting_login"] = login
+        row["posting_fallback"] = {"bot": bot, "variable": variable}
+        fallbacks = w.__dict__.setdefault("_posting_fallbacks", {})
+        fallbacks.setdefault((host, project), f"{project_name}: {denial}; posting as {login}")
 
     def describe(self, w, detail):
         for t in w.config["targets"]:
             yield f"  {'target ' if detail else ''}{t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "") + (
                 f" (posts with ${t['token']})" if detail and t.get("token") else "")
+        if detail:
+            for line in w.prs.get("_posting_fallbacks", []):
+                yield f"  {line}"
 
     def policy(self, w):
         return f"dormant after {w.config['dormant_days']} days, "
