@@ -67,11 +67,18 @@ class Base(unittest.TestCase):
         login = patch.object(rs, "posting_login", side_effect=lambda url, token: self.logins.append((url, token)) or "bot")
         login.start()
         self.addCleanup(login.stop)
+        self.reach = self.start_patch("posting_reach", True)
+        self.default = self.start_patch("default_login", "owner")
         sched = patch.object(rs.engine, "is_scheduled", return_value=False)  # the host's crontab is not under test
         sched.start()
         self.addCleanup(sched.stop)
         self.watch = f"w{self.id().split('.')[-1]}"
         self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--reviewer-model", "sonnet")
+
+    def start_patch(self, name, value):
+        mock = patch.object(rs, name, return_value=value)
+        self.addCleanup(mock.stop)
+        return mock.start()
 
     def cli(self, *argv, spawn=None):
         out = io.StringIO()
@@ -745,14 +752,135 @@ class ScheduledTokens(Base):
         self.assertEqual(len(self.spawned), 2)
 
     def test_an_unresolvable_login_starts_no_run_and_resolves_once_per_tick(self):
-        with patch.object(rs, "posting_login", return_value=None):
+        with patch.object(rs, "posting_login", return_value=None) as login:
             code, out = self.cli("tick", self.watch)
         self.assertEqual((code, self.spawned), (5, []))
+        login.assert_called_once()
+        self.reach.assert_not_called()
+        self.default.assert_not_called()
         self.assertIn("does not resolve to a login", out)
         self.assertIn("$PR_REVIEW_GH_TOKEN does not resolve", self.prs()["_alert"]["problem"])
         self.cli("tick", self.watch)
         self.assertEqual(len(self.spawned), 2)
         self.assertEqual(len(self.logins), 1)  # two PRs, one lookup
+
+    def test_unreachable_project_uses_the_default_login_and_reports_it_once(self):
+        other = "https://github.com/acme/other/pull/1"
+        self.listing["acme/other"] = [row(other)]
+        self.cli("init", self.watch, "--target", "acme/app", "--target", "acme/other",
+                 "--own", "review-bot", "--own", "owner")
+        self.reach.return_value = False
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.spawned), 3)
+        self.assertEqual([c.args for c in self.reach.call_args_list], [(PR1, "t"), (other, "t")])
+        self.default.assert_called_once_with(PR1)
+        for _, brief in self.spawned:
+            self.assertIn("Posting account: `owner`, the default `gh` login", brief)
+            self.assertIn("`$PR_REVIEW_GH_TOKEN` (`bot`) has no access", brief)
+            self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN gh api user --jq .login", brief)
+            self.assertIn("identity line in every body", brief)
+            self.assertIn("APPROVED comment", brief)
+            self.assertNotIn("Never post from an ambient", brief)
+        log = (rs.HOME / self.watch / "scan.log").read_text()
+        _, status = self.cli("status", self.watch)
+        for project in ("acme/app", "acme/other"):
+            message = f"{project}: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+            for report in (out, log, status):
+                self.assertEqual(report.count(message), 1)
+
+    def test_default_login_brief_omits_the_target_token_export(self):
+        url = "https://git.example.com/g/p/-/merge_requests/3"
+        target = "gitlab:git.example.com/g/p!"
+        self.listing[target] = [row(url)]
+        self.cli("init", self.watch, "--target", target, "--own", "owner", "--token", f"{target}=OTHER_TOKEN")
+        self.reach.return_value = False
+        with patch.dict(os.environ, {"OTHER_TOKEN": "custom"}):
+            self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.reach.assert_called_once_with(url, "custom")
+        (_, brief), = self.spawned
+        self.assertIn("Posting account: `owner`, the default `glab` login", brief)
+        self.assertIn("`$OTHER_TOKEN` (`bot`) has no access", brief)
+        self.assertIn("env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN glab api --hostname git.example.com user", brief)
+        self.assertNotIn("exported", brief)
+
+    def test_status_keeps_the_fallback_until_reach_succeeds(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--own", "owner")
+        self.reach.return_value = False
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+        for url in (PR1, PR2):
+            self.activity[url] = act()
+            self.assertEqual(self.cli("settle", self.watch, url, "--head", A, *SINCE)[0], 0)
+
+        self.reach.reset_mock()
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual(code, 0)
+        self.assertNotIn(message, out)
+        self.reach.assert_not_called()
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.reach.return_value = None
+        self.assertEqual(self.cli("tick", self.watch, "--full")[0], 0)
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.reach.return_value = True
+        self.assertEqual(self.cli("tick", self.watch, "--full")[0], 0)
+        self.assertNotIn(message, self.cli("status", self.watch)[1])
+
+    def test_fallback_is_pruned_when_no_target_covers_the_project(self):
+        self.listing = {"acme": [row(PR1)], PR2: [row(PR2, named=True)], "other/repo": []}
+        self.cli("init", self.watch, "--target", "acme", "--own", "owner")
+        self.reach.return_value = False
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+
+        self.cli("init", self.watch, "--target", PR2, "--own", "owner")
+        self.reach.reset_mock()
+        self.assertEqual(self.cli("tick", self.watch, "--only", PR1)[0], 0)
+        self.reach.assert_not_called()
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.cli("init", self.watch, "--target", "other/repo", "--own", "owner")
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.reach.assert_not_called()
+        self.assertNotIn(message, self.cli("status", self.watch)[1])
+
+    def test_quiet_tick_migrates_the_previous_fallback_list(self):
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+        w = rs.Watch(self.watch).load()
+        w.prs.update({PR1: {}, "_posting_fallbacks": [message]})
+        w.save()
+        self.listing["acme/app"] = []
+        self.assertIn(message, self.cli("status", self.watch)[1])
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.reach.assert_not_called()
+        self.assertEqual(self.prs()["_posting_fallbacks"], {"github.com/acme/app": {"url": PR1, "line": message}})
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+    def test_unreachable_project_blocks_without_a_default_login(self):
+        self.reach.return_value = False
+        self.default.return_value = None
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("$PR_REVIEW_GH_TOKEN (bot) has no access", out)
+        self.assertIn("default login does not resolve", out)
+        self.default.assert_called_once()
+
+    def test_unreachable_project_blocks_when_default_login_is_outside_own(self):
+        self.reach.return_value = False
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual((code, self.spawned), (5, []))
+        self.assertIn("$PR_REVIEW_GH_TOKEN (bot) has no access", out)
+        self.assertIn("default login owner is not in --own", out)
+
+    def test_unknown_reach_keeps_the_bot(self):
+        self.reach.return_value = None
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.assertEqual(len(self.spawned), 2)
+        self.assertIn("Posting account: `bot`", self.spawned[0][1])
+        self.reach.assert_called_once_with(PR1, "t")
+        self.default.assert_not_called()
 
     def test_posting_login_runs_the_host_cli_and_parses_its_json(self):
         calls = []
@@ -784,6 +912,16 @@ class ScheduledTokens(Base):
                 rs.engine.SOURCE.preflight(w, r)
         self.assertEqual([u for u, _ in self.logins], urls)
 
+    def test_reach_and_default_login_are_cached_separately_by_host(self):
+        urls = ["https://gl-a.example.com/g/p/-/merge_requests/1", "https://gl-b.example.com/g/p/-/merge_requests/1"]
+        w = rs.Watch(self.watch).load()
+        w.config["own"].append("owner")
+        self.reach.return_value = False
+        for url in urls * 2:
+            rs.engine.SOURCE.preflight(w, {"url": url})
+        self.assertEqual([c.args for c in self.reach.call_args_list], [(u, "t") for u in urls])
+        self.assertEqual([c.args for c in self.default.call_args_list], [(u,) for u in urls])
+
     def test_a_dry_run_reports_a_missing_token_without_recording_it(self):
         with patch.dict(os.environ, {"PR_REVIEW_GH_TOKEN": ""}):
             code, out = self.cli("tick", self.watch, "--dry-run")
@@ -803,6 +941,52 @@ class ScheduledTokens(Base):
         self.assertIn("History accounts", brief)
         self.assertIn("review-bot", brief.split("History accounts")[1])
         self.assertNotIn("Accounts that post as you", brief)
+
+
+class PostingCLI(unittest.TestCase):
+    def test_posting_reach_fetches_the_project_with_the_token(self):
+        cases = [
+            (PR1, ["gh", "api", "repos/acme/app"], "GH_TOKEN"),
+            ("https://git.example.com/group/sub/project/-/merge_requests/3",
+             ["glab", "api", "--hostname", "git.example.com", "projects/group%2Fsub%2Fproject"], "GITLAB_TOKEN"),
+        ]
+        for url, command, variable in cases:
+            with self.subTest(url=url), patch.dict(os.environ, {"OTHER": "preserved"}), \
+                    patch.object(rs.subprocess, "run", return_value=rs.subprocess.CompletedProcess(command, 0, "{}", "")) as run:
+                self.assertIs(rs.posting_reach(url, "t"), True)
+                run.assert_called_once_with(command, capture_output=True, text=True, timeout=30,
+                                            env={**os.environ, variable: "t"})
+
+    def test_posting_reach_distinguishes_denials_from_other_errors(self):
+        for out, err, expected in [
+            ("", "gh: Not Found (HTTP 404)", False),
+            ("404 Project Not Found", "", False),
+            ("", "gh: Forbidden (HTTP 403)", False),
+            ("", "503 Service Unavailable", None),
+            ("", "dial tcp 192.0.2.1:404: connection refused", None),
+        ]:
+            with self.subTest(out=out, err=err), patch.object(
+                rs.subprocess, "run", return_value=rs.subprocess.CompletedProcess([], 1, out, err)
+            ):
+                self.assertIs(rs.posting_reach(PR1, "t"), expected)
+        with patch.object(rs.subprocess, "run", side_effect=rs.subprocess.TimeoutExpired("gh", 30)):
+            self.assertIsNone(rs.posting_reach(PR1, "t"))
+
+    def test_default_login_omits_token_variables(self):
+        variables = ("GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN")
+        cases = [
+            (PR1, ["gh", "api", "user"], {"login": "owner"}),
+            ("https://git.example.com/g/p/-/merge_requests/3",
+             ["glab", "api", "--hostname", "git.example.com", "user"], {"username": "owner"}),
+        ]
+        for url, command, body in cases:
+            with self.subTest(url=url), patch.dict(os.environ, {v: "t" for v in variables}), \
+                    patch.object(rs.subprocess, "run", return_value=rs.subprocess.CompletedProcess(
+                        command, 0, json.dumps(body), ""
+                    )) as run:
+                self.assertEqual(rs.default_login(url), "owner")
+                run.assert_called_once_with(command, capture_output=True, text=True, timeout=30,
+                                            env={k: v for k, v in os.environ.items() if k not in variables})
 
 
 class PausedNudge(Base):
@@ -1725,6 +1909,7 @@ class Covers(unittest.TestCase):
         mr = "https://gitlab.example.com/grp/sub/proj/-/merge_requests/5"
         self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp", mr))
         self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp/sub/proj!", mr))
+        self.assertFalse(rs.covers("gitlab:gitlab.example.com/grp/sub!", mr))
         self.assertFalse(rs.covers("gitlab:gitlab.example.com/gr", mr))
 
 
