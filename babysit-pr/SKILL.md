@@ -58,6 +58,8 @@ When `WatchPullRequest` exists, call it with `{"url":"<canonical PR/MR URL>"}` o
 
 Before the final report, or before handing a ready/merged target to release's delivery phases, call `WatchPullRequest` with the same URL and `stop: true`. Stop only this PR watch; leave unrelated wakeups and PR watches intact. If release returns to readiness waiting, arm a new native wait. When converting a restored polling round to native events, cancel its recorded backup heartbeat and do not schedule another polling wakeup; cancel a still-pending polling wakeup only through a mechanism that targets that owned job. Do not use session-wide stop to remove unrelated jobs.
 
+In Claude Code web and Remote Control sessions the native watch is `subscribe_pr_activity` (`{owner, repo, pullNumber}`), and `unsubscribe_pr_activity` stops it: use them where this section says `WatchPullRequest` and `stop: true`. Its "repository is not configured for this session" refusal is fixed with `add_repo`, then a second call; it is not a reason to fall back to polling.
+
 The host app must be running and the machine awake. Native watches persist through restart and pause after 20 event deliveries; do not automatically re-arm a paused watch to reset that limit. Its pause and refresh-failure notices ask the user to resume or repair access. Do not add a timer to enforce the polling fallback's quiet cap.
 
 ### Background waiter
