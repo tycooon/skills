@@ -1402,6 +1402,20 @@ class Account(Base):
     def config(self):
         return json.loads((Path(TMP.name) / self.watch / "config.json").read_text())
 
+    def test_account_shows_oauth_token_login(self):
+        with patch.object(rs.engine, "claude_auth_status", return_value={"loggedIn": True, "authMethod": "oauth_token"}):
+            code, out = self.cli("account", self.watch)
+        self.assertEqual(code, 0)
+        self.assertIn("    logged in with an OAuth token (the CLI reports no account for token logins)", out)
+        self.assertNotIn("None", out)
+
+    def test_account_shows_api_key_login(self):
+        with patch.object(rs.engine, "claude_auth_status", return_value={"loggedIn": True, "authMethod": "api_key"}):
+            code, out = self.cli("account", self.watch)
+        self.assertEqual(code, 0)
+        self.assertIn("    logged in (api_key)", out)
+        self.assertNotIn("OAuth", out)
+
     def test_switching_links_the_shared_setup_and_back(self):
         d = Path(tempfile.mkdtemp(dir=TMP.name)) / "secondary"
         code, out = self.switch(str(d))

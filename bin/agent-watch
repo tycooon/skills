@@ -1122,7 +1122,13 @@ def print_accounts(w, auth=False, heading=True):
             except (OSError, ScanError, subprocess.SubprocessError, ValueError):
                 status = {}
             if isinstance(status, dict) and status.get("loggedIn"):
-                print(f"    logged in as {status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})")
+                auth_method = status.get("authMethod")
+                if status.get("email"):
+                    print(f"    logged in as {status.get('email')} ({status.get('orgName')}, {status.get('subscriptionType')})")
+                elif auth_method == "oauth_token":
+                    print("    logged in with an OAuth token (the CLI reports no account for token logins)")
+                else:
+                    print(f"    logged in ({auth_method or 'unknown method'})")
             else:
                 print(f"    not logged in yet: {account_login(account)}; until then the tick reports its runs as failing to start")
 
