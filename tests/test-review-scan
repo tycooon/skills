@@ -804,6 +804,60 @@ class ScheduledTokens(Base):
         self.assertIn("env -u GITLAB_TOKEN -u GITLAB_ACCESS_TOKEN glab api --hostname git.example.com user", brief)
         self.assertNotIn("exported", brief)
 
+    def test_status_keeps_the_fallback_until_reach_succeeds(self):
+        self.cli("init", self.watch, "--target", "acme/app", "--own", "review-bot", "--own", "owner")
+        self.reach.return_value = False
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+        for url in (PR1, PR2):
+            self.activity[url] = act()
+            self.assertEqual(self.cli("settle", self.watch, url, "--head", A, *SINCE)[0], 0)
+
+        self.reach.reset_mock()
+        code, out = self.cli("tick", self.watch)
+        self.assertEqual(code, 0)
+        self.assertNotIn(message, out)
+        self.reach.assert_not_called()
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.reach.return_value = None
+        self.assertEqual(self.cli("tick", self.watch, "--full")[0], 0)
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.reach.return_value = True
+        self.assertEqual(self.cli("tick", self.watch, "--full")[0], 0)
+        self.assertNotIn(message, self.cli("status", self.watch)[1])
+
+    def test_fallback_is_pruned_when_no_target_covers_the_project(self):
+        self.listing = {"acme": [row(PR1)], PR2: [row(PR2, named=True)], "other/repo": []}
+        self.cli("init", self.watch, "--target", "acme", "--own", "owner")
+        self.reach.return_value = False
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+
+        self.cli("init", self.watch, "--target", PR2, "--own", "owner")
+        self.reach.reset_mock()
+        self.assertEqual(self.cli("tick", self.watch, "--only", PR1)[0], 0)
+        self.reach.assert_not_called()
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
+        self.cli("init", self.watch, "--target", "other/repo", "--own", "owner")
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.reach.assert_not_called()
+        self.assertNotIn(message, self.cli("status", self.watch)[1])
+
+    def test_quiet_tick_migrates_the_previous_fallback_list(self):
+        message = "acme/app: $PR_REVIEW_GH_TOKEN (bot) has no access; posting as owner"
+        w = rs.Watch(self.watch).load()
+        w.prs.update({PR1: {}, "_posting_fallbacks": [message]})
+        w.save()
+        self.listing["acme/app"] = []
+        self.assertIn(message, self.cli("status", self.watch)[1])
+        self.assertEqual(self.cli("tick", self.watch)[0], 0)
+        self.reach.assert_not_called()
+        self.assertEqual(self.prs()["_posting_fallbacks"], {"github.com/acme/app": {"url": PR1, "line": message}})
+        self.assertIn(message, self.cli("status", self.watch)[1])
+
     def test_unreachable_project_blocks_without_a_default_login(self):
         self.reach.return_value = False
         self.default.return_value = None
@@ -1855,6 +1909,7 @@ class Covers(unittest.TestCase):
         mr = "https://gitlab.example.com/grp/sub/proj/-/merge_requests/5"
         self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp", mr))
         self.assertTrue(rs.covers("gitlab:gitlab.example.com/grp/sub/proj!", mr))
+        self.assertFalse(rs.covers("gitlab:gitlab.example.com/grp/sub!", mr))
         self.assertFalse(rs.covers("gitlab:gitlab.example.com/gr", mr))
 
 

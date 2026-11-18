@@ -321,7 +321,7 @@ def default_login(url):
 
 
 def posting_host(url):
-    return "github" if GH_PR.match(url) else urllib.parse.urlparse(url).hostname
+    return urllib.parse.urlparse(url).hostname
 
 
 def posting_project(url):
@@ -330,6 +330,30 @@ def posting_project(url):
     if m := GL_MR.match(url):
         return m[2]
     return None
+
+
+def posting_project_key(url):
+    if project := posting_project(url):
+        return f"{posting_host(url)}/{project}"
+    return None
+
+
+def posting_project_label(key):
+    host, _, project = key.partition("/")
+    return project if host == "github.com" else key
+
+
+def posting_fallbacks(w):
+    saved = w.prs.get("_posting_fallbacks", {})
+    if isinstance(saved, dict):
+        return saved
+    # The earlier format stored display lines only. Recover their project keys from the PR records.
+    lines = {line.partition(": ")[0]: line for line in saved}
+    fallbacks = {}
+    for url in w.prs:
+        if (key := posting_project_key(url)) and (line := lines.get(posting_project_label(key))):
+            fallbacks[key] = {"url": url, "line": line}
+    return fallbacks
 
 
 def posting_reach(url, token):
@@ -538,7 +562,8 @@ def covers(spec, url):
     m = GL_MR.match(url)
     if m and spec.startswith("gitlab:"):
         host, _, path = spec[len("gitlab:"):].partition("/")
-        path = path.rstrip("!")
+        if path.endswith("!"):
+            return host == m[1] and m[2] == path[:-1]
         return host == m[1] and (m[2] == path or m[2].startswith(path + "/"))
     return False
 
@@ -611,14 +636,25 @@ class PRSource:
         return listed, failed, accounting, finished
 
     def finish(self, w, finished, accounting):
-        fallbacks = list(w.__dict__.get("_posting_fallbacks", {}).values())
-        w.prs["_posting_fallbacks"] = fallbacks
-        accounting.extend(fallbacks)
         for t in finished:
             w.config["targets"].remove(t)
             accounting.append(f"{t['spec']}: merged or closed, left the watch")
         if finished:
             engine.write_json(w.dir / "config.json", w.config)
+
+        fallbacks = posting_fallbacks(w)
+        for key, entry in w.__dict__.get("_posting_fallback_updates", {}).items():
+            if entry is None:
+                fallbacks.pop(key, None)
+            else:
+                fallbacks[key] = entry
+                accounting.append(entry["line"])
+        targets = self.targets(w)
+        named_projects = {posting_project_key(spec) for spec in targets}
+        w.prs["_posting_fallbacks"] = {
+            key: entry for key, entry in fallbacks.items()
+            if key in named_projects or any(covers(spec, entry["url"]) for spec in targets)
+        }
 
     def owed(self, rec, row, full):
         return owed_reason(rec, row, full)
@@ -651,13 +687,20 @@ class PRSource:
         reach_key = (variable, host, project)
         if reach_key not in reach:
             reach[reach_key] = posting_reach(url, token)
-        if reach[reach_key] is not False:
+        result = reach[reach_key]
+        if result is None:
+            return
+        project_key = posting_project_key(url)
+        updates = w.__dict__.setdefault("_posting_fallback_updates", {})
+        if result:
+            # A reachable token doesn't cancel a fallback from another token in the same tick.
+            updates.setdefault(project_key, None)
             return
         defaults = w.__dict__.setdefault("_default_posting_logins", {})
         if host not in defaults:
             defaults[host] = default_login(url)
         login = defaults[host]
-        project_name = project if GH_PR.match(url) else f"{host}/{project}"
+        project_name = posting_project_label(project_key)
         denial = f"${variable} ({bot}) has no access"
         if not login:
             raise engine.PostingBlocked(variable, f"{denial} to {project_name} and the default login does not resolve")
@@ -665,16 +708,15 @@ class PRSource:
             raise engine.PostingBlocked(variable, f"{denial} to {project_name} and the default login {login} is not in --own")
         row["posting_login"] = login
         row["posting_fallback"] = {"bot": bot, "variable": variable}
-        fallbacks = w.__dict__.setdefault("_posting_fallbacks", {})
-        fallbacks.setdefault((host, project), f"{project_name}: {denial}; posting as {login}")
+        updates[project_key] = {"url": url, "line": f"{project_name}: {denial}; posting as {login}"}
 
     def describe(self, w, detail):
         for t in w.config["targets"]:
             yield f"  {'target ' if detail else ''}{t['spec']}" + (f" (filter: {t['filter']})" if t.get("filter") else "") + (
                 f" (posts with ${t['token']})" if detail and t.get("token") else "")
         if detail:
-            for line in w.prs.get("_posting_fallbacks", []):
-                yield f"  {line}"
+            for entry in posting_fallbacks(w).values():
+                yield f"  {entry['line']}"
 
     def policy(self, w):
         return f"dormant after {w.config['dormant_days']} days, "
