@@ -1444,13 +1444,20 @@ class Account(Base):
 
 class AccountFallback(Base):
     def test_limit_ended_review_stays_owed_and_starts_next_account(self):
+        self.check_limit_ended_review('Claude AI usage limit reached|1792764000')
+
+    def test_five_hour_limit_ended_review_stays_owed_and_starts_next_account(self):
+        self.check_limit_ended_review("You've hit your 5-hour limit · resets 7:40pm (UTC)")
+        self.assertEqual(self.prs()['_accounts']['default']['until'], '2026-10-23T19:40:00Z')
+
+    def check_limit_ended_review(self, text):
         w = rs.Watch(self.watch).load()
         backup = str(w.dir / 'backup')
         w.config['claude_accounts'] = [{'kind': 'default'}, {'kind': 'config_dir', 'path': backup}]
         rs.engine.write_json(w.dir / 'config.json', w.config)
         log = w.runs / 'limit.jsonl'
         log.write_text(json.dumps({'type': 'result', 'is_error': True,
-                                  'result': 'Claude AI usage limit reached|1792764000'}) + '\n')
+                                  'result': text, 'timestamp': '2026-10-23T11:59:00Z'}) + '\n')
         w.prs[PR1] = {'last_run': {'started': '2026-10-23T11:59:00Z', 'head': A, 'reason': 'never reviewed',
                                    'account': 'default', 'log': str(log)}}
         w.save()

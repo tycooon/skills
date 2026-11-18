@@ -676,8 +676,8 @@ def pick_claude_account(w):
 
 
 # Keep these error-channel patterns in step with the cluster launcher's quota detection.
-CLAUDE_LIMIT = re.compile(r"usage limit reached|limit reached\s*[|∙·]|You(?:'|’)ve hit your (?:[\w' ]{1,40} )?limit"
-                          r"|reached your (?:[\w ]{1,30} )?usage limit", re.I)
+CLAUDE_LIMIT = re.compile(r"usage limit reached|limit reached\s*[|∙·]|You(?:'|’)ve hit your (?:[\w' -]{1,40} )?limit"
+                          r"|reached your (?:[\w -]{1,30} )?usage limit", re.I)
 CLAUDE_EPOCH = re.compile(r'limit reached\|(\d{9,13})')
 MONTHS = ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec')
 CLAUDE_CLOCK = re.compile(r'resets (?:(' + '|'.join(MONTHS) + r')[a-z]*\.? (\d{1,2})(?:,? (\d{4}))?,? )?'
