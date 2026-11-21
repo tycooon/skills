@@ -12,9 +12,11 @@
 # references/ directory is mirrored beside the skills the same way, so a skill's
 # ../references/ links resolve in every runtime.
 #
-# It also installs bin/claude-memory into ~/.claude/bin and registers its hook:
-# on a Mac the SessionEnd push, and with --cloud (the Claude cloud environment's
-# setup script) the SessionStart pull. bin/wait-pr-ready, which babysit-pr,
+# It also installs bin/claude-memory into ~/.claude/bin and registers its hooks:
+# on a Mac the git-backed SessionStart start and SessionEnd end (hooks --git; a
+# dev box gets the same from its own provisioning once memory-sync.json names a
+# repo), and with --cloud (the Claude cloud environment's setup script) the
+# SessionStart pull. bin/wait-pr-ready, which babysit-pr,
 # release and codex run as a background waiter, goes into ~/.claude/bin as well,
 # and so do bin/gh-review-thread, bin/review-scan and its engine bin/agent-watch. review-scan loads
 # both its engine and wait-pr-ready from beside itself. The codex and
@@ -102,6 +104,6 @@ if $cloud; then
   "$memory" hooks --cloud
   echo "Registered the memory pull hook."
 elif [ "$(uname -s)" = Darwin ]; then
-  "$memory" hooks --mac
-  echo "Registered the memory push hook."
+  "$memory" hooks --git
+  echo "Registered the memory start and end hooks."
 fi
