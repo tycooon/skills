@@ -8,7 +8,7 @@
   claude-memory migrate [--from <backup>]  Mac, by hand: import the project memory folders (or a memory-backup folder) into the checkout and link them
   claude-memory hooks --git|--cloud  register start/end (--mac is an alias of --git) or the cloud's SessionStart pull
 
-Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. On a Mac without a usable checkout, start prints nothing and end keeps publishing the project folders (push), whether or not "repo" is set, until migrate runs; elsewhere start falls back to pull and end does nothing. start never imports notes: a folder that is not the expected link is moved to <config>/memory-backup/ and linked afresh (the memory folders sit in a home directory other processes can write, the checkout only trusted sessions), and only a person's migrate [--from <backup>] imports notes. end stages only regular files inside the checkout and refuses any symlink there. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
+Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. On a Mac without a usable checkout, start prints nothing and end keeps publishing the project folders (push), whether or not "repo" is set, until migrate runs; elsewhere start falls back to pull and end does nothing. migrate --from and the folder adoption never replace a note: MEMORY.md gains the source's missing lines, and any other differing note keeps the checkout's version with the source's saved as <name>.conflict-<host>-<ts>.md and a pointer in MEMORY.md (mtimes decide nothing). start never imports notes: a folder that is not the expected link is moved to <config>/memory-backup/ and linked afresh (the memory folders sit in a home directory other processes can write, the checkout only trusted sessions), and only a person's migrate [--from <backup>] imports notes. end stages only regular files inside the checkout and refuses any symlink there. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
 
 Cloud sessions cannot reach git, so every git writer also refreshes a snapshot in Kubernetes Secrets, which they reach through an agent proxy that injects the cluster credential. A Secret holds at most 1 MiB, so the archive is split over claude-memory (the index, written last) and claude-memory-1 to claude-memory-7, which is the fixed set of names the cluster grants read on. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ..., "repo": ..., "checkout": ...}, with only namespace required. A glob in ~/.claude/memory-sync.exclude matching host/owner/repo keeps that repo's folder out of the checkout, and one matching host/owner/repo/note.md keeps that note on this machine (listed in <checkout>/.git/info/exclude, so never committed or archived); migrate and the Mac's non-git push refuse to run until that file exists, even empty. Every sync result goes to CLAUDE_MEMORY_LOG, never file contents.
 """
@@ -67,7 +67,8 @@ HOOK_COMMANDS = {
 HOOK_COMMANDS["--mac"] = HOOK_COMMANDS["--git"]
 
 LOCK = "claude-memory.lock"
-GITATTRIBUTES_LINE = "*/*/*/MEMORY.md merge=union"
+GITATTRIBUTES_LINE = "MEMORY.md merge=union"
+OLD_GITATTRIBUTES_LINES = ("*/*/*/MEMORY.md merge=union",)  # matched three-part keys only
 PULL_SECONDS = 8
 LOCK_SECONDS = 60
 PUSH_ATTEMPTS = 3
@@ -456,11 +457,14 @@ def sync_excludes(checkout):
 
 
 def ensure_gitattributes(checkout):
+    """MEMORY.md merges as a union at any depth; an older, narrower line is replaced, not kept beside it."""
     path = Path(checkout) / ".gitattributes"
     text = path.read_text() if path.exists() else ""
-    if GITATTRIBUTES_LINE in text.splitlines():
+    lines = text.splitlines()
+    if GITATTRIBUTES_LINE in lines and not any(line in OLD_GITATTRIBUTES_LINES for line in lines):
         return
-    path.write_text(text + ("" if text.endswith("\n") or not text else "\n") + GITATTRIBUTES_LINE + "\n")
+    kept = [line for line in lines if line not in OLD_GITATTRIBUTES_LINES and line != GITATTRIBUTES_LINE]
+    path.write_text("".join(f"{line}\n" for line in kept + [GITATTRIBUTES_LINE]))
 
 
 def symlinked(checkout, name):
@@ -533,6 +537,16 @@ def index_for(checkout, path):
     return directory / "MEMORY.md"
 
 
+def point_to_conflict(checkout, path, name):
+    """Adds a line to the MEMORY.md that serves path, pointing at its conflict file name. Returns that index's path in the checkout."""
+    index = index_for(checkout, path)
+    text = index.read_text() if index.exists() else ""
+    relative = os.path.relpath(Path(checkout) / name, index.parent)
+    line = f"- [Unresolved conflict in {PurePosixPath(path).name}]({relative}) — this machine's version kept, upstream's saved there; merge them, then delete the file and this line\n"
+    index.write_text(text + ("" if text.endswith("\n") or not text else "\n") + line)
+    return str(index.relative_to(checkout))
+
+
 def resolve_conflicts(checkout, paths, conflicts):
     """Keeps this machine's version at each path (stage 3 during a rebase) and saves upstream's (stage 2) beside it."""
     for path in sorted(paths, key=lambda p: (PurePosixPath(p).name != "MEMORY.md", p)):
@@ -548,12 +562,7 @@ def resolve_conflicts(checkout, paths, conflicts):
         name = conflict_name(checkout, path)
         (Path(checkout) / name).write_bytes(upstream)
         git(checkout, "add", "--", name)
-        index = index_for(checkout, path)
-        text = index.read_text() if index.exists() else ""
-        relative = os.path.relpath(Path(checkout) / name, index.parent)
-        line = f"- [Unresolved conflict in {PurePosixPath(path).name}]({relative}) — this machine's version kept, upstream's saved there; merge them, then delete the file and this line\n"
-        index.write_text(text + ("" if text.endswith("\n") or not text else "\n") + line)
-        git(checkout, "add", "--", str(index.relative_to(checkout)))
+        git(checkout, "add", "--", point_to_conflict(checkout, path, name))
         conflicts.append(f"{path} (upstream saved as {name})")
 
 
@@ -639,27 +648,39 @@ def regular_notes(folder):
     return found
 
 
-def import_notes(checkout, source, key, strict=False):
-    """Copies notes from source into <checkout>/<key>, never over a newer or identical copy. Returns (copied, newer): newer names a note newer than the committed one when strict."""
+def import_notes(checkout, source, key):
+    """Imports source's notes into <checkout>/<key> without ever replacing one. Returns (copied, conflicts).
+
+    A missing note is copied. MEMORY.md gains the source's lines it lacks, in order. Any other note that differs keeps the checkout's version, and the source's goes beside it as <name>.conflict-<host>-<ts>.md with a pointer line in MEMORY.md.
+    """
     target = Path(checkout) / key
-    copies = []
-    for path in regular_notes(source):
-        relative = path.relative_to(source).as_posix()
-        dest = target / relative
-        if dest.is_file() and not dest.is_symlink():
-            if dest.read_bytes() == path.read_bytes():
-                continue
-            if path.stat().st_mtime <= dest.stat().st_mtime:
-                continue  # the committed copy is at least as new, and the backup keeps this one
-            if strict:
-                return [], relative
-        copies.append((path, dest))
-    for path, dest in copies:
-        if symlinked(checkout, dest.relative_to(checkout).as_posix()):
+    copied, conflicts = [], []
+    notes = sorted(regular_notes(source), key=lambda p: (p.name != "MEMORY.md", p))
+    for path in notes:
+        relative = f"{key}/{path.relative_to(source).as_posix()}"
+        dest = Path(checkout) / relative
+        if symlinked(checkout, relative):
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, dest)
-    return [d for _, d in copies], None
+        data = path.read_bytes()
+        if not dest.is_file():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+            copied.append(relative)
+        elif dest.read_bytes() == data:
+            continue
+        elif path.name == "MEMORY.md":
+            have = dest.read_text(errors="replace").splitlines()
+            extra = [line for line in dict.fromkeys(data.decode(errors="replace").splitlines()) if line.strip() and line not in have]
+            if extra:
+                text = dest.read_text(errors="replace")
+                dest.write_text(text + ("" if text.endswith("\n") or not text else "\n") + "".join(f"{line}\n" for line in extra))
+                copied.append(relative)
+        elif not any(c.read_bytes() == data for c in dest.parent.glob(f"{dest.stem}.conflict-*.md")):  # a repeated import adds no second copy
+            name = conflict_name(checkout, relative)
+            (Path(checkout) / name).write_bytes(data)
+            point_to_conflict(checkout, relative, name)
+            conflicts.append(f"{relative} (the backup's version saved as {name})")
+    return copied, conflicts
 
 
 def move_to_backup(memory, slug):
@@ -685,11 +706,11 @@ def link_memory(checkout, memory, key, slug, adopt=False):
         if memory.exists() and not memory.is_dir():
             return "skipped", "not a folder"
         files = regular_notes(memory) if memory.is_dir() else []
-        copied, newer = import_notes(checkout, memory, key, strict=True)
-        if newer:
-            return "skipped", f"{newer} is newer than the committed copy"
+        copied, conflicts = import_notes(checkout, memory, key)
+        for conflict in conflicts:
+            log(f"import conflict {conflict}")
         target.mkdir(parents=True, exist_ok=True)
-        if copied:
+        if copied or conflicts:
             sync_excludes(checkout)
             commit_all(checkout)
         if files:
@@ -835,8 +856,10 @@ def migrate(sources=()):
             elif key is None or ".." in key.split("/") or matches_exclude(key, exclude_patterns()):
                 skipped.append(f"{source} (no repo key, or kept on this machine)")
             else:
-                copied, _ = import_notes(checkout, source, key)
-                imported.append(f"{key}: {len(copied)} note(s) from {source}")
+                copied, conflicts = import_notes(checkout, source, key)
+                imported.append(f"{key}: {len(copied)} note(s) from {source}" + "".join(f"; conflict {c}" for c in conflicts))
+                for conflict in conflicts:
+                    log(f"import conflict {conflict}")
         ensure_gitattributes(checkout)
         sync_excludes(checkout)
         commit_all(checkout)
@@ -860,6 +883,9 @@ def migrate(sources=()):
             else:
                 (linked if state == "linked" else already).append(project.name)
         sync_excludes(checkout)
+        commit_all(checkout)
+        if ahead_of(checkout, upstream_ref(checkout, branch)):  # notes adopted from the folders above
+            git(checkout, "push", "-u", "origin", f"HEAD:refs/heads/{branch}")
     except Failure as error:
         log(f"migrate failed: {error}")
         sys.stderr.write(f"migrate failed: {error}\n")

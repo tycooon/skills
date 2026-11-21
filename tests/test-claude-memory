@@ -556,7 +556,7 @@ class GitMode(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(git(self.bare, "rev-parse", "--abbrev-ref", "HEAD"), "master")
         self.assertEqual(self.remote_file(f"{KEY}/topic.md"), "t")
-        self.assertIn("*/*/*/MEMORY.md merge=union", self.remote_file(".gitattributes"))
+        self.assertEqual(self.remote_file(".gitattributes"), "MEMORY.md merge=union")
         for name, key in [(box.slug, KEY), ("-other", "github.com/acme/other"), ("-empty", "github.com/acme/empty")]:
             memory = box.config / "projects" / name / "memory"
             self.assertTrue(memory.is_symlink(), name)
@@ -576,28 +576,32 @@ class GitMode(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in (box.config / "memory-backup").iterdir()), backups)
         self.assertIn("folders linked: 0", again.stdout)
 
-    def test_migrate_stops_for_a_folder_with_a_note_newer_than_the_commit(self):
+    def test_migrate_adopts_a_differing_note_as_a_conflict_file_whatever_its_mtime(self):
         box = self.a
         seed = box.root / "seed"
         subprocess.run(["git", "clone", "-q", str(self.bare), str(seed)], check=True, capture_output=True)
         (seed / KEY).mkdir(parents=True)
         (seed / KEY / "topic.md").write_text("committed\n")
+        (seed / KEY / "MEMORY.md").write_text("- [topic](topic.md) - shared\n")
         git(seed, "add", "-A")
         git(seed, "-c", "user.name=s", "-c", "user.email=s@s", "commit", "-q", "-m", "seed")
         git(seed, "push", "-q", "origin", "HEAD:master")
-        project = box.project(box.slug, box.app, {"topic.md": "edited since\n"})
+        project = box.project(box.slug, box.app, {"topic.md": "edited since\n", "MEMORY.md": "- [mine](mine.md) - local\n", "mine.md": "m\n"})
         future = time.time() + 3600
         os.utime(project / "memory" / "topic.md", (future, future))
-        other = box.checkout("other", "https://github.com/acme/other")
-        box.project("-other", other, {"MEMORY.md": "other\n"})
+        os.utime(project / "memory" / "MEMORY.md", (future, future))
 
         result = box.run("migrate")
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse((project / "memory").is_symlink())
-        self.assertEqual((project / "memory" / "topic.md").read_text(), "edited since\n")
-        self.assertIn("topic.md is newer than the committed copy", result.stdout)
-        self.assertTrue((box.config / "projects" / "-other" / "memory").is_symlink())
+        self.assertTrue((project / "memory").is_symlink())
+        self.assertEqual((box.repo / KEY / "topic.md").read_text(), "committed\n")
+        conflicts = list((box.repo / KEY).glob("topic.conflict-*.md"))
+        self.assertEqual([c.read_text() for c in conflicts], ["edited since\n"])
+        index = (box.repo / KEY / "MEMORY.md").read_text()
+        self.assertEqual(index.splitlines()[:2], ["- [topic](topic.md) - shared", "- [mine](mine.md) - local"])
+        self.assertIn(conflicts[0].name, index)
+        self.assertEqual(self.remote_file(f"{KEY}/{conflicts[0].name}"), "edited since")
 
     def test_migrate_refuses_without_repo_or_exclude_file(self):
         box = self.a
@@ -683,7 +687,57 @@ class GitMode(unittest.TestCase):
         imported = b.run("migrate", "--from", str(backups[0]))
         self.assertEqual(imported.returncode, 0, imported.stderr + imported.stdout)
         self.assertEqual((b.repo / KEY / "mine.md").read_text(), "mine\n")
-        self.assertEqual((b.repo / KEY / "base.md").read_text(), "base\n")  # the stale copy did not win
+        self.assertEqual((b.repo / KEY / "base.md").read_text(), "base\n")  # the checkout's version is kept
+        conflicts = list((b.repo / KEY).glob("base.conflict-*.md"))
+        self.assertEqual([c.read_text() for c in conflicts], ["stale\n"])
+        self.assertEqual((b.repo / KEY / "MEMORY.md").read_text().splitlines()[:2], ["- [base](base.md) - first", "- planted"])
+        self.assertIn(conflicts[0].name, (b.repo / KEY / "MEMORY.md").read_text())
+        before = git(b.repo, "rev-parse", "HEAD")
+        self.assertEqual(b.run("migrate", "--from", str(backups[0])).returncode, 0)
+        self.assertEqual(len(list((b.repo / KEY).glob("base.conflict-*.md"))), 1)  # a repeat adds no second copy
+        self.assertEqual(git(b.repo, "rev-parse", "HEAD"), before)
+
+    def test_migrate_from_an_older_index_appends_the_new_notes_line(self):
+        self.migrated()
+        b = self.second()
+        self.assertEqual(b.run("start").returncode, 0)
+        (b.repo / KEY / "MEMORY.md").write_text("- [base](base.md) - first\n- [x](x.md) - new upstream\n")
+        old = b.root / "old-backup"
+        old.mkdir()
+        (old / "MEMORY.md").write_text("- [base](base.md) - first\n- [fresh](fresh.md) - added on this machine\n")
+        (old / "fresh.md").write_text("fresh\n")
+        past = time.time() - 7200
+        os.utime(old / "MEMORY.md", (past, past))
+        shutil.move(str(b.memory), str(b.root / "gone"))
+        os.symlink(b.repo / KEY, b.memory)
+        slug_backup = b.root / f"{b.slug}-20200101T000000Z"
+        shutil.move(str(old), str(slug_backup))
+        result = b.run("migrate", "--from", str(slug_backup))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual((b.repo / KEY / "MEMORY.md").read_text(), "- [base](base.md) - first\n- [x](x.md) - new upstream\n- [fresh](fresh.md) - added on this machine\n")
+        self.assertEqual((b.repo / KEY / "fresh.md").read_text(), "fresh\n")
+
+    def test_gitattributes_covers_deep_keys_and_upgrades_the_old_line(self):
+        self.migrated()
+        a = self.a
+        (a.repo / ".gitattributes").write_text("*/*/*/MEMORY.md merge=union\n*.png binary\n")
+        self.assertEqual(a.run("start").returncode, 0)
+        self.assertEqual((a.repo / ".gitattributes").read_text(), "*.png binary\nMEMORY.md merge=union\n")
+        deep = "gitlab.com/group/sub/app"
+        b = self.second()
+        for box, line in ((a, "- from a\n"), (b, "- from b\n")):
+            (box.repo / deep).mkdir(parents=True, exist_ok=True)
+            (box.repo / deep / "MEMORY.md").write_text("- base\n" if box is a else "")
+        a.run("end")
+        b.run("start")
+        for box, line in ((a, "- from a\n"), (b, "- from b\n")):
+            with open(box.repo / deep / "MEMORY.md", "a") as f:
+                f.write(line)
+        self.assertEqual(a.run("end").returncode, 0)
+        self.assertEqual(b.run("end").returncode, 0)
+        merged = self.remote_file(f"{deep}/MEMORY.md")
+        self.assertTrue({"- base", "- from a", "- from b"} <= set(merged.splitlines()), merged)
+        self.assertNotIn("<<<<", merged)
 
     def test_start_replaces_a_symlink_pointing_elsewhere(self):
         self.migrated()
