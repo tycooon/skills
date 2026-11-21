@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Copy every skill in this repo into each agent runtime's skills directory.
+# Copy every skill in this repo into each agent runtime's skills directory,
+# and install the four helper tools the skills call into ~/.claude/bin.
 #
 # A "skill" is any immediate subdirectory containing a SKILL.md. Each skill is
 # rsync'd (mirrored) into every runtime's skills dir as a real copy rather than
@@ -10,9 +11,12 @@
 # with a real copy, and unrelated skills already in the target dirs are left
 # untouched. Re-run after editing a skill to propagate the changes.
 #
-# Only skills live in this repo. The tools (~/.claude/bin), the global rules and
-# the shared references/ come from a separate private repo, which also mirrors
-# references/ beside the skills; this script must not touch <skills dir>/references.
+# Installs wait-pr-ready, gh-review-thread, review-scan and its engine
+# agent-watch as copies in ~/.claude/bin (review-scan loads both agent-watch
+# and wait-pr-ready from beside itself). The remaining tools (such as
+# claude-memory and its hooks), the global rules and the shared references/
+# come from a separate private repo, which also mirrors references/ beside the
+# skills; this script must not touch <skills dir>/references.
 
 set -euo pipefail
 shopt -s nullglob
@@ -77,3 +81,11 @@ done
 
 echo
 echo "Synced ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
+
+# Copies rather than links: a cloud environment's setup script deletes this checkout.
+bin_dir="$HOME/.claude/bin"
+mkdir -p "$bin_dir"
+install -m 0755 "$repo_root/bin/wait-pr-ready" "$bin_dir/wait-pr-ready"
+install -m 0755 "$repo_root/bin/gh-review-thread" "$bin_dir/gh-review-thread"
+install -m 0755 "$repo_root/bin/agent-watch" "$bin_dir/agent-watch"
+install -m 0755 "$repo_root/bin/review-scan" "$bin_dir/review-scan"

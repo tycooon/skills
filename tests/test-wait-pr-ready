@@ -1,0 +1,1514 @@
+#!/usr/bin/env python3
+"""Tests for bin/wait-pr-ready. Run: tests/test-wait-pr-ready"""
+
+import contextlib
+import copy
+import importlib.machinery
+import importlib.util
+import io
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+sys.dont_write_bytecode = True  # loading bin/wait-pr-ready as a module would litter bin/
+SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wait-pr-ready"
+URL = "https://github.com/acme/app/pull/7"
+HEAD = "a" * 40
+OLD = "b" * 40
+
+
+def load_module():
+    loader = importlib.machinery.SourceFileLoader("wait_pr_ready", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("wait_pr_ready", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+w = load_module()
+
+
+def review(login, state, body, sha=HEAD, at="2026-10-15T10:00:00Z"):
+    return {"author": {"login": login}, "state": state, "body": body, "submittedAt": at, "commit": {"oid": sha}}
+
+
+def comment(login, body, at="2026-10-15T10:00:00Z"):
+    return {"author": {"login": login}, "body": body, "createdAt": at}
+
+
+def check(name, status="COMPLETED", conclusion="SUCCESS", completed="2026-10-15T09:30:00Z"):
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion, "completedAt": completed}
+
+
+def ready_pr(**overrides):
+    pr = {
+        "state": "OPEN",
+        "author": {"login": "author"},
+        "headRefOid": HEAD,
+        "baseRefName": "master",
+        "updatedAt": "2026-10-15T10:00:00Z",
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+        "reviewThreads": {"totalCount": 1, "nodes": [{"isResolved": True}]},
+        "reviews": {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]},
+        "comments": {"totalCount": 0, "nodes": []},
+        "commits": {"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-15T09:00:00Z", "statusCheckRollup": {"contexts": {"nodes": [check("test")]}}}}]},
+    }
+    pr.update(overrides)
+    return pr
+
+
+def finding_thread(review_id, path, state="APPROVED", answered=True, opener="review-bot", line=40, body=""):
+    """A thread a review opened on `line`; answered means the author replied after it."""
+    last = "author" if answered else opener
+    return {
+        "isResolved": False,
+        "path": path,
+        "originalLine": line,
+        "comments": {"nodes": [{"author": {"login": opener}, "body": body, "pullRequestReview": {"id": review_id, "state": state}}]},
+        "replies": {"totalCount": 2 if answered else 1, "nodes": [{"author": {"login": last}}]},
+    }
+
+
+def thread_with_last_comment(login="review-bot", at="2026-10-15T10:00:00Z", state="APPROVED"):
+    thread = finding_thread("R1", "src/app.py", state=state, answered=login != "review-bot")
+    thread["replies"]["nodes"] = [{"author": {"login": login} if login else None,
+                                   "createdAt": at, "url": URL + "#discussion_r1"}]
+    return thread
+
+
+def evaluate(pr, no_ci=False, reviewers=(), same=lambda old, new, at: False):
+    return w.evaluate(pr, no_ci=no_ci, reviewers=set(reviewers), same_authored_lines=same)
+
+
+GL_URL = "https://gitlab.example.com/grp/app/-/merge_requests/7"
+
+
+def gl_note(nid, user, body, at="2026-10-15T10:00:00Z", system=False, resolvable=False, resolved=False):
+    return {"id": nid, "author": {"username": user}, "body": body, "created_at": at, "system": system,
+            "resolvable": resolvable, "resolved": resolved}
+
+
+def gl_pr(pipeline="success", merge="mergeable", discussions=None, sha=HEAD, pipeline_sha=None, ref="feature", **overrides):
+    mr = {"state": "opened", "iid": 7, "sha": sha, "target_branch": "master", "updated_at": "2026-10-15T10:00:00Z",
+          "detailed_merge_status": merge, "has_conflicts": merge == "conflict",
+          "head_pipeline": {"id": 1, "sha": pipeline_sha or sha, "ref": ref, "status": pipeline, "finished_at": "2026-10-15T09:30:00Z"}}
+    mr.update(overrides)
+    if discussions is None:
+        discussions = [{"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}]
+    return w.gl_mr_to_pr(mr, discussions, {"committed_date": "2026-10-15T09:00:00Z"})
+
+
+class GitLab(unittest.TestCase):
+    def test_a_verdict_note_and_green_pipeline_are_ready(self):
+        ready, reasons = evaluate(gl_pr(), reviewers=["review-bot"])
+        self.assertTrue(ready, reasons)
+
+    def test_a_system_approval_counts_for_a_listed_reviewer(self):
+        pr = gl_pr(discussions=[{"notes": [gl_note(1, "review-bot", "approved this merge request", system=True)]}])
+        self.assertEqual(pr["reviews"]["nodes"][0]["state"], "APPROVED")
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_system_approvals_inherit_the_paired_verdicts_role_and_sha(self):
+        for qualifier in ("Codex handoff", "session reviewer", "Opus 5.5"):
+            for signed_at in ("2026-10-15T09:59:55Z", "2026-10-15T10:00:05Z"):
+                for reverse in (False, True):
+                    with self.subTest(qualifier=qualifier, signed_at=signed_at, reverse=reverse):
+                        body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}."
+                        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                                 gl_note(2, "Review-Bot", body, at=signed_at)]
+                        discussions = [{"notes": [n]} for n in notes]
+                        pr = gl_pr(discussions=discussions[::-1] if reverse else discussions)
+                        formal = next(r for r in pr["reviews"]["nodes"] if r["id"] == "note-1")
+                        self.assertEqual(formal["body"], body)
+                        self.assertEqual(formal["commit"], {"oid": HEAD})
+                        self.assertEqual(evaluate(pr, reviewers=["review-bot"])[0], qualifier == "Opus 5.5")
+                        self.assertTrue(evaluate(pr)[0])
+
+    def test_a_signed_old_sha_is_not_overridden_by_its_newer_system_note(self):
+        notes = [gl_note(1, "review-bot", f"APPROVED. AI reviewer: Claude. Reviewed {OLD}."),
+                 gl_note(2, "review-bot", "approved this merge request", at="2026-10-15T10:00:05Z", system=True)]
+        self.assertFalse(evaluate(gl_pr(discussions=[{"notes": notes}]), reviewers=["review-bot"])[0])
+
+    def test_a_role_verdict_does_not_relabel_another_accounts_unsigned_approval(self):
+        notes = [gl_note(1, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}."),
+                 gl_note(2, "another-bot", "approved this merge request", system=True)]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot", "another-bot"])[0])
+
+    def test_a_verdict_is_not_reused_for_a_later_unsigned_approval(self):
+        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                 gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.",
+                         at="2026-10-15T10:00:05Z"),
+                 gl_note(3, "review-bot", "unapproved this merge request", at="2026-10-15T10:10:00Z", system=True),
+                 gl_note(4, "review-bot", "approved this merge request", at="2026-10-15T10:20:00Z", system=True)]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        formal = next(r for r in pr["reviews"]["nodes"] if r["id"] == "note-4")
+        self.assertEqual(formal["body"], "")
+        self.assertIsNone(formal["commit"])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_paired_repo_and_role_approvals_keep_their_own_signatures(self):
+        notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                 gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude (Opus 5.5). Reviewed {HEAD}.",
+                         at="2026-10-15T10:00:05Z"),
+                 gl_note(3, "review-bot", "approved this merge request", at="2026-10-15T10:10:00Z", system=True),
+                 gl_note(4, "review-bot", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.",
+                         at="2026-10-15T10:10:05Z")]
+        pr = gl_pr(discussions=[{"notes": notes}])
+        self.assertTrue(evaluate(pr, reviewers=["review-bot"])[0])
+        found = w.verdicts(pr, {"review-bot"})
+        self.assertEqual(found[0][3], "2026-10-15T10:00:05Z")
+
+    def test_pipeline_statuses(self):
+        self.assertFalse(evaluate(gl_pr(pipeline="running"), reviewers=["review-bot"])[0])
+        self.assertTrue(w.hard_failures(gl_pr(pipeline="failed"), []))
+        self.assertFalse(w.hard_failures(gl_pr(pipeline="canceled"), []))
+        self.assertTrue(evaluate(gl_pr(pipeline="manual"), reviewers=["review-bot"])[0])
+
+    def test_merge_statuses(self):
+        self.assertEqual(gl_pr(merge="conflict")["mergeable"], "CONFLICTING")
+        self.assertEqual(gl_pr(merge="need_rebase")["mergeStateStatus"], "BEHIND")
+        self.assertEqual(gl_pr(merge="checking")["mergeable"], "UNKNOWN")
+        self.assertTrue(evaluate(gl_pr(merge="not_approved"), reviewers=["review-bot"])[0])
+        self.assertFalse(evaluate(gl_pr(merge="draft_status"), reviewers=["review-bot"])[0])
+
+    def test_discussions_become_threads_without_system_notes(self):
+        approved = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}
+        open_finding = {"notes": [gl_note(2, "review-bot", "P1: broken", resolvable=True),
+                                  gl_note(3, "dev", "changed this line in version 2 of the diff", system=True, resolvable=False)]}
+        pr = gl_pr(discussions=[approved, open_finding])
+        self.assertEqual(pr["reviewThreads"]["totalCount"], 1)
+        self.assertEqual(pr["reviewThreads"]["nodes"][0]["replies"]["nodes"][0]["author"]["login"], "review-bot")
+        self.assertFalse(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_an_answered_non_blocking_finding_does_not_hold_the_mr(self):
+        approved = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}
+        nit = {"notes": [gl_note(2, "review-bot", "P3 (non-blocking): rename", resolvable=True),
+                         gl_note(3, "dev", "Done", resolvable=True)]}
+        self.assertTrue(evaluate(gl_pr(discussions=[approved, nit]), reviewers=["review-bot"])[0])
+
+    def test_a_merged_results_pipeline_tests_the_head(self):
+        merged = gl_pr(pipeline="failed", pipeline_sha="c" * 40, ref="refs/merge-requests/7/merge")
+        self.assertTrue(w.has_checks(merged))
+        self.assertTrue(w.hard_failures(merged, []))
+        other_branch = gl_pr(pipeline="failed", pipeline_sha="c" * 40, ref="refs/merge-requests/8/merge")
+        self.assertFalse(w.has_checks(other_branch))
+
+    def test_a_blocking_manual_job_holds_the_mr_where_the_pipeline_gates_it(self):
+        self.assertFalse(evaluate(gl_pr(pipeline="manual", merge="ci_still_running"), reviewers=["review-bot"])[0])
+        self.assertFalse(evaluate(gl_pr(pipeline="manual", merge="ci_must_pass"), reviewers=["review-bot"])[0])
+        self.assertFalse(w.hard_failures(gl_pr(pipeline="manual", merge="ci_must_pass"), []))
+
+    def test_a_reply_in_a_discussion_counts_as_review_activity(self):
+        opened = {"notes": [gl_note(2, "review-bot", "P1: broken", resolvable=True), gl_note(3, "dev", "It is fine", resolvable=True)]}
+        held = {"notes": opened["notes"] + [gl_note(4, "review-bot", "Still broken", resolvable=True)]}
+        self.assertGreater(w.review_count(gl_pr(discussions=[held])), w.review_count(gl_pr(discussions=[opened])))
+
+    def test_gitlab_findings_carry_across_files_and_reanchoring(self):
+        verdict = {"notes": [gl_note(1, "review-bot", f"**APPROVED** at {OLD} — AI reviewer: Claude")]}
+        nit = gl_note(2, "review-bot", "P3 (non-blocking): rename", at="2026-10-15T09:59:00Z", resolvable=True)
+        nit["position"] = {"new_path": "src/a.rs", "new_line": 40, "head_sha": OLD}
+        for anchor in (OLD, HEAD, None):
+            for resolved in (False, True):
+                with self.subTest(anchor=anchor, resolved=resolved):
+                    nit["position"]["head_sha"] = anchor
+                    nit["resolved"] = resolved
+                    notes = [nit] if resolved else [nit, gl_note(3, "dev", "Done", resolvable=True)]
+                    pr = gl_pr(discussions=[{"notes": notes}, verdict])
+                    self.assertEqual(pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["pullRequestReview"]["id"], "verdict-1")
+                    for count, expected in ((30, True), (31, False)):
+                        ready, reasons = w.evaluate(pr, no_ci=False, reviewers={"review-bot"},
+                                                    same_authored_lines=lambda *_: False,
+                                                    hunks_between=lambda *_: {"docs/notes.md": [(200, 200, count)]})
+                        self.assertEqual(ready, expected, reasons)
+
+    def test_a_pipeline_for_another_sha_is_no_check(self):
+        pr = gl_pr()
+        mr_sha_other = w.gl_mr_to_pr({"state": "opened", "sha": HEAD, "target_branch": "master", "updated_at": "2026-10-15T10:00:00Z",
+                                      "detailed_merge_status": "mergeable", "head_pipeline": {"id": 1, "sha": OLD, "status": "success"}},
+                                     [], {"committed_date": "2026-10-15T09:00:00Z"})
+        self.assertTrue(w.has_checks(pr))
+        self.assertFalse(w.has_checks(mr_sha_other))
+
+
+class Approval(unittest.TestCase):
+    def test_formal_approval_naming_the_head(self):
+        ready, reasons = evaluate(ready_pr())
+        self.assertTrue(ready, reasons)
+
+    def test_teammate_approve_does_not_count(self):
+        pr = ready_pr(reviews={"nodes": [review("alice", "APPROVED", "")]})
+        self.assertFalse(evaluate(pr)[0])
+
+    def test_listed_reviewer_counts_without_identity(self):
+        pr = ready_pr(reviews={"nodes": [review("alice", "APPROVED", "")]})
+        self.assertTrue(evaluate(pr, reviewers=["alice"])[0])
+
+    def test_listed_reviewers_are_the_only_verdict_source(self):
+        # A session reviewer posting from the author's account carries the identity line too.
+        session = review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.")
+        pr = ready_pr(reviews={"nodes": [session]})
+        self.assertFalse(evaluate(pr, reviewers=["review-bot"])[0])
+        self.assertTrue(evaluate(pr)[0], "without --reviewer the identity line still counts")
+        both = ready_pr(reviews={"nodes": [session, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})
+        self.assertTrue(evaluate(both, reviewers=["review-bot"])[0])
+
+    def test_newer_findings_review_replaces_the_approval(self):
+        pr = ready_pr(reviews={"nodes": [
+            review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD, at="2026-10-15T08:00:00Z"),
+            review("review-bot", "COMMENTED", "AI reviewer: Claude.", at="2026-10-15T10:00:00Z"),
+        ]})
+        self.assertFalse(evaluate(pr, same=lambda o, n, at: True)[0])
+
+    def test_bodiless_thread_reply_is_not_a_verdict(self):
+        pr = ready_pr()
+        pr["reviews"]["nodes"].append(review("review-bot", "COMMENTED", "", at="2026-10-15T11:00:00Z"))
+        self.assertTrue(evaluate(pr)[0])
+
+    def test_approval_on_older_head_needs_base_sync(self):
+        pr = ready_pr(reviews={"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]})
+        self.assertFalse(evaluate(pr, same=lambda o, n, at: False)[0])
+        ready, reasons = evaluate(pr, same=lambda o, n, at: (o, n) == (OLD, HEAD))
+        self.assertTrue(ready)
+        self.assertIn("base-sync", reasons[0])
+
+    def test_go_signal_comment(self):
+        pr = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", f"APPROVED. AI reviewer: Codex. Reviewed {HEAD}.")]})
+        self.assertTrue(evaluate(pr)[0])
+
+    def test_negated_go_signal_is_not_approval(self):
+        pr = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "AI reviewer: Codex. Not approving until the test is fixed.")]})
+        self.assertFalse(evaluate(pr)[0])
+
+    def test_person_naming_an_agent_is_not_a_verdict(self):
+        pr = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "Claude's findings are addressed, Codex approved the earlier design", at="2026-10-15T09:10:00Z")]})
+        self.assertFalse(evaluate(pr)[0])
+
+    def test_shaless_comment_must_follow_the_head_commit(self):
+        late = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "LGTM — AI reviewer: Codex", at="2026-10-15T09:10:00Z")]})
+        early = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("tycooon", "LGTM — AI reviewer: Codex", at="2026-10-15T08:50:00Z")]})
+        self.assertTrue(evaluate(late)[0])
+        self.assertFalse(evaluate(early)[0])
+
+
+def retarget(at="2026-10-15T10:30:00Z", previous="feature"):
+    return {"nodes": [{"createdAt": at, "previousRefName": previous}]}
+
+
+class BaseAt(unittest.TestCase):
+    def test_no_retarget_reads_the_current_base(self):
+        self.assertEqual(w.base_at(ready_pr(), "2026-10-15T10:00:00Z"), "master")
+
+    def test_verdict_before_a_retarget_reads_the_base_it_was_posted_under(self):
+        pr = ready_pr(timelineItems=retarget())
+        self.assertEqual(w.base_at(pr, "2026-10-15T10:00:00Z"), "feature")
+        self.assertEqual(w.base_at(pr, "2026-10-15T11:00:00Z"), "master")
+
+    def test_the_first_retarget_after_the_verdict_wins(self):
+        pr = ready_pr(timelineItems={"nodes": [
+            {"createdAt": "2026-10-15T09:00:00Z", "previousRefName": "older"},
+            {"createdAt": "2026-10-15T12:00:00Z", "previousRefName": "middle"},
+            {"createdAt": "2026-10-15T11:00:00Z", "previousRefName": "feature"},
+        ]})
+        self.assertEqual(w.base_at(pr, "2026-10-15T10:00:00Z"), "feature")
+
+    def test_githubs_automatic_retarget_counts(self):
+        pr = ready_pr(timelineItems={"nodes": [{"createdAt": "2026-10-15T10:30:00Z", "oldBase": "feature"}]})
+        self.assertEqual(w.base_at(pr, "2026-10-15T10:00:00Z"), "feature")
+
+
+class OtherGates(unittest.TestCase):
+    def test_pending_failed_or_missing_checks_block(self):
+        for contexts in ([check("test", status="IN_PROGRESS", conclusion=None)], [check("test", conclusion="FAILURE")], []):
+            pr = ready_pr()
+            pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": contexts}}
+            self.assertFalse(evaluate(pr)[0], contexts)
+
+    def test_no_ci_skips_the_checks_gate(self):
+        pr = ready_pr()
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = None
+        self.assertFalse(evaluate(pr)[0])
+        self.assertTrue(evaluate(pr, no_ci=True)[0])
+
+    def test_status_context(self):
+        pr = ready_pr()
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [{"__typename": "StatusContext", "context": "ci", "state": "PENDING", "createdAt": None}]}}
+        self.assertFalse(evaluate(pr)[0])
+
+    def test_unresolved_thread_blocks(self):
+        self.assertFalse(evaluate(ready_pr(reviewThreads={"nodes": [{"isResolved": False}]}))[0])
+
+    def test_merge_blocks(self):
+        for mergeable, status in (("CONFLICTING", "DIRTY"), ("MERGEABLE", "BEHIND"), ("MERGEABLE", "BLOCKED"), ("MERGEABLE", "DRAFT"), ("UNKNOWN", "UNKNOWN")):
+            self.assertFalse(evaluate(ready_pr(mergeable=mergeable, mergeStateStatus=status))[0], status)
+
+
+def mixed_review_pr(unanswered=False):
+    threads = [finding_thread("R1", "src/app.py", state="CHANGES_REQUESTED", body=body)
+               for body in ("[P1] Fix this", "[P2, non-blocking] Rename this", "[P2, non-blocking] Clarify this")]
+    threads[0]["isResolved"] = True
+    if unanswered:
+        threads[-1] = finding_thread("R1", "src/app.py", state="CHANGES_REQUESTED", answered=False,
+                                     body="[P2, non-blocking] Clarify this")
+    reviews = [{**review("review-bot", "CHANGES_REQUESTED", "AI reviewer: Claude.", sha=OLD,
+                         at="2026-10-15T09:00:00Z"), "id": "R1"},
+               {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}."), "id": "R2"}]
+    return ready_pr(reviews={"totalCount": 2, "nodes": reviews}, reviewThreads={"totalCount": 3, "nodes": threads})
+
+
+class NonBlocking(unittest.TestCase):
+    def test_answered_marked_findings_from_changes_requested_do_not_hold_later_approval(self):
+        ready, reasons = evaluate(mixed_review_pr(), reviewers=["review-bot"])
+        self.assertTrue(ready, reasons)
+
+    def test_one_unanswered_marked_finding_still_holds_later_approval(self):
+        ready, reasons = evaluate(mixed_review_pr(unanswered=True), reviewers=["review-bot"])
+        self.assertFalse(ready)
+        self.assertIn("1 unresolved threads", reasons)
+
+    def marked_pr(self, host, opener, body):
+        if host == "GitLab":
+            return gl_pr(discussions=[{"notes": [gl_note(1, "review-bot", f"APPROVED. AI reviewer: Claude. Reviewed {HEAD}.")]},
+                                      {"notes": [gl_note(2, opener, body, resolvable=True),
+                                                 gl_note(3, "author", "Done", resolvable=True)]}])
+        thread = finding_thread("R1", "src/app.py", state="CHANGES_REQUESTED", opener=opener, body=body)
+        return ready_pr(reviewThreads={"totalCount": 1, "nodes": [thread]})
+
+    def test_marker_uses_verdict_identity_rules_on_both_hosts(self):
+        for host in ("GitHub", "GitLab"):
+            for opener, signature, reviewers, expected in (
+                ("review-bot", "", ["review-bot"], True),
+                ("Review-Bot", "", ["review-bot"], True),
+                ("another-account", "", ["review-bot"], False),
+                ("another-account", "AI reviewer: Claude.", ["review-bot"], False),
+                ("review-bot", "AI reviewer: Claude (session reviewer).", ["review-bot"], False),
+                ("review-bot", "AI reviewer: Claude (Opus 5.5).", ["review-bot"], True),
+                ("review-bot", "", [], False),
+                ("review-bot", "AI reviewer: Claude.", [], True),
+                ("review-bot", "AI reviewer: Claude (session reviewer).", [], True),
+            ):
+                with self.subTest(host=host, opener=opener, signature=signature, reviewers=reviewers):
+                    pr = self.marked_pr(host, opener, f"[P2, non-blocking] Rename this. {signature}")
+                    ready, reasons = evaluate(pr, reviewers=reviewers)
+                    self.assertEqual(ready, expected, reasons)
+                    self.assertIn(f"{0 if expected else 1} unresolved threads", reasons)
+
+    def test_answered_p0_p1_and_rfc_questions_still_block(self):
+        for body in ("[P0] Fix this", "[P1] Fix this", "[Q3] Choose an approach"):
+            with self.subTest(body=body):
+                pr = self.marked_pr("GitHub", "review-bot", body)
+                ready, reasons = evaluate(pr, reviewers=["review-bot"])
+                self.assertFalse(ready)
+                self.assertIn("1 unresolved threads", reasons)
+
+    def test_answered_p1_mentioning_non_blocking_in_prose_still_blocks_on_both_hosts(self):
+        for host in ("GitHub", "GitLab"):
+            for body in (
+                "[P1] AI reviewer: Codex. This is not a non-blocking nit: the retry loses data.",
+                "[P1, non-blocking] AI reviewer: Codex. The retry loses data.",
+                "[P2] AI reviewer: Codex. This is not a non-blocking nit.",
+                "[P2] This is not a non-blocking nit.",
+                "P2 This is not a non-blocking nit.",
+                "AI reviewer: Codex. Example: [P3, non-blocking]",
+            ):
+                with self.subTest(host=host, body=body):
+                    ready, reasons = evaluate(self.marked_pr(host, "review-bot", body), reviewers=["review-bot"])
+                    self.assertFalse(ready)
+                    self.assertIn("1 unresolved threads", reasons)
+
+    def test_answered_p3_with_non_blocking_in_leading_tag_does_not_block_on_both_hosts(self):
+        for host in ("GitHub", "GitLab"):
+            for body in ("[P3, non-blocking] AI reviewer: Codex. Rename this.",
+                         "**[P3, non-blocking]** AI reviewer: Codex. Rename this.",
+                         "[p3, non blocking] AI reviewer: Codex. Rename this.",
+                         "P3 (non-blocking): rename",
+                         "**P2, non-blocking.** Rename"):
+                with self.subTest(host=host, body=body):
+                    ready, reasons = evaluate(self.marked_pr(host, "review-bot", body), reviewers=["review-bot"])
+                    self.assertTrue(ready, reasons)
+
+    def test_marker_in_a_reply_does_not_change_the_opening_finding(self):
+        pr = self.marked_pr("GitLab", "review-bot", "[P1] Fix this")
+        pr["reviewThreads"]["nodes"][0]["replies"]["nodes"][0]["body"] = "non-blocking"
+        self.assertFalse(evaluate(pr, reviewers=["review-bot"])[0])
+
+    def test_marked_findings_from_another_review_do_not_carry_a_clean_approval(self):
+        pr = mixed_review_pr()
+        pr["reviews"]["nodes"][-1]["commit"]["oid"] = OLD
+        pr["reviews"]["nodes"][-1]["body"] = f"AI reviewer: Claude. Reviewed {OLD}."
+        ready, reasons = w.evaluate(pr, no_ci=False, reviewers={"review-bot"}, same_authored_lines=lambda *_: False,
+                                    hunks_between=lambda *_: {"src/app.py": [(1, 1, 1)]})
+        self.assertFalse(ready)
+        self.assertIn("no AI reviewer approval covering " + HEAD[:12], reasons)
+        self.assertIn("0 unresolved threads", reasons)
+
+
+class Loop(unittest.TestCase):
+    def run_main(self, reads, args=(), clock_step=0, workflows=1, runs=1, head=(), recent_checks=1, url=URL,
+                 start="2026-10-15T10:00:00Z", stderr=None):
+        """Feeds main() one PR per read; each sleep advances the fake clock by its wait plus clock_step.
+        workflows and runs are what the Actions API reports for the repository and the head,
+        recent_checks how many recent heads carry checks;
+        head yields head_runs' (active, failed, oldest) per call, by default an hour-old green run."""
+        reads = iter(reads)
+        clock = [w.ts(start)]
+        waits = []
+
+        def read_pr(*_):
+            pr = next(reads)
+            if isinstance(pr, Exception):
+                raise pr
+            return copy.deepcopy(pr)
+
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds + clock_step
+
+        head = iter(head)
+        originals = w.read_pr, w.workflow_count, w.recent_checks, w.workflow_runs, w.head_runs, w.gl_read_mr
+        w.read_pr = read_pr
+        w.gl_read_mr = read_pr
+        w.workflow_count = lambda *_: workflows
+        w.recent_checks = lambda *_: recent_checks
+        w.workflow_runs = lambda *_: runs
+        w.head_runs = lambda *_: next(head, ([], [], w.ts("2026-10-15T09:00:00Z")))
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(stderr if stderr is not None else io.StringIO()):
+                code = w.main([url, *args], now=lambda: clock[0], sleep=sleep)
+        finally:
+            w.read_pr, w.workflow_count, w.recent_checks, w.workflow_runs, w.head_runs, w.gl_read_mr = originals
+        return code, out.getvalue(), waits
+
+    def test_an_owed_thread_on_the_first_read_wakes_both_modes(self):
+        for args in ([], ["--until-review"]):
+            for state in ("APPROVED", "COMMENTED"):
+                with self.subTest(args=args, state=state):
+                    thread = thread_with_last_comment(state=state)
+                    pr = ready_pr(reviewThreads={"nodes": [thread]})
+                    code, out, waits = self.run_main([pr], args=args)
+                    self.assertEqual(code, 14, out)
+                    self.assertIn(f"an open thread awaits the author on {URL} at {HEAD}: {URL}#discussion_r1", out)
+                    self.assertTrue(out.endswith("; activity 2026-10-15T10:00:00Z\n"), out)
+                    self.assertEqual(waits, [])
+
+    def test_the_owed_thread_mark_covers_every_last_comment(self):
+        first = thread_with_last_comment(at="2026-10-15T10:05:00Z")
+        second = thread_with_last_comment(at="2026-10-15T10:06:00Z")
+        second["replies"]["nodes"][0]["url"] = URL + "#discussion_r2"
+        pr = ready_pr(reviewThreads={"nodes": [first, second]})
+        code, out, waits = self.run_main([pr])
+        self.assertEqual(code, 14, out)
+        self.assertIn(URL + "#discussion_r1 (2 threads)", out)
+        self.assertTrue(out.endswith("; activity 2026-10-15T10:06:00Z\n"), out)
+        self.assertEqual(waits, [])
+        code, _, waits = self.run_main([pr, ready_pr(headRefOid=OLD)], args=["--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
+        self.assertEqual(code, 12)
+        self.assertEqual(len(waits), 1)
+
+    def test_a_fractional_comment_time_survives_the_printed_rearm_mark(self):
+        at = "2026-10-15T10:05:00.123456Z"
+        pr = ready_pr(reviewThreads={"nodes": [thread_with_last_comment(at=at)]})
+        code, out, _ = self.run_main([pr])
+        self.assertEqual(code, 14, out)
+        mark = out.strip().split("; activity ")[-1]
+        self.assertGreaterEqual(w.ts(mark), w.ts(at))
+        code, out, waits = self.run_main([pr, ready_pr(headRefOid=OLD)], args=["--after", mark], start=mark)
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 1)
+
+    def test_author_last_threads_keep_waiting_in_both_modes(self):
+        for args in ([], ["--until-review"]):
+            for state in ("APPROVED", "COMMENTED"):
+                with self.subTest(args=args, state=state):
+                    thread = thread_with_last_comment("Author[bot]", at="2026-10-15T10:05:00Z", state=state)
+                    pr = ready_pr(reviews={"nodes": []}, reviewThreads={"nodes": [thread]})
+                    code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid=OLD)], args=args)
+                    self.assertEqual(code, 12, out)
+                    self.assertEqual(len(waits), 2)
+
+    def test_threads_at_or_before_after_keep_waiting_in_both_modes(self):
+        for mode in ([], ["--until-review"]):
+            for at in ("2026-10-15T10:00:00Z", "2026-10-15T10:01:00Z"):
+                with self.subTest(mode=mode, at=at):
+                    pr = ready_pr(reviewThreads={"nodes": [thread_with_last_comment(at=at)]})
+                    code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid=OLD)],
+                                                    args=[*mode, "--after", "2026-10-15T10:01:00Z"])
+                    self.assertEqual(code, 12, out)
+                    self.assertEqual(len(waits), 2)
+
+    def test_missing_last_comment_data_keeps_waiting(self):
+        for replies in (None, {"nodes": []}, {"nodes": [None]}, {"nodes": [{"author": {"login": "review-bot"}}]}):
+            with self.subTest(replies=replies):
+                pr = ready_pr(reviewThreads={"nodes": [{"isResolved": False, "replies": replies}]})
+                code, out, waits = self.run_main([pr, ready_pr(headRefOid=OLD)])
+                self.assertEqual(code, 12, out)
+                self.assertEqual(len(waits), 1)
+
+    def test_ghost_authors_still_leave_threads_owed(self):
+        for author, login in (({"login": "author"}, None), (None, "author"), (None, None)):
+            with self.subTest(author=author, login=login):
+                thread = thread_with_last_comment(login)
+                pr = ready_pr(author=author, reviewThreads={"nodes": [thread]})
+                self.assertEqual(self.run_main([pr])[0], 14)
+
+    def test_resolved_threads_are_not_owed(self):
+        thread = thread_with_last_comment()
+        thread["isResolved"] = True
+        self.assertEqual(self.run_main([ready_pr(reviewThreads={"nodes": [thread]})])[0], 0)
+
+    def test_a_non_author_reply_is_owed_even_when_the_thread_does_not_block(self):
+        thread = thread_with_last_comment("another-reviewer")
+        pr = ready_pr(reviewThreads={"nodes": [thread]})
+        self.assertEqual(w.blocking_threads(pr), 0)
+        self.assertTrue(evaluate(pr)[0])
+        for args in ([], ["--until-review"]):
+            self.assertEqual(self.run_main([pr], args=args)[0], 14)
+
+    def test_owed_threads_preserve_exit_precedence(self):
+        owed = ready_pr(reviewThreads={"nodes": [thread_with_last_comment()]})
+        for args in ([], ["--until-review"]):
+            for overrides, expected in (({"state": "MERGED"}, 10), ({"state": "CLOSED"}, 11),
+                                        ({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}, 15)):
+                with self.subTest(args=args, overrides=overrides):
+                    self.assertEqual(self.run_main([{**owed, **overrides}], args=args)[0], expected)
+            self.assertEqual(self.run_main([ready_pr(reviews={"nodes": []}), {**owed, "headRefOid": OLD}], args=args)[0], 12)
+        stale = {**owed, "headRefOid": OLD}
+        code, out, waits = self.run_main([stale, ready_pr()], args=["--head", HEAD])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(waits), 1)
+        code, out, _ = self.run_main([stale] * 20, args=["--head", HEAD])
+        self.assertEqual(code, 12, out)
+        owed["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = [check("test", conclusion="FAILURE")]
+        self.assertEqual(self.run_main([owed])[0], 14)
+
+    def test_role_qualified_posts_from_a_listed_account_are_not_verdicts(self):
+        for qualifier in ("Codex handoff", "session reviewer"):
+            for state in ("COMMENTED", "APPROVED"):
+                post = review("review-bot", state, f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}.")
+                pr = ready_pr(reviews={"nodes": [post]})
+                self.assertFalse(w.approval_state(pr, {"review-bot"}, lambda *_: False)[0])
+                self.assertTrue(evaluate(pr)[0], "without --reviewer a role's verdict still counts")
+                for mode in ([], ["--until-review"]):
+                    with self.subTest(qualifier=qualifier, state=state, mode=mode):
+                        code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid=OLD)], args=[*mode, "--reviewer", "review-bot"])
+                        self.assertEqual(code, 12, out)
+                        self.assertEqual(len(waits), 2)
+
+    def test_model_qualified_posts_from_a_listed_account_still_approve(self):
+        for qualifier in ("Opus 5.5", "Opus", "Sonnet", "Haiku", "Fable", "Sol", "Astra", "GPT", "6.1"):
+            for state in ("APPROVED", "COMMENTED"):
+                with self.subTest(qualifier=qualifier, state=state):
+                    body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}."
+                    pr = ready_pr(reviews={"nodes": [review("review-bot", state, body)]})
+                    code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot"])
+                    self.assertEqual(code, 14, out)
+                    self.assertIn("review-bot's approval is already on", out)
+                    self.assertEqual(waits, [])
+                    self.assertEqual(self.run_main([pr], args=["--reviewer", "review-bot"])[0], 0)
+
+    def test_a_fresh_role_go_post_from_a_listed_account_alone_wakes_nobody(self):
+        waiting = ready_pr(reviews={"nodes": []})
+        for qualifier in ("Codex handoff", "session reviewer"):
+            for state in ("COMMENTED", "APPROVED"):
+                with self.subTest(qualifier=qualifier, state=state):
+                    body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}."
+                    landed = ready_pr(reviews={"nodes": [review("review-bot", state, body)]})
+                    code, out, waits = self.run_main([waiting, landed, landed, ready_pr(headRefOid=OLD)], args=["--reviewer", "review-bot"])
+                    self.assertEqual(code, 12, out)
+                    self.assertEqual(len(waits), 3)
+                    self.assertEqual(self.run_main([waiting, landed], args=["--until-review", "--reviewer", "review-bot"])[0], 14)
+
+    def test_role_qualified_formal_reviews_do_not_supply_finding_threads(self):
+        body = f"AI reviewer: Claude (session reviewer). Reviewed {HEAD}."
+        post = {**review("review-bot", "APPROVED", body), "id": "R1"}
+        pr = ready_pr(reviews={"nodes": [post]}, reviewThreads={"nodes": [finding_thread("R1", "src/app.py")]})
+        self.assertEqual(w.finding_threads(pr, HEAD, {"review-bot"}), [])
+        self.assertEqual(len(w.finding_threads(pr, HEAD, set())), 1)
+
+    def test_a_parenthetical_after_the_identity_sentence_is_not_its_qualifier(self):
+        body = f"AI reviewer: Claude. Reviewed {HEAD}. Approved (Codex handoff was separate)."
+        pr = ready_pr(reviews={"nodes": [review("review-bot", "APPROVED", body)]})
+        self.assertEqual(self.run_main([pr], args=["--reviewer", "review-bot"])[0], 0)
+
+    def test_a_gitlab_owed_discussion_carries_author_time_and_url(self):
+        last_at = "2026-10-15T10:05:00Z"
+        discussion = {"notes": [gl_note(1, "review-bot", "non-blocking: consider this", resolvable=True),
+                                 gl_note(2, "author", "Answered", at="2026-10-15T10:04:00Z"),
+                                 gl_note(3, "review-bot", "Please clarify", at=last_at),
+                                 gl_note(4, "author", "system update", at="2026-10-15T10:06:00Z", system=True)]}
+        pr = gl_pr(discussions=[discussion], author={"username": "author"}, web_url=GL_URL)
+        self.assertEqual(pr["author"], {"login": "author"})
+        self.assertEqual(w.thread_last(pr["reviewThreads"]["nodes"][0]),
+                         {"author": {"login": "review-bot"}, "createdAt": last_at, "url": GL_URL + "#note_3"})
+        for args in ([], ["--until-review"]):
+            code, out, waits = self.run_main([pr], args=args, url=GL_URL)
+            self.assertEqual(code, 14, out)
+            self.assertIn(GL_URL + "#note_3", out)
+            self.assertTrue(out.endswith(f"; activity {last_at}\n"), out)
+            self.assertEqual(waits, [])
+        no_url = gl_pr(discussions=[discussion])
+        self.assertIsNone(no_url["author"])
+        self.assertIsNone(w.thread_last(no_url["reviewThreads"]["nodes"][0])["url"])
+        self.assertEqual(self.run_main([no_url], url=GL_URL)[0], 14)
+
+    def test_a_gitlab_paired_role_approval_does_not_ready_or_end_the_initial_review_wait(self):
+        for qualifier in ("Codex handoff", "session reviewer"):
+            for signed_at in ("2026-10-15T09:59:55Z", "2026-10-15T10:00:05Z"):
+                notes = [gl_note(1, "review-bot", "approved this merge request", system=True),
+                         gl_note(2, "review-bot", f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {HEAD}.", at=signed_at)]
+                pr = gl_pr(discussions=[{"notes": [n]} for n in notes])
+                moved = copy.deepcopy(pr)
+                moved["headRefOid"] = OLD
+                for mode in ([], ["--until-review"]):
+                    with self.subTest(qualifier=qualifier, signed_at=signed_at, mode=mode):
+                        code, out, waits = self.run_main([pr, pr, moved], url=GL_URL,
+                                                        args=[*mode, "--reviewer", "review-bot", "--after", "2026-10-15T10:01:00Z"])
+                        self.assertEqual(code, 12, out)
+                        self.assertEqual(len(waits), 2)
+
+    def unchecked(self):
+        return ready_pr(commits={"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-10-15T09:00:00Z", "statusCheckRollup": None}}]})
+
+    def test_a_repository_with_no_ci_at_all_is_ready_on_first_read(self):
+        code, out, waits = self.run_main([self.unchecked()], workflows=0, runs=0, recent_checks=0)
+        self.assertEqual(code, 0)
+        self.assertIn("no Actions workflow and no check on master or recently merged heads", out)
+        self.assertEqual(waits, [])
+
+    def test_recent_checks_count_merged_pr_heads_not_just_the_base(self):
+        # A PR-only integration posts on PR heads, never on the base's squash commits.
+        reply = {"data": {"repository": {"ref": {"target": {"statusCheckRollup": None}}, "pullRequests": {"nodes": [
+            {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}},
+            {"commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]}}]}}}}
+        original = w.gh
+        w.gh = lambda *_a, **_k: subprocess.CompletedProcess([], 0, json.dumps(reply), "")
+        try:
+            self.assertEqual(w.recent_checks("acme", "app", "master"), 1)
+        finally:
+            w.gh = original
+
+    def test_a_repository_without_workflows_needs_no_checks_once_none_came(self):
+        code, out, waits = self.run_main([self.unchecked()] * 20, workflows=0, runs=0, recent_checks=1)
+        self.assertEqual(code, 0)
+        self.assertIn("no check came in", out)
+        self.assertGreaterEqual(sum(waits), w.CI_SETTLE)
+
+    def test_an_external_check_that_arrives_late_is_waited_for(self):
+        pending = self.unchecked()
+        pending["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("ci", status="IN_PROGRESS", conclusion=None)]}}
+        code, out, _ = self.run_main([self.unchecked(), pending, ready_pr()], workflows=0, runs=0, recent_checks=1)
+        self.assertEqual(code, 0)
+        self.assertNotIn("no Actions workflow", out)
+
+    def test_a_head_no_workflow_ran_for_is_ready_once_ci_had_time_to_start(self):
+        code, out, waits = self.run_main([self.unchecked()] * 20, runs=0)
+        self.assertEqual(code, 0)
+        self.assertIn("no workflow ran", out)
+        self.assertGreaterEqual(sum(waits), w.CI_SETTLE)
+
+    def test_a_head_whose_workflows_ran_still_waits_for_their_checks(self):
+        code, out, _ = self.run_main([self.unchecked()] * 130, runs=2)
+        self.assertEqual(code, 13)
+        self.assertIn("no checks reported yet", out)
+
+    def test_ready_on_first_read(self):
+        code, out, waits = self.run_main([ready_pr()])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("ready:"))
+        self.assertEqual(waits, [])
+
+    def test_a_rerun_still_running_is_not_ready(self):
+        # A rerun leaves only the finished checks in the rollup, so it reads green.
+        code, out, waits = self.run_main([ready_pr(), ready_pr()], head=[(["CI", "CI"], [], None)])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 1)
+
+    def test_a_cancelled_run_dropped_from_the_rollup_is_not_ready(self):
+        # GitHub drops a cancelled run's checks, leaving one green pull_request check.
+        code, out, waits = self.run_main([ready_pr(), ready_pr()], head=[([], ["CI=cancelled"], w.ts("2026-10-15T09:00:00Z"))])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 1)
+
+    def test_young_runs_wait_for_a_push_run_actions_creates_late(self):
+        # A quick pull_request run finished green; the push CI run is not created yet.
+        young = ([], [], w.ts("2026-10-15T10:00:00Z"))
+        code, out, waits = self.run_main([ready_pr()] * 30, head=[young] * 30)
+        self.assertEqual(code, 0)
+        self.assertEqual(sum(waits), w.RUN_SETTLE)
+
+    def test_runs_older_than_run_settle_but_younger_than_ci_settle_are_ready(self):
+        age = (w.RUN_SETTLE + w.CI_SETTLE) // 2
+        settled = ([], [], w.ts("2026-10-15T10:00:00Z") - age)
+        code, out, waits = self.run_main([ready_pr()], head=[settled])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("ready:"))
+        self.assertEqual(waits, [])
+
+    def test_head_runs_judges_each_workflow_by_its_newest_run(self):
+        rows = "\n".join([
+            "1\t7\tCI\tcompleted\tcancelled\t2026-10-15T09:00:00Z",
+            "1\t8\tCI\tcompleted\tsuccess\t2026-10-15T09:05:00Z",
+            "2\t3\tp2p\tcompleted\tfailure\t2026-10-15T09:01:00Z",
+            "3\t4\tlint\tin_progress\t\t2026-10-15T09:02:00Z",
+        ])
+        original = w.gh
+        w.gh = lambda *_: subprocess.CompletedProcess([], 0, rows, "")
+        try:
+            active, failed, oldest = w.head_runs("o", "r", "sha")
+        finally:
+            w.gh = original
+        self.assertEqual(active, ["lint"])
+        self.assertEqual(failed, ["p2p=failure"])
+        self.assertEqual(oldest, w.ts("2026-10-15T09:00:00Z"))
+
+    def test_an_approval_wakes_when_a_cancelled_run_hides_from_the_rollup(self):
+        waiting = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        approved = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})
+        cancelled = ([], ["CI=cancelled"], w.ts("2026-10-15T09:00:00Z"))
+        code, out, waits = self.run_main([waiting, approved], head=[cancelled] * 2)
+        self.assertEqual(code, 14, out)
+        self.assertIn("CI=cancelled", out)
+        self.assertEqual(len(waits), 1)
+
+    def test_no_ci_does_not_ask_for_runs(self):
+        code, _, _ = self.run_main([ready_pr()], args=["--no-ci"], head=[(["CI"], [], None)])
+        self.assertEqual(code, 0)
+
+    def test_waits_with_backoff_until_ready(self):
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        code, _, waits = self.run_main([waiting, waiting, waiting, ready_pr()])
+        self.assertEqual(code, 0)
+        self.assertEqual(waits, [60, 60, 120])
+
+    def test_merged_and_closed(self):
+        self.assertEqual(self.run_main([ready_pr(state="MERGED")])[0], 10)
+        self.assertEqual(self.run_main([ready_pr(state="CLOSED")])[0], 11)
+
+    def test_head_change(self):
+        moved = ready_pr(headRefOid="c" * 40, reviewThreads={"nodes": [{"isResolved": False}]})
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        self.assertEqual(self.run_main([waiting, moved])[0], 12)
+
+    def test_expected_head_settles_before_counting_as_change(self):
+        stale = ready_pr(headRefOid=OLD)
+        code, out, _ = self.run_main([stale, ready_pr()], args=["--head", HEAD])
+        self.assertEqual(code, 0, out)
+        code, _, _ = self.run_main([stale] * 10, args=["--head", HEAD])
+        self.assertEqual(code, 12)
+
+    def test_quiet_limit(self):
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        code, out, waits = self.run_main([waiting] * 130)
+        self.assertEqual(code, 13)
+        self.assertTrue(out.startswith("quiet:"))
+        self.assertGreaterEqual(sum(waits), w.QUIET_LIMIT)
+
+    def test_activity_resets_backoff(self):
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        later = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]}, updatedAt="2026-10-15T10:20:00Z")
+        _, _, waits = self.run_main([waiting, waiting, waiting, later, ready_pr()])
+        self.assertEqual(waits, [60, 60, 120, 60])
+
+    def test_transient_read_failures_retry_then_give_up(self):
+        code, _, _ = self.run_main([RuntimeError("timeout"), ready_pr()])
+        self.assertEqual(code, 0)
+        code, out, waits = self.run_main([RuntimeError("bad credentials")] * w.MAX_FAILED_READS)
+        self.assertEqual(code, 2)
+        self.assertTrue(out.startswith("error:"))
+        self.assertGreaterEqual(sum(waits), 15 * 60)
+
+    def test_failure_while_evaluating_is_retried(self):
+        original = w.authored_lines
+        calls = []
+
+        def slow(*_):
+            calls.append(1)
+            if len(calls) == 1:
+                raise w.subprocess.TimeoutExpired("gh", 120)
+            return ["x +line"]
+
+        w.authored_lines = slow
+        try:
+            pr = ready_pr(reviews={"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]})
+            code, out, waits = self.run_main([pr, pr])
+        finally:
+            w.authored_lines = original
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [w.RETRY_WAIT])
+
+    def test_approval_survives_a_retarget_after_the_base_pr_merged(self):
+        # Against the new base the old head also carries the merged base PR.
+        lines = {("feature", OLD): ["x +mine"], ("master", OLD): ["x +base pr", "x +mine"], ("master", HEAD): ["x +mine"]}
+        original = w.authored_lines
+        w.authored_lines = lambda owner, name, base, sha: lines.get((base, sha))
+        try:
+            approved_old = {"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]}
+            code, out, _ = self.run_main([ready_pr(reviews=approved_old, timelineItems=retarget())])
+            self.assertEqual(code, 0, out)
+            self.assertIn("base-sync", out)
+            # Without the retarget the old head's lines differ, and the wait runs into the quiet cap.
+            code, out, _ = self.run_main([ready_pr(reviews=approved_old)] * 130)
+            self.assertEqual(code, 13, out)
+        finally:
+            w.authored_lines = original
+
+    def test_a_deleted_base_branch_reads_against_its_merged_pr_head(self):
+        tip = "d" * 40
+        lines = {(tip, OLD): ["x +mine"], ("master", HEAD): ["x +mine"]}
+        originals = w.authored_lines, w.merged_branch_tip
+        w.authored_lines = lambda owner, name, base, sha: lines.get((base, sha))
+        w.merged_branch_tip = lambda owner, name, branch: tip if branch == "feature" else None
+        try:
+            approved_old = {"nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]}
+            retargeted = {"nodes": [{"createdAt": "2026-10-15T10:30:00Z", "oldBase": "feature"}]}
+            code, out, _ = self.run_main([ready_pr(reviews=approved_old, timelineItems=retargeted)])
+            self.assertEqual(code, 0, out)
+        finally:
+            w.authored_lines, w.merged_branch_tip = originals
+
+    def test_after_needs_newer_activity(self):
+        code, out, _ = self.run_main([ready_pr()])
+        mark = out.rsplit("activity ", 1)[1].strip()
+        self.assertEqual(mark, "2026-10-15T10:00:00Z")
+        newer = ready_pr(updatedAt="2026-10-15T10:30:00Z")
+        code, _, waits = self.run_main([ready_pr(), ready_pr(), newer], args=["--refused", mark])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 2)
+
+    def test_after_never_holds_back_a_ready(self):
+        # A session arms the waiter with the time of its own PR read; a PR that is
+        # already ready then must exit at once, not wait for activity that never comes.
+        for url in (URL, GL_URL):
+            with self.subTest(url=url):
+                code, out, waits = self.run_main([ready_pr()], url=url, args=["--after", "2026-10-15T10:00:30Z"], start="2026-10-15T10:01:00Z")
+                self.assertEqual(code, 0, out)
+                self.assertEqual(waits, [])
+
+    def test_refused_is_a_usage_error_with_until_review_or_in_the_future(self):
+        for args in (["--until-review", "--refused", "2026-10-15T10:00:00Z"], ["--refused", "2026-10-15T10:10:00Z"]):
+            with self.subTest(args=args):
+                err = io.StringIO()
+                code, out, waits = self.run_main([], args=args, stderr=err)
+                self.assertEqual(code, 2)
+                self.assertEqual(waits, [])
+
+    def test_future_after_is_a_usage_error_before_any_pr_read(self):
+        for url in (URL, GL_URL):
+            for mode in ([], ["--until-review"]):
+                for mark in ("2026-10-15T10:01:00.000001Z", "2026-10-15T10:10:00Z"):
+                    with self.subTest(url=url, mode=mode, mark=mark):
+                        err = io.StringIO()
+                        code, out, waits = self.run_main([], url=url, args=[*mode, "--after", mark], stderr=err)
+                        self.assertEqual(code, 2)
+                        self.assertEqual(out, "")
+                        self.assertEqual(waits, [])
+                        self.assertEqual(err.getvalue(), f"error: --after {mark} is more than 60s ahead of current UTC time 2026-10-15T10:00:00Z\n")
+
+    def test_past_and_clock_skew_after_still_need_newer_activity(self):
+        for url in (URL, GL_URL):
+            for mode in ([], ["--until-review"]):
+                for offset in (-60, 0, 30, 60):
+                    with self.subTest(url=url, mode=mode, offset=offset):
+                        mark = w.iso(w.ts("2026-10-15T10:00:00Z") + offset)
+                        later = w.iso(w.ts(mark) + 1)
+                        initial = ready_pr(updatedAt=mark, reviews={"nodes": [review("review-bot", "APPROVED", "AI reviewer: Claude.", at=mark)]})
+                        newer = ready_pr(updatedAt=later, reviews={"nodes": [review("review-bot", "APPROVED", "AI reviewer: Claude.", at=later)]})
+                        flag = "--after" if mode else "--refused"
+                        code, _, waits = self.run_main([initial, newer], url=url, args=[*mode, flag, mark])
+                        self.assertEqual(code, 14 if mode else 0)
+                        self.assertEqual(waits, [60])
+
+    def test_until_review_exits_on_new_review_activity(self):
+        pr = ready_pr()
+        more = ready_pr(reviewThreads={"totalCount": 2, "nodes": [{"isResolved": True}, {"isResolved": False}]})
+        code, out, waits = self.run_main([pr, pr, more], args=["--until-review"])
+        self.assertEqual(code, 14, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_after_catches_a_verdict_before_the_first_read(self):
+        approved = ready_pr(reviews={"totalCount": 2, "nodes": [review("review-bot", "APPROVED", "AI reviewer: Claude.", at="2026-10-15T10:05:00Z")]})
+        code, _, waits = self.run_main([approved], args=["--until-review", "--after", "2026-10-15T10:01:00Z"])
+        self.assertEqual(code, 14)
+        self.assertEqual(waits, [])
+        moved = copy.deepcopy(approved)
+        moved["headRefOid"] = "c" * 40
+        code, _, waits = self.run_main([approved, approved, moved], args=["--until-review", "--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
+        self.assertEqual(code, 12)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_exits_on_a_listed_verdict_already_on_the_head(self):
+        # The verdict landed before the waiter was armed, and --after was taken at arming time.
+        approved = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:05:00Z")]})
+        code, out, waits = self.run_main([approved], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
+        self.assertEqual(code, 14, out)
+        self.assertIn("review-bot's approval is already on", out)
+        self.assertEqual(out, f"review activity: review-bot's approval is already on {URL} at {HEAD}\n")
+        self.assertEqual(waits, [])
+
+    def test_until_review_exits_on_a_carried_approval_by_findings(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        for answered, resolved in ((True, False), (False, True)):
+            with self.subTest(answered=answered, resolved=resolved):
+                thread = finding_thread("R1", "src/a.rs", answered=answered)
+                thread["isResolved"] = resolved
+                pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                              reviewThreads={"totalCount": 1, "nodes": [thread]})
+                original_hunks = w.changed_hunks
+                w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+                try:
+                    code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+                finally:
+                    w.changed_hunks = original_hunks
+                self.assertEqual(code, 14, out)
+                self.assertIn("approval of", out)
+                self.assertIn("covers", out)
+                self.assertIn(f"review activity: review-bot's approval of {OLD[:12]} covers {URL} at {HEAD}; all findings answered or resolved, 10/30 later changed lines", out)
+                self.assertEqual(waits, [])
+
+    def test_until_review_carried_approval_over_line_cap_keeps_waiting(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True)]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 31, 0)]}
+        try:
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.changed_hunks = original_hunks
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_unanswered_finding_keeps_waiting_and_preserves_owed_thread_exit(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        thread = finding_thread("R1", "src/a.rs", answered=False)
+        thread["comments"]["nodes"][0]["createdAt"] = "2026-10-15T10:00:00Z"
+        thread["replies"]["nodes"][0]["createdAt"] = "2026-10-15T10:00:00Z"
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [thread]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+        try:
+            # When --after is past the thread, owed_threads does not trigger, and the waiter keeps waiting.
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)],
+                                             args=["--until-review", "--reviewer", "review-bot", "--head", HEAD, "--after", "2026-10-15T10:05:00Z"],
+                                             start="2026-10-15T10:05:00Z")
+            self.assertEqual(code, 12, out)
+            self.assertEqual(len(waits), 2)
+
+            # Without --after past the thread, owed-thread exit behaves as before.
+            code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+            self.assertEqual(code, 14, out)
+            self.assertIn("an open thread awaits the author", out)
+            self.assertEqual(waits, [])
+        finally:
+            w.changed_hunks = original_hunks
+
+    def test_until_review_carried_approval_by_base_sync_exits(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 0, "nodes": []})
+        original_lines = w.authored_lines
+        w.authored_lines = lambda owner, name, base, sha: ["+same"]
+        try:
+            code, out, waits = self.run_main([pr], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.authored_lines = original_lines
+        self.assertEqual(code, 14, out)
+        self.assertIn("approval of", out)
+        self.assertIn("covers", out)
+        self.assertIn(f"review activity: review-bot's approval of {OLD[:12]} covers {URL} at {HEAD}, a base-sync of {HEAD[:12]}", out)
+        self.assertEqual(waits, [])
+
+    def test_until_review_carried_approval_by_unlisted_approver_keeps_waiting(self):
+        approve = {**review("other-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True, opener="other-bot")]})
+        original_hunks = w.changed_hunks
+        w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+        try:
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+        finally:
+            w.changed_hunks = original_hunks
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_carried_approval_with_role_qualified_identity_keeps_waiting(self):
+        for qualifier in ("Codex handoff", "session reviewer"):
+            with self.subTest(qualifier=qualifier):
+                body = f"APPROVED. AI reviewer: Claude ({qualifier}). Reviewed {OLD}."
+                approve = {**review("review-bot", "APPROVED", body, sha=OLD), "id": "R1"}
+                pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                              reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs", answered=True)]})
+                original_hunks = w.changed_hunks
+                w.changed_hunks = lambda *_: {"src/a.rs": [(1, 10, 0)]}
+                try:
+                    code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)], args=["--until-review", "--reviewer", "review-bot", "--head", HEAD])
+                finally:
+                    w.changed_hunks = original_hunks
+                self.assertEqual(code, 12, out)
+                self.assertEqual(len(waits), 2)
+
+    def test_until_review_keeps_waiting_on_a_listed_findings_verdict_already_on_the_head(self):
+        # The session argued the finding back without pushing; it waits for the answer.
+        findings = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "CHANGES_REQUESTED", "AI reviewer: Claude.", at="2026-10-15T10:05:00Z")]})
+        answer = copy.deepcopy(findings)
+        answer["reviews"]["totalCount"] = 2
+        answer["reviews"]["nodes"].append(review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z"))
+        code, _, waits = self.run_main([findings, findings, answer], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_keeps_waiting_on_a_listed_verdict_for_an_older_head(self):
+        old = "d" * 40
+        stale = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {old}.", sha=old)]})
+        newer = copy.deepcopy(stale)
+        newer["reviews"]["totalCount"] = 2
+        newer["reviews"]["nodes"].append(review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z"))
+        code, _, waits = self.run_main([stale, stale, newer], args=["--until-review", "--reviewer", "review-bot"])
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_ignores_an_unlisted_verdict_already_on_the_head(self):
+        handoff = review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (Codex handoff). Reviewed {HEAD}.", at="2026-10-15T10:05:00Z")
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [handoff]})
+        more = ready_pr(reviews={"totalCount": 2, "nodes": [handoff, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.", at="2026-10-15T10:20:00Z")]})
+        code, _, waits = self.run_main([pr, pr, more], args=["--until-review", "--reviewer", "review-bot", "--after", "2026-10-15T10:06:00Z"], start="2026-10-15T10:06:00Z")
+        self.assertEqual(code, 14)
+        self.assertEqual(len(waits), 2)
+
+    def test_until_review_still_exits_on_head_change(self):
+        moved = ready_pr(headRefOid="c" * 40)
+        self.assertEqual(self.run_main([ready_pr(), moved], args=["--until-review"])[0], 12)
+
+    def test_conflict_on_the_watched_head_exits(self):
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        conflict = ready_pr(mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        code, out, waits = self.run_main([waiting, conflict])
+        self.assertEqual(code, 15, out)
+        self.assertTrue(out.startswith("conflict:"))
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.run_main([conflict], args=["--until-review"])[0], 15)
+
+    def test_known_conflict_waits_for_the_head_to_move(self):
+        conflict = ready_pr(mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        moved = ready_pr(headRefOid="c" * 40)
+        code, _, waits = self.run_main([conflict, conflict, moved], args=["--known-conflict"])
+        self.assertEqual(code, 12)
+        self.assertEqual(len(waits), 2)
+
+    def test_findings_wake_a_readiness_wait(self):
+        waiting = ready_pr(reviewThreads={"totalCount": 1, "nodes": [{"isResolved": True}]}, reviews={"totalCount": 0, "nodes": []})
+        findings = ready_pr(
+            reviewThreads={"totalCount": 2, "nodes": [{"isResolved": True}, {"isResolved": False}]},
+            reviews={"totalCount": 1, "nodes": [review("review-bot", "COMMENTED", "AI reviewer: Claude.")]},
+        )
+        code, out, waits = self.run_main([waiting, waiting, findings])
+        self.assertEqual(code, 14, out)
+        self.assertIn("not ready", out)
+        self.assertEqual(len(waits), 2)
+
+    def test_an_approval_that_lands_is_ready_not_review_activity(self):
+        waiting = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        code, out, _ = self.run_main([waiting, ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})])
+        self.assertEqual(code, 0, out)
+
+    def test_a_session_approval_neither_readies_nor_wakes_a_listed_reviewer_wait(self):
+        waiting = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        session = ready_pr(reviews={"totalCount": 1, "nodes": [review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.")]})
+        bot = ready_pr(reviews={"totalCount": 2, "nodes": [review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}."), review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})
+        code, out, waits = self.run_main([waiting, session, session, bot], args=["--reviewer", "review-bot"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("approved by review-bot", out)
+        self.assertEqual(len(waits), 3)
+
+    def test_an_approval_while_ci_runs_keeps_waiting(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        none = {"totalCount": 0, "nodes": []}
+        approved = {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}
+        waiting, approved_pending = ready_pr(reviews=none), ready_pr(reviews=approved)
+        for pr in (waiting, approved_pending):
+            pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, waits = self.run_main([waiting, approved_pending, approved_pending, ready_pr(reviews=approved)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(waits), 3)
+
+    def test_an_approved_head_waiting_only_on_checks_polls_every_minute(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        approved_pending = ready_pr()
+        approved_pending["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, waits = self.run_main([approved_pending] * 6 + [ready_pr()])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [w.CHECKS_ONLY_WAIT] * 6)
+
+    def test_answered_marked_findings_from_a_changes_requested_review_allow_readiness(self):
+        pr = mixed_review_pr()
+        code, out, waits = self.run_main([pr], args=["--reviewer", "review-bot"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [])
+
+    def test_answered_marked_findings_keep_approval_activity_quiet_while_ci_runs(self):
+        waiting, approved = mixed_review_pr(), mixed_review_pr()
+        waiting["reviews"]["nodes"].pop()
+        waiting["reviews"]["totalCount"] -= 1
+        for pr in (waiting, approved):
+            pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {
+                "contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        code, out, waits = self.run_main([waiting] * 3 + [approved] * 3 + [mixed_review_pr()],
+                                         args=["--reviewer", "review-bot"])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [60, 60, 120] + [w.CHECKS_ONLY_WAIT] * 3)
+
+    def test_an_unapproved_head_backs_off_to_two_minutes(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        unapproved = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        unapproved["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, waits = self.run_main([unapproved] * 6 + [ready_pr()])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(waits, [60, 60, 120, 120, 120, 120])
+
+    def test_an_approval_wakes_when_what_blocks_wont_clear_by_itself(self):
+        none = {"totalCount": 0, "nodes": []}
+        approved = {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}
+        stale = {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD)]}
+        failed = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        for name, overrides, rollup in (
+            ("behind", {"mergeStateStatus": "BEHIND"}, None),
+            ("blocked", {"mergeStateStatus": "BLOCKED"}, None),
+            ("failed check", {}, failed),
+            ("uncovered verdict", {"reviews": stale}, None),
+        ):
+            waiting = ready_pr(**{**overrides, "reviews": none})
+            landed = ready_pr(**{"reviews": approved, **overrides})
+            for pr in (waiting, landed):
+                if rollup:
+                    pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = rollup
+            original = w.authored_lines
+            w.authored_lines = lambda *_: None
+            try:
+                # The red check was there before the wait began: the last round already handled it.
+                code, out, _ = self.run_main([waiting, landed], args=["--after", "2026-10-15T10:00:00Z"])
+            finally:
+                w.authored_lines = original
+            self.assertEqual(code, 14, f"{name}: {out}")
+
+    def test_an_unlisted_formal_approval_wakes_a_listed_reviewer_wait(self):
+        # The wrong --reviewer: the repo's bot approves formally, and the wait must not sit on it.
+        waiting = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        bot = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})
+        code, out, _ = self.run_main([waiting, bot], args=["--reviewer", "someone-else"])
+        self.assertEqual(code, 14, out)
+        self.assertIn("review-bot approved it formally but is not a listed --reviewer", out)
+
+    def test_an_unanswered_non_blocking_finding_holds_until_answered(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}."), "id": "R1"}
+        open_finding = finding_thread("R1", "src/a.rs", answered=False)
+        held = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [open_finding]})
+        ready, reasons = evaluate(held)
+        self.assertFalse(ready)
+        self.assertIn("1 unresolved threads", reasons)
+        answered = ready_pr(reviews={"totalCount": 1, "nodes": [approve]}, reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs")]})
+        self.assertTrue(evaluate(answered)[0])
+
+    def test_a_blocking_thread_still_holds_once_answered(self):
+        findings = {**review("review-bot", "COMMENTED", "AI reviewer: Claude."), "id": "R1"}
+        thread = finding_thread("R1", "src/a.rs", state="COMMENTED")
+        self.assertFalse(evaluate(ready_pr(reviewThreads={"totalCount": 1, "nodes": [thread]}, reviews={"totalCount": 2, "nodes": [findings, review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}))[0])
+
+    def test_an_approval_with_answered_findings_carries_up_to_30_lines_anywhere(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"totalCount": 1, "nodes": [approve]},
+                      reviewThreads={"totalCount": 1, "nodes": [finding_thread("R1", "src/a.rs")]})
+        cases = [
+            ({"docs/notes.md": [(200, 200, 21)]}, True),
+            ({"src/a.rs": [(1, 30, 0)]}, True),
+            ({"src/a.rs": [(1, 31, 0)]}, False),
+            ({"src/a.rs": [(40, 40, 30)]}, True),
+            ({"src/a.rs": [(40, 40, 31)]}, False),
+            ({"src/a.rs": [(1, 15, 20)], "docs/notes.md": [(200, 209, 5)]}, True),
+            ({"src/a.rs": [(1, 15, 20)], "docs/notes.md": [(200, 210, 5)]}, False),
+            ({"src/a.rs": [(1, 10, 5), (200, 200, 20)]}, True),
+            ({"src/a.rs": [(1, 10, 5), (200, 200, 21)]}, False),
+            (None, False), ({}, False), ({"src/a.rs": []}, False),
+            ({"src/a.rs": [(40, 40, 1)], "image.png": []}, False),
+        ]
+        for hunks, expected in cases:
+            with self.subTest(hunks=hunks):
+                ready, reasons = w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=lambda *_: False,
+                                            hunks_between=lambda *_: hunks)
+                self.assertEqual(ready, expected, reasons)
+
+    def test_every_finding_of_the_approval_must_be_answered_or_resolved(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        unanswered = finding_thread("R1", "src/b.rs", answered=False)
+        pr = ready_pr(reviews={"nodes": [approve]},
+                      reviewThreads={"nodes": [finding_thread("R1", "src/a.rs"), unanswered]})
+        def run():
+            return w.evaluate(pr, no_ci=False, reviewers={"review-bot"}, same_authored_lines=lambda *_: False,
+                              hunks_between=lambda *_: {"src/a.rs": [(40, 40, 1)]})
+        ready, reasons = run()
+        self.assertFalse(ready)
+        self.assertIn("1 unresolved threads", reasons)
+        self.assertTrue(any("no AI reviewer approval covering" in r for r in reasons), reasons)
+        unanswered["isResolved"] = True
+        self.assertTrue(run()[0], "a resolved finding needs no reply")
+
+    def test_findings_on_removed_lines_or_without_positions_still_carry(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        for location in ({"diffSide": "LEFT"}, {"path": None, "originalLine": None}):
+            with self.subTest(location=location):
+                thread = {**finding_thread("R1", "src/a.rs"), **location}
+                pr = ready_pr(reviews={"nodes": [approve]}, reviewThreads={"nodes": [thread]})
+                self.assertTrue(w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=lambda *_: False,
+                                           hunks_between=lambda *_: {"docs/notes.md": [(200, 200, 1)]})[0])
+
+    def test_an_approval_without_findings_only_carries_by_base_sync(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"nodes": [approve]}, reviewThreads={"nodes": []})
+        for base_sync, expected in ((False, False), (True, True)):
+            self.assertEqual(w.evaluate(pr, no_ci=False, reviewers=set(), same_authored_lines=lambda *_: base_sync,
+                                        hunks_between=lambda *_: {"docs/notes.md": [(200, 200, 1)]})[0], expected)
+
+    def test_base_sync_carries_before_finding_and_line_cap_checks(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"nodes": [approve]},
+                      reviewThreads={"nodes": [finding_thread("R1", "src/a.rs", answered=False)]})
+        def unexpected_compare(*_):
+            self.fail("a base-sync must not read changed hunks")
+        self.assertTrue(w.approval_state(pr, set(), lambda *_: True, unexpected_compare)[0])
+
+    def test_an_unreadable_compare_keeps_the_waiter_waiting(self):
+        approve = {**review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {OLD}.", sha=OLD), "id": "R1"}
+        pr = ready_pr(reviews={"nodes": [approve]}, reviewThreads={"nodes": [finding_thread("R1", "src/a.rs")]})
+        original_lines, original_hunks = w.authored_lines, w.changed_hunks
+        w.authored_lines = lambda *_: None
+        w.changed_hunks = lambda *_: None
+        try:
+            code, out, waits = self.run_main([pr, pr, ready_pr(headRefOid="c" * 40)])
+        finally:
+            w.authored_lines, w.changed_hunks = original_lines, original_hunks
+        self.assertEqual(code, 12, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_hunk_ranges_are_read_on_the_old_side(self):
+        original = w.gh
+        # Context lines don't count: only the changed runs, at their old-side lines.
+        patch = "@@ -10,7 +10,7 @@ fn a()\n a\n b\n c\n-d\n+D\n e\n f\n g\n@@ -50,0 +51,2 @@\n+x\n+y\n@@ -80,3 +81,1 @@\n-p\n-q\n r"
+        w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "src/a.rs", "patch": patch}]), "")
+        try:
+            self.assertEqual(w.changed_hunks("o", "n", OLD, HEAD), {"src/a.rs": [(13, 13, 1), (50, 50, 2), (80, 81, 0)]})
+            w.gh = lambda *_: subprocess.CompletedProcess([], 0, json.dumps([{"filename": "big.bin"}]), "")
+            self.assertIsNone(w.changed_hunks("o", "n", OLD, HEAD))
+        finally:
+            w.gh = original
+
+    def test_listed_reviewer_matches_case_and_bot_suffix(self):
+        # GraphQL gives a GitHub App bot's login without the [bot] suffix REST and gh show.
+        bot = ready_pr(reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]})
+        for listed in ("Review-Bot", "review-bot[bot]"):
+            code, out, _ = self.run_main([bot], args=["--reviewer", listed])
+            self.assertEqual(code, 0, f"{listed}: {out}")
+            self.assertIn("approved by review-bot", out)
+
+    def test_a_session_approval_wakes_when_what_blocks_wont_clear_by_itself(self):
+        none = {"totalCount": 0, "nodes": []}
+        session = {"totalCount": 1, "nodes": [review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.")]}
+        failed = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        for name, overrides, rollup in (
+            ("behind", {"mergeStateStatus": "BEHIND"}, None),
+            ("blocked", {"mergeStateStatus": "BLOCKED"}, None),
+            ("failed check", {}, failed),
+        ):
+            waiting = ready_pr(**{**overrides, "reviews": none})
+            landed = ready_pr(**{"reviews": session, **overrides})
+            for pr in (waiting, landed):
+                if rollup:
+                    pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = rollup
+            code, out, _ = self.run_main([waiting, landed], args=["--reviewer", "review-bot", "--after", "2026-10-15T10:00:00Z"])
+            self.assertEqual(code, 14, f"{name}: {out}")
+
+    def test_an_approval_while_mergeability_is_computed_keeps_waiting(self):
+        none = {"totalCount": 0, "nodes": []}
+        approved = {"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]}
+        unknown = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"}
+        code, out, _ = self.run_main([ready_pr(reviews=none, **unknown), ready_pr(reviews=approved, **unknown), ready_pr(reviews=approved)])
+        self.assertEqual(code, 0, out)
+
+    def test_a_comment_beside_the_approval_still_wakes(self):
+        pending = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        waiting = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        landed = ready_pr(
+            reviews={"totalCount": 1, "nodes": [review("review-bot", "APPROVED", f"AI reviewer: Claude. Reviewed {HEAD}.")]},
+            comments={"totalCount": 1, "nodes": [comment("alice", "Please hold this until the migration lands.")]},
+        )
+        for pr in (waiting, landed):
+            pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = pending
+        code, out, _ = self.run_main([waiting, landed])
+        self.assertEqual(code, 14, out)
+
+    def test_unknown_mergeability_keeps_waiting(self):
+        unknown = ready_pr(mergeable="UNKNOWN", mergeStateStatus="UNKNOWN")
+        code, _, waits = self.run_main([unknown, unknown, ready_pr()])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(waits), 2)
+
+    def test_conflict_on_a_stale_head_waits_for_the_expected_one(self):
+        stale = ready_pr(headRefOid=OLD, mergeable="CONFLICTING", mergeStateStatus="DIRTY")
+        code, out, _ = self.run_main([stale, ready_pr()], args=["--head", HEAD])
+        self.assertEqual(code, 0, out)
+
+    def test_abbreviated_head_matches_the_full_sha(self):
+        code, out, _ = self.run_main([ready_pr()], args=["--head", HEAD[:7]])
+        self.assertEqual(code, 0, out)
+        waiting = ready_pr(reviewThreads={"nodes": [{"isResolved": False}]})
+        moved = ready_pr(headRefOid="c" * 40)
+        self.assertEqual(self.run_main([waiting, moved], args=["--head", HEAD[:7]])[0], 12)
+
+    def test_a_failed_check_wakes_with_16_unless_the_last_round_saw_it(self):
+        red = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        red["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        code, out, waits = self.run_main([red])
+        self.assertEqual(code, 16, out)
+        self.assertTrue(out.startswith("ci failed:"))
+        self.assertEqual(waits, [])
+        code, _, _ = self.run_main([red] * 130, args=["--after", "2026-10-15T10:00:00Z"])
+        self.assertEqual(code, 13)
+
+    def test_a_cancelled_check_is_no_ci_failure(self):
+        # With no cancelled run behind it (the default head runs are green), a cancelled check is only not ready.
+        cancelled = ready_pr()
+        cancelled["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="CANCELLED")]}}
+        code, _, _ = self.run_main([cancelled, ready_pr()])
+        self.assertEqual(code, 0)
+
+    def cancelled_pr(self, completed="2026-10-15T09:30:00Z", **overrides):
+        pr = ready_pr(**overrides)
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="CANCELLED", completed=completed)]}}
+        return pr
+
+    def test_an_abandoned_cancelled_check_exits_16(self):
+        run = ([], ["CI=cancelled"], w.ts("2026-10-15T09:00:00Z"))
+        code, out, waits = self.run_main([self.cancelled_pr()], head=[run])
+        self.assertEqual(code, 16, out)
+        self.assertIn("test=CANCELLED (cancelled, no run active for 3 min)", out)
+        self.assertEqual(waits, [])
+
+    def test_a_cancelled_check_waits_out_the_settle_window(self):
+        run = ([], ["CI=cancelled"], w.ts("2026-10-15T09:00:00Z"))
+        code, out, waits = self.run_main([self.cancelled_pr(completed="2026-10-15T09:59:00Z")] * 10, head=[run] * 10)
+        self.assertEqual(code, 16, out)
+        self.assertGreaterEqual(sum(waits), w.CANCEL_SETTLE - 60)
+        self.assertGreater(len(waits), 0)
+
+    def test_a_cancelled_check_with_an_active_run_keeps_waiting_until_the_rerun_passes(self):
+        reads = [self.cancelled_pr(), self.cancelled_pr(), ready_pr()]
+        head = [(["CI"], ["CI=cancelled"], None), (["CI"], [], None), ([], [], w.ts("2026-10-15T09:00:00Z"))]
+        code, out, waits = self.run_main(reads, head=head)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(waits), 2)
+
+    def test_a_cancelled_check_whose_newest_run_passed_is_no_failure(self):
+        passed = ([], [], w.ts("2026-10-15T09:00:00Z"))
+        code, out, _ = self.run_main([self.cancelled_pr()] * 200, head=[passed] * 200)
+        self.assertEqual(code, 13)
+
+    def test_a_cancelled_check_asks_for_runs_once_per_read(self):
+        run = ([], ["CI=cancelled"], w.ts("2026-10-15T09:00:00Z"))
+        asked = []
+        original = w.forge
+
+        def counting(url):
+            host = original(url)
+            host["head_runs"] = lambda sha: (asked.append(sha), run)[1]
+            return host
+
+        w.forge = counting
+        try:
+            code, _, _ = self.run_main([self.cancelled_pr()])
+        finally:
+            w.forge = original
+        self.assertEqual(code, 16)
+        self.assertEqual(asked, [HEAD])
+
+    def test_a_cancelled_gitlab_pipeline_exits_16_on_the_settle_window_alone(self):
+        pr = self.cancelled_pr()
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [
+            {"__typename": "StatusContext", "context": "pipeline 9", "state": "CANCELLED", "createdAt": "2026-10-15T09:30:00Z"}]}}
+        code, out, _ = self.run_main([pr], url=GL_URL)
+        self.assertEqual(code, 16, out)
+        self.assertIn("pipeline 9=CANCELLED", out)
+
+    def pending_pr(self, **overrides):
+        pr = ready_pr(reviews={"totalCount": 0, "nodes": []}, **overrides)
+        pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", status="IN_PROGRESS", conclusion=None)]}}
+        return pr
+
+    def test_an_agent_marked_comment_is_no_review_activity_but_an_unmarked_one_is(self):
+        for body, code in (("Flake note.\n" + w.AGENT_MARKER, 0), ("Flake note.", 14)):
+            with self.subTest(body=body):
+                landed = self.pending_pr(comments={"totalCount": 1, "nodes": [comment("alice", body)]})
+                code_out, out, _ = self.run_main([self.pending_pr(), landed, ready_pr(comments=landed["comments"])])
+                self.assertEqual(code_out, code, out)
+
+    def test_a_marked_note_past_the_comment_window_is_no_activity(self):
+        # 60 comments exist and the query fetches the newest 50; the oldest fetched one (#10) is
+        # marked. A new note pushes it out of the window while totalCount rises by one.
+        def thread(total, new_body=None):
+            bodies = {i: (w.AGENT_MARKER if i == 10 else f"c{i}") for i in range(total)}
+            if new_body is not None:
+                bodies[total] = new_body
+            seen = sorted(bodies)[-50:]
+            return {"totalCount": len(bodies), "nodes": [comment("alice", bodies[i], at=f"2026-10-15T08:{i:02d}:00Z") for i in seen]}
+        for body, expected in (("note\n" + w.AGENT_MARKER, None), ("note", 14)):
+            for args in ([], ["--until-review"]):
+                with self.subTest(body=body, args=args):
+                    first, landed = self.pending_pr(comments=thread(60)), self.pending_pr(comments=thread(60, body))
+                    reads = [first, landed, landed] if not args else [first] + [landed] * 200
+                    if not args and expected is None:
+                        reads.append(ready_pr(comments=landed["comments"]))
+                    code, out, _ = self.run_main(reads, args=args)
+                    self.assertEqual(code, expected or (0 if not args else 13), out)
+
+    def test_until_review_after_ignores_a_newer_agent_marked_comment(self):
+        for body, code in (("note\n" + w.AGENT_MARKER, 13), ("note", 14)):
+            with self.subTest(body=body):
+                pr = ready_pr(reviews={"totalCount": 0, "nodes": []},
+                              comments={"totalCount": 1, "nodes": [comment("alice", body, at="2026-10-15T09:30:00Z")]})
+                got, out, _ = self.run_main([pr] * 200, args=["--until-review", "--after", "2026-10-15T09:00:00Z"])
+                self.assertEqual(got, code, out)
+
+    def test_a_marked_verdict_comment_still_approves(self):
+        verdict = f"APPROVED. AI reviewer: Claude. Reviewed {HEAD}.\n{w.AGENT_MARKER}"
+        pr = ready_pr(reviews={"totalCount": 0, "nodes": []}, comments={"totalCount": 1, "nodes": [comment("review-bot", verdict)]})
+        code, out, _ = self.run_main([pr])
+        self.assertEqual(code, 0, out)
+
+    def test_no_ci_never_reports_a_ci_failure(self):
+        red = ready_pr(reviews={"totalCount": 0, "nodes": []})
+        red["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = {"contexts": {"nodes": [check("test", conclusion="FAILURE")]}}
+        self.assertEqual(self.run_main([red] * 130, args=["--no-ci"])[0], 13)
+
+    def test_a_gitlab_mr_runs_through_the_same_gates(self):
+        reads = iter([gl_pr(pipeline="running"), gl_pr()])
+        original = w.gl_read_mr
+        w.gl_read_mr = lambda *_: next(reads)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+                code = w.main([GL_URL, "--reviewer", "review-bot"], now=lambda: w.ts("2026-10-15T10:00:00Z"), sleep=lambda s: None)
+        finally:
+            w.gl_read_mr = original
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("approved by review-bot", out.getvalue())
+
+    def test_other_urls_are_unsupported(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(w.main(["https://bitbucket.org/acme/app/pull-requests/7"]), 2)
+        self.assertEqual(w.parse_gitlab_url("https://gitlab.example.com/grp/sub/app/-/merge_requests/7"),
+                         ("gitlab.example.com", "grp/sub/app", 7))
+        self.assertIsNone(w.parse_gitlab_url(URL))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)
