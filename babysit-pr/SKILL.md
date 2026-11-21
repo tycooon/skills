@@ -68,7 +68,7 @@ Use this transport when neither `WatchPullRequest` nor `subscribe_pr_activity` i
 
 Choose `--after` only from an activity mark printed by a previous waiter exit or the time of your own PR read, never a typed future time. `--refused` takes only the mark an exit 0 printed for a ready your recheck turned down; a read time there would hold an already-ready PR until something on it moves. A later mark hides activity you have not read. The waiter rejects a mark more than 60 seconds ahead of startup UTC before reading the PR; the allowance covers small clock differences.
 
-The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed by this repo's `bin/setup`. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff: 1 minute, 1 minute, then every 2 minutes, and exits with a one-line reason:
+The waiter is `~/.claude/bin/wait-pr-ready <canonical PR URL> --head <head sha>`, installed into `~/.claude/bin` by the separate private repo's setup. Run it as one background shell command (Claude Code's `run_in_background`), which re-invokes the session when it exits. It reads the PR with backoff: 1 minute, 1 minute, then every 2 minutes, and exits with a one-line reason:
 
 | Exit | Reason | Next |
 |---|---|---|
