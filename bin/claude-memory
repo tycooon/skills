@@ -5,10 +5,10 @@
   claude-memory end [--background]   SessionEnd: commit, rebase and push the checkout, then refresh the Secrets snapshot
   claude-memory pull                 cloud: fetch the Secrets snapshot, print this repo's memory (read-only)
   claude-memory push [--background]  publish the Secrets snapshot (git mode: from the checkout; otherwise from the Mac's project folders)
-  claude-memory migrate              Mac, once: move the project memory folders into the git checkout and link them
+  claude-memory migrate [--from <backup>]  Mac, by hand: import the project memory folders (or a memory-backup folder) into the checkout and link them
   claude-memory hooks --git|--cloud  register start/end (--mac is an alias of --git) or the cloud's SessionStart pull
 
-Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
+Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. start never imports notes: a folder that is not the expected link is moved to <config>/memory-backup/ and linked afresh (the memory folders sit in a home directory other processes can write, the checkout only trusted sessions), and only a person's migrate [--from <backup>] imports notes. end stages only regular files inside the checkout and refuses any symlink there. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
 
 Cloud sessions cannot reach git, so every git writer also refreshes a snapshot in Kubernetes Secrets, which they reach through an agent proxy that injects the cluster credential. A Secret holds at most 1 MiB, so the archive is split over claude-memory (the index, written last) and claude-memory-1 to claude-memory-7, which is the fixed set of names the cluster grants read on. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ..., "repo": ..., "checkout": ...}, with only namespace required. A glob in ~/.claude/memory-sync.exclude matching host/owner/repo keeps that repo's folder out of the checkout, and one matching host/owner/repo/note.md keeps that note on this machine (listed in <checkout>/.git/info/exclude, so never committed or archived); migrate and the Mac's non-git push refuse to run until that file exists, even empty. Every sync result goes to CLAUDE_MEMORY_LOG, never file contents.
 """
@@ -463,10 +463,23 @@ def ensure_gitattributes(checkout):
     path.write_text(text + ("" if text.endswith("\n") or not text else "\n") + GITATTRIBUTES_LINE + "\n")
 
 
+def symlinked(checkout, name):
+    """True when name, or a folder on its way inside the checkout, is a symlink: never staged, archived or followed."""
+    path = Path(checkout)
+    for part in PurePosixPath(name).parts:
+        path = path / part
+        if path.is_symlink():
+            return True
+    return False
+
+
 def commit_all(checkout):
-    """Stages every note (not what .git/info/exclude lists) and commits; True when something changed."""
+    """Stages every regular note inside the checkout (not what .git/info/exclude lists, never a symlink) and commits; True when something changed."""
     changed = git_text(checkout, "ls-files", "-z", "--others", "--modified", "--deleted", "--exclude-standard").split("\0")
     names = sorted({n for n in changed if n and (n == ".gitattributes" or len(PurePosixPath(n).parts) >= 4)})
+    for name in [n for n in names if symlinked(checkout, n)]:
+        log(f"refused to stage symlink {name}")
+    names = [n for n in names if not symlinked(checkout, n)]
     if names:
         git(checkout, "--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", input="\0".join(names).encode())
     if git(checkout, "diff", "--cached", "--quiet", check=False).returncode == 0:
@@ -596,7 +609,7 @@ def refresh_secrets(checkout):
     names = [n for n in git_text(checkout, "ls-files", "-z").split("\0") if n]
     files = {}
     for name in names:
-        if len(PurePosixPath(name).parts) < 4:
+        if len(PurePosixPath(name).parts) < 4 or symlinked(checkout, name):
             continue
         try:
             files[name] = (Path(checkout) / name).read_bytes()
@@ -618,47 +631,83 @@ def project_slug(directory):
     return re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(root))
 
 
-def link_memory(checkout, memory, key, slug, strict=False):
-    """Makes memory (a project's folder) a symlink to <checkout>/<key>. Returns (state, detail): linked, already or skipped."""
+def regular_notes(folder):
+    """The regular files under folder; symlinks (files or folders) are never followed or imported."""
+    found = []
+    for root, _, names in os.walk(folder, followlinks=False):
+        found += [Path(root) / n for n in sorted(names) if not (Path(root) / n).is_symlink()]
+    return found
+
+
+def import_notes(checkout, source, key, strict=False):
+    """Copies notes from source into <checkout>/<key>, never over a newer or identical copy. Returns (copied, newer): newer names a note newer than the committed one when strict."""
     target = Path(checkout) / key
-    if memory.is_symlink():
-        if os.path.realpath(memory) == os.path.realpath(target):
-            target.mkdir(parents=True, exist_ok=True)
-            return "already", ""
-        return "skipped", "links elsewhere"
-    if memory.exists() and not memory.is_dir():
-        return "skipped", "not a folder"
-    patterns = exclude_patterns()
-    files = [p for p in memory.rglob("*") if p.is_file()] if memory.is_dir() else []
     copies = []
-    for source in files:
-        relative = source.relative_to(memory).as_posix()
+    for path in regular_notes(source):
+        relative = path.relative_to(source).as_posix()
         dest = target / relative
-        if dest.is_file():
-            if dest.read_bytes() == source.read_bytes():
+        if dest.is_file() and not dest.is_symlink():
+            if dest.read_bytes() == path.read_bytes():
                 continue
-            newer = source.stat().st_mtime > dest.stat().st_mtime
-            if newer and strict:
-                return "skipped", f"{relative} is newer than the committed copy"
-            if not newer:
+            if path.stat().st_mtime <= dest.stat().st_mtime:
                 continue  # the committed copy is at least as new, and the backup keeps this one
-        copies.append((source, dest))
-    for source, dest in copies:
+            if strict:
+                return [], relative
+        copies.append((path, dest))
+    for path, dest in copies:
+        if symlinked(checkout, dest.relative_to(checkout).as_posix()):
+            continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, dest)
+        shutil.copy2(path, dest)
+    return [d for _, d in copies], None
+
+
+def move_to_backup(memory, slug):
+    backup = CONFIG / "memory-backup" / f"{slug}-{utc_now('%Y%m%dT%H%M%SZ')}"
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(memory), str(backup))
+    return backup
+
+
+def link_memory(checkout, memory, key, slug, adopt=False):
+    """Makes memory (a project's folder) a symlink to <checkout>/<key>. Returns (state, detail): linked, already, moved (detail: the backup) or skipped.
+
+    Only migrate (adopt) imports notes from a folder it finds; start never does, because other processes can write these folders and only trusted sessions may write the checkout.
+    """
+    target = Path(checkout) / key
+    if memory.is_symlink() and os.path.realpath(memory) == os.path.realpath(target):
+        target.mkdir(parents=True, exist_ok=True)
+        return "already", ""
+    backup = None
+    if adopt:
+        if memory.is_symlink():
+            return "skipped", "links elsewhere"
+        if memory.exists() and not memory.is_dir():
+            return "skipped", "not a folder"
+        files = regular_notes(memory) if memory.is_dir() else []
+        copied, newer = import_notes(checkout, memory, key, strict=True)
+        if newer:
+            return "skipped", f"{newer} is newer than the committed copy"
+        target.mkdir(parents=True, exist_ok=True)
+        if copied:
+            sync_excludes(checkout)
+            commit_all(checkout)
+        if files:
+            backup = move_to_backup(memory, slug)
+    elif os.path.lexists(memory):
+        if memory.is_dir() and not memory.is_symlink() and not any(p.is_file() or p.is_symlink() for p in memory.rglob("*")):
+            pass  # empty
+        else:
+            backup = move_to_backup(memory, slug)
+    if backup is None and os.path.lexists(memory):
+        if memory.is_dir() and not memory.is_symlink():
+            shutil.rmtree(memory)
+        else:
+            memory.unlink()
     target.mkdir(parents=True, exist_ok=True)
-    if copies:
-        sync_excludes(checkout)
-        commit_all(checkout)
-    if files:
-        backup = CONFIG / "memory-backup" / f"{slug}-{utc_now('%Y%m%dT%H%M%SZ')}"
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(memory), str(backup))
-    elif memory.exists():
-        shutil.rmtree(memory)
     memory.parent.mkdir(parents=True, exist_ok=True)
     os.symlink(target, memory)
-    return "linked", ""
+    return ("moved", str(backup)) if backup and not adopt else ("linked", "")
 
 
 def link_project(checkout):
@@ -669,7 +718,9 @@ def link_project(checkout):
     slug = project_slug(directory)
     state, detail = link_memory(checkout, CONFIG / "projects" / slug / "memory", key, slug)
     log(f"link {key}: {state}{': ' + detail if detail else ''}")
-    return f"left {key} alone ({detail})" if state == "skipped" else None
+    if state == "moved":
+        return f"Memory: moved unlinked notes in {slug} to {detail}; run claude-memory migrate to import them"
+    return None
 
 
 # --- start / end -------------------------------------------------------------
@@ -679,6 +730,7 @@ def start_git(checkout):
     deadline = time.monotonic() + PULL_SECONDS
     conflicts = []
     extra = None
+    moved = None
     try:
         with locked(checkout, 5):
             try:
@@ -692,7 +744,7 @@ def start_git(checkout):
                 abort_rebase(checkout)
                 message = f"pull failed: {error}; using the local checkout"
             try:
-                extra = link_project(checkout)
+                moved = link_project(checkout)
             except (Failure, OSError) as error:
                 extra = f"linking failed: {error}"
     except Failure as error:
@@ -704,6 +756,9 @@ def start_git(checkout):
         line += f"; {extra}"
     log(f"start: {line[len('Memory: git sync, '):]}" + "".join(f"; conflict {c}" for c in conflicts))
     print(line)
+    if moved:
+        log(moved)
+        print(moved)
     return 0
 
 
@@ -745,7 +800,7 @@ def end_git(checkout):
 # --- migrate (Mac) -----------------------------------------------------------
 
 
-def migrate():
+def migrate(sources=()):
     config = load_config()
     if not isinstance(config.get("repo"), str) or not config["repo"]:
         sys.stderr.write(f'{CLUSTER} has no "repo": nothing to migrate to\n')
@@ -771,6 +826,17 @@ def migrate():
             if not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
+        imported = []
+        for source in map(Path, sources):
+            slug = re.sub(r"-\d{8}T\d{6}Z$", "", source.name)
+            key, _ = project_repo(CONFIG / "projects" / slug)
+            if not source.is_dir() or source.is_symlink():
+                skipped.append(f"{source} (not a backup folder)")
+            elif key is None or ".." in key.split("/") or matches_exclude(key, exclude_patterns()):
+                skipped.append(f"{source} (no repo key, or kept on this machine)")
+            else:
+                copied, _ = import_notes(checkout, source, key)
+                imported.append(f"{key}: {len(copied)} note(s) from {source}")
         ensure_gitattributes(checkout)
         sync_excludes(checkout)
         commit_all(checkout)
@@ -788,7 +854,7 @@ def migrate():
             if matches_exclude(key, exclude_patterns()):
                 kept.append(project.name)
                 continue
-            state, detail = link_memory(checkout, memory, key, project.name, strict=True)
+            state, detail = link_memory(checkout, memory, key, project.name, adopt=True)
             if state == "skipped":
                 skipped.append(f"{project.name} ({detail})")
             else:
@@ -802,6 +868,8 @@ def migrate():
     refreshed = refresh_secrets(checkout)
     notes = sum(1 for name in git_text(checkout, "ls-files", "-z").split("\0") if len(PurePosixPath(name).parts) >= 4)
     print(f"repos: {len(repos)}, notes: {notes}, folders linked: {len(linked)}, already linked: {len(already)}, kept on this machine (excluded): {len(kept)}, skipped: {len(skipped)}")
+    for item in imported:
+        print(f"  imported {item}")
     for item in skipped:
         print(f"  skipped: {item}")
     if refreshed != 0:
@@ -978,8 +1046,8 @@ def main(argv):
         return pull()
     if command == "start" and not options:
         return start()
-    if command == "migrate" and not options:
-        return migrate()
+    if command == "migrate" and len(options) % 2 == 0 and options[::2] == ["--from"] * (len(options) // 2):
+        return migrate(options[1::2])
     if command == "hooks" and len(options) == 1 and options[0] in HOOK_COMMANDS:
         return hooks(options[0])
     sys.stderr.write(__doc__)
