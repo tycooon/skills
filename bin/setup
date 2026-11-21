@@ -8,28 +8,18 @@
 # skill directories. Safe to re-run: copies are re-synced in place, any
 # pre-existing symlink (e.g. from an earlier version of this script) is replaced
 # with a real copy, and unrelated skills already in the target dirs are left
-# untouched. Re-run after editing a skill to propagate the changes. The shared
-# references/ directory is mirrored beside the skills the same way, so a skill's
-# ../references/ links resolve in every runtime.
+# untouched. Re-run after editing a skill to propagate the changes.
 #
-# It also installs bin/claude-memory into ~/.claude/bin and registers its hooks:
-# on a Mac the git-backed SessionStart start and SessionEnd end (hooks --git; a
-# dev box gets the same from its own provisioning once memory-sync.json names a
-# repo), and with --cloud (the Claude cloud environment's setup script) the
-# SessionStart pull. bin/wait-pr-ready, which babysit-pr,
-# release and codex run as a background waiter, goes into ~/.claude/bin as well,
-# and so do bin/gh-review-thread, bin/review-scan and its engine bin/agent-watch. review-scan loads
-# both its engine and wait-pr-ready from beside itself. The codex and
-# remote-claude skills and their host picker live in a separate private repo
-# with its own setup, which installs them beside these skills.
+# Only skills live in this repo. The tools (~/.claude/bin), the global rules and
+# the shared references/ come from a separate private repo, which also mirrors
+# references/ beside the skills; this script must not touch <skills dir>/references.
 
 set -euo pipefail
 shopt -s nullglob
 
-cloud=false
+# --cloud is a no-op kept because old cloud environments still pass it.
 case "${1:-}" in
-  "") ;;
-  --cloud) cloud=true ;;
+  ""|--cloud) ;;
   *) echo "usage: bin/setup [--cloud]" >&2; exit 2 ;;
 esac
 
@@ -83,27 +73,7 @@ for target in "${targets[@]}"; do
   for skill in "${skills[@]}"; do
     sync_skill "$skill" "$target/$(basename "$skill")"
   done
-  # Skills link shared procedures as ../references/<file>; a sibling copy keeps
-  # those links resolving in the installed layout. No SKILL.md, so no runtime
-  # loads it as a skill.
-  sync_skill "$repo_root/references" "$target/references"
 done
 
 echo
 echo "Synced ${#skills[@]} skill(s) into ${#targets[@]} runtime(s)."
-
-# A copy rather than a link: the cloud's setup script deletes this checkout.
-memory="$HOME/.claude/bin/claude-memory"
-mkdir -p "$(dirname "$memory")"
-install -m 0755 "$repo_root/bin/claude-memory" "$memory"
-install -m 0755 "$repo_root/bin/wait-pr-ready" "$(dirname "$memory")/wait-pr-ready"
-install -m 0755 "$repo_root/bin/gh-review-thread" "$(dirname "$memory")/gh-review-thread"
-install -m 0755 "$repo_root/bin/agent-watch" "$(dirname "$memory")/agent-watch"
-install -m 0755 "$repo_root/bin/review-scan" "$(dirname "$memory")/review-scan"
-if $cloud; then
-  "$memory" hooks --cloud
-  echo "Registered the memory pull hook."
-elif [ "$(uname -s)" = Darwin ]; then
-  "$memory" hooks --git
-  echo "Registered the memory start and end hooks."
-fi
