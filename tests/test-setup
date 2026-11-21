@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Tests for bin/setup. Run: tests/test-setup
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+export HOME="$tmp/home"; mkdir -p "$HOME"
+"$root/bin/setup" >/dev/null
+for skill in "$root"/*/SKILL.md; do
+  name="$(basename "$(dirname "$skill")")"
+  for rt in .claude .codex .zcode .opencode .gemini/config; do
+    [ -f "$HOME/$rt/skills/$name/SKILL.md" ] || fail "$name not synced into $rt"
+  done
+done
+[ ! -e "$HOME/.claude/bin" ] || fail "setup wrote ~/.claude/bin"
+[ ! -e "$HOME/.claude/skills/references" ] || fail "setup wrote references/"
+
+export HOME="$tmp/home2"; mkdir -p "$HOME"
+"$root/bin/setup" --cloud >/dev/null || fail "--cloud rejected"
+[ -f "$HOME/.claude/skills/rfc/SKILL.md" ] || fail "--cloud did not sync skills"
+[ ! -e "$HOME/.claude/bin" ] || fail "--cloud wrote ~/.claude/bin"
+
+rc=0; "$root/bin/setup" --bogus >/dev/null 2>&1 || rc=$?
+[ "$rc" = 2 ] || fail "bad flag exited $rc, want 2"
+echo "ok"

@@ -25,7 +25,7 @@ Resolve every target to a concrete list of projects before reviewing anything, a
 
 ## Running the watch
 
-A watch is not a long-running agent session. `~/.claude/bin/review-scan` (installed by the skills repo's `bin/setup`) scans the targets on a schedule without any model, and starts a fresh headless `claude -p` or `codex exec` run for each PR that changed since a run last settled it. A quiet PR costs one line of a listing and nothing else, and no session carries hours of context from tick to tick. `review-scan --help` and the script's docstring cover every option.
+A watch is not a long-running agent session. `~/.claude/bin/review-scan` (installed into `~/.claude/bin` by the separate private repo's setup) scans the targets on a schedule without any model, and starts a fresh headless `claude -p` or `codex exec` run for each PR that changed since a run last settled it. A quiet PR costs one line of a listing and nothing else, and no session carries hours of context from tick to tick. `review-scan --help` and the script's docstring cover every option.
 
 **Setting one up** is the part you do in this session, once:
 
