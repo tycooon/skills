@@ -609,6 +609,41 @@ class GitMode(unittest.TestCase):
         (box.config / "memory-sync.json").write_text(json.dumps(config))
         self.assertEqual(box.run("migrate").returncode, 1)
 
+    # -- a machine with "repo" set but no checkout yet
+
+    def as_darwin(self, box):
+        """A launcher that makes the script see platform.system() == "Darwin"."""
+        launcher = box.root / "as-darwin"
+        launcher.write_text(f"#!{sys.executable}\nimport platform, runpy, sys\nplatform.system = lambda: 'Darwin'\nsys.argv[0] = {str(SCRIPT)!r}\nrunpy.run_path({str(SCRIPT)!r}, run_name='__main__')\n")
+        launcher.chmod(0o755)
+        return launcher
+
+    def test_unmigrated_mac_with_repo_set_prints_nothing_at_start_and_still_pushes_at_end(self):
+        box = self.a  # repo configured, no checkout
+        box.project(box.slug, box.app, {"MEMORY.md": "- native\n", "n.md": "native\n"})
+        launcher = self.as_darwin(box)
+        started = box.run("start", script=launcher)
+        self.assertEqual((started.returncode, started.stdout), (0, ""), started.stderr)
+        ended = box.run("end", script=launcher)
+        self.assertEqual(ended.returncode, 0, ended.stderr)
+        files, _ = load_module().read_archive(box.archive())
+        self.assertIn(f"{KEY}/n.md", files)
+        self.assertFalse(box.repo.exists())
+
+    def test_unmigrated_linux_with_repo_set_pulls_at_start_and_does_nothing_at_end(self):
+        box = self.a
+        box.project(box.slug, box.app, {"MEMORY.md": "- native\n"})
+        cloud = box.checkout("cloud-app", "https://github.com/acme/app")
+        env = {"CLAUDE_PROJECT_DIR": str(cloud)}
+        other = self.machine()
+        other.project(other.slug, other.app, {"MEMORY.md": "- seen\n"})
+        other.run("push")
+        box.write_secret(other.secret())
+        started = box.run("start", extra_env=env)
+        self.assertIn("## Mac memory snapshot", started.stdout)
+        self.assertEqual(box.run("end").returncode, 0)
+        self.assertEqual(box.apply_calls(), [])
+
     # -- start
 
     def test_start_links_a_missing_folder_and_leaves_an_existing_link_alone(self):
