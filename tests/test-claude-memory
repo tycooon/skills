@@ -634,6 +634,30 @@ class GitMode(unittest.TestCase):
         self.assertIn(f"{KEY}/n.md", files)
         self.assertFalse(box.repo.exists())
 
+    def test_migrated_mac_with_the_checkout_gone_publishes_nothing(self):
+        self.migrated()
+        box = self.a
+        before = box.secret()
+        applies = len(box.apply_calls())
+        shutil.rmtree(box.repo)  # the links dangle
+        ended = box.run("end", script=self.as_darwin(box))
+        self.assertEqual(ended.returncode, 0, ended.stderr)
+        self.assertEqual(len(box.apply_calls()), applies)
+        self.assertEqual(box.secret(), before)
+        self.assertIn("end: checkout unusable on a migrated Mac; not publishing", Path(box.env["CLAUDE_MEMORY_LOG"]).read_text())
+
+    def test_publish_refuses_an_empty_archive_over_existing_notes(self):
+        self.migrated()
+        box = self.a
+        before = box.secret()
+        applies = len(box.apply_calls())
+        shutil.rmtree(box.repo / KEY)
+        subprocess.run(["git", "-C", str(box.repo), "rm", "-rq", "--", KEY], check=True, capture_output=True)
+        self.assertNotEqual(box.run("push").returncode, 0)
+        self.assertEqual(len(box.apply_calls()), applies)
+        self.assertEqual(box.secret(), before)
+        self.assertIn("refused: the archive has no notes", Path(box.env["CLAUDE_MEMORY_LOG"]).read_text())
+
     def test_unmigrated_linux_with_repo_set_pulls_at_start_and_does_nothing_at_end(self):
         box = self.a
         box.project(box.slug, box.app, {"MEMORY.md": "- native\n"})

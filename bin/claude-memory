@@ -8,7 +8,7 @@
   claude-memory migrate [--from <backup>]  Mac, by hand: import the project memory folders (or a memory-backup folder) into the checkout and link them
   claude-memory hooks --git|--cloud  register start/end (--mac is an alias of --git) or the cloud's SessionStart pull
 
-Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. On a Mac without a usable checkout, start prints nothing and end keeps publishing the project folders (push), whether or not "repo" is set, until migrate runs; elsewhere start falls back to pull and end does nothing. migrate --from and the folder adoption never replace a note: MEMORY.md gains the source's missing lines, and any other differing note keeps the checkout's version with the source's saved as <name>.conflict-<host>-<ts>.md and a pointer in MEMORY.md (mtimes decide nothing). start never imports notes: a folder that is not the expected link is moved to <config>/memory-backup/ and linked afresh (the memory folders sit in a home directory other processes can write, the checkout only trusted sessions), and only a person's migrate [--from <backup>] imports notes. end stages only regular files inside the checkout and refuses any symlink there. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
+Memories are keyed by host/owner/repo from each project's git remote, because checkout paths never match between machines. A private git repo, named by "repo" in ~/.claude/memory-sync.json, is the shared store, laid out as <host>/<owner>/<repo>/<note>.md. Its presence turns on git mode: the Mac and trusted dev-box sessions read and write the checkout ("checkout", default ~/.claude/memory-repo), and each project's <config>/projects/<slug>/memory folder becomes a symlink to <checkout>/<key>. MEMORY.md merges as a union (.gitattributes); when another note conflicts in end's rebase, this machine's version keeps the path, the upstream one is saved as <name>.conflict-<host>-<ts>.md and MEMORY.md points at it. On a Mac without a usable checkout, start prints nothing and end keeps publishing the project folders (push) unless it has migrated, whether or not "repo" is set, until migrate runs; elsewhere start falls back to pull and end does nothing. migrate --from and the folder adoption never replace a note: MEMORY.md gains the source's missing lines, and any other differing note keeps the checkout's version with the source's saved as <name>.conflict-<host>-<ts>.md and a pointer in MEMORY.md (mtimes decide nothing). start never imports notes: a folder that is not the expected link is moved to <config>/memory-backup/ and linked afresh (the memory folders sit in a home directory other processes can write, the checkout only trusted sessions), and only a person's migrate [--from <backup>] imports notes. end stages only regular files inside the checkout and refuses any symlink there. Never mid-rebase: an unexpected git failure aborts the rebase, keeps the local commit and is logged for the next end to retry.
 
 Cloud sessions cannot reach git, so every git writer also refreshes a snapshot in Kubernetes Secrets, which they reach through an agent proxy that injects the cluster credential. A Secret holds at most 1 MiB, so the archive is split over claude-memory (the index, written last) and claude-memory-1 to claude-memory-7, which is the fixed set of names the cluster grants read on. ~/.claude/memory-sync.json names the cluster on each machine: {"namespace": ..., "context": ..., "kubeconfig": ..., "repo": ..., "checkout": ...}, with only namespace required. A glob in ~/.claude/memory-sync.exclude matching host/owner/repo keeps that repo's folder out of the checkout, and one matching host/owner/repo/note.md keeps that note on this machine (listed in <checkout>/.git/info/exclude, so never committed or archived); migrate and the Mac's non-git push refuse to run until that file exists, even empty. Every sync result goes to CLAUDE_MEMORY_LOG, never file contents.
 """
@@ -310,6 +310,9 @@ def publish(files, repos, skipped_note=""):
         if current and current["metadata"].get("annotations", {}).get(HASH_ANNOTATION) == digest:
             log(f"unchanged ({len(repos)} repo(s)){skipped_note}")
             return 0
+        if not files and current:
+            log("refused: the archive has no notes but the Secrets hold some; not overwriting them")
+            return 1
         pushed_at = utc_now()
         chunks = [archive[i : i + CHUNK_BYTES] for i in range(0, len(archive), CHUNK_BYTES)] or [b""]
         if len(chunks) > 1:
@@ -1059,6 +1062,10 @@ def end():
     if checkout is not None:
         return end_git(checkout)
     if platform.system() == "Darwin":
+        if any(p.is_symlink() for p in (CONFIG / "projects").glob("*/memory")):
+            # Migrated: the folders are links into a checkout that is briefly unusable, and collect() would publish nothing or only this Mac's repos.
+            log("end: checkout unusable on a migrated Mac; not publishing")
+            return 0
         return push()  # a Mac without a usable checkout (not yet migrated, "repo" set or not) keeps publishing its project folders
     return 0
 
