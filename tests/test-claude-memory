@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.dont_write_bytecode = True  # loading bin/claude-memory as a module would litter bin/
@@ -122,6 +123,7 @@ class Sandbox:
         return json.loads((self.state / f"{name}.json").read_text())
 
     def write_secret(self, secret):
+        self.state.mkdir(parents=True, exist_ok=True)
         (self.state / f"{secret['metadata']['name']}.json").write_text(json.dumps(secret))
 
     def secret_names(self):
@@ -454,10 +456,393 @@ class Hooks(unittest.TestCase):
         self.assertEqual(self.commands("SessionStart"), ["echo other", "~/.claude/bin/claude-memory pull"])
         self.assertNotIn("SessionEnd", settings["hooks"])
 
-    def test_mac_registers_push_once(self):
-        for _ in range(2):
-            self.assertEqual(self.box.run("hooks", "--mac").returncode, 0)
-        self.assertEqual(self.commands("SessionEnd"), ["~/.claude/bin/claude-memory push --background"])
+    def test_git_replaces_older_hooks_and_mac_is_an_alias(self):
+        old = {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "~/.claude/bin/claude-memory pull", "timeout": 15}, {"type": "command", "command": "echo other"}]}],
+            "SessionEnd": [{"hooks": [{"type": "command", "command": "~/.claude/bin/claude-memory push --background"}]}],
+        }
+        results = []
+        for flag in ("--git", "--mac"):
+            self.settings.write_text(json.dumps({"hooks": old}))
+            for _ in range(2):
+                self.assertEqual(self.box.run("hooks", flag).returncode, 0)
+            results.append(self.settings.read_text())
+            self.assertEqual(self.commands("SessionStart"), ["echo other", "~/.claude/bin/claude-memory start"])
+            self.assertEqual(self.commands("SessionEnd"), ["~/.claude/bin/claude-memory end --background"])
+            start = [h for g in json.loads(self.settings.read_text())["hooks"]["SessionStart"] for h in g["hooks"] if h["command"].endswith("start")][0]
+            self.assertEqual(start["timeout"], 15)
+        self.assertEqual(results[0], results[1])
+
+
+def git(path, *args, check=True):
+    env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+    result = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, env=env)
+    if check and result.returncode != 0:
+        raise AssertionError(f"git {args}: {result.stderr}")
+    return result.stdout.strip()
+
+
+KEY = "github.com/acme/app"
+
+
+class GitMode(unittest.TestCase):
+    """Two machines (sandboxes) sharing one local bare repo."""
+
+    def setUp(self):
+        self.boxes = []
+        self.bare = None
+        a = self.machine()
+        self.bare = a.root / "remote.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "master", str(self.bare)], check=True)
+        self.a = a
+        self.configure(a)
+
+    def tearDown(self):
+        for box in self.boxes:
+            for path in [box.config / "memory-repo"]:
+                if path.exists():
+                    path.chmod(0o755)
+            box.close()
+
+    def machine(self):
+        box = Sandbox()
+        self.boxes.append(box)
+        box.app = box.checkout("app", "git@github.com:acme/app.git")
+        box.env["CLAUDE_PROJECT_DIR"] = str(box.app)
+        box.env["GIT_CONFIG_GLOBAL"] = "/dev/null"  # no identity: the tool supplies its own
+        box.env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+        box.slug = re.sub(r"[^A-Za-z0-9]", "-", str(box.app))
+        box.memory = box.config / "projects" / box.slug / "memory"
+        box.repo = box.config / "memory-repo"
+        return box
+
+    def configure(self, box):
+        config = json.loads((box.config / "memory-sync.json").read_text())
+        config["repo"] = str(self.bare)
+        (box.config / "memory-sync.json").write_text(json.dumps(config))
+
+    def second(self):
+        box = self.machine()
+        self.configure(box)
+        subprocess.run(["git", "clone", "-q", str(self.bare), str(box.repo)], check=True, capture_output=True)
+        return box
+
+    def migrated(self, notes=None):
+        """Machine A with the app's notes migrated into an empty bare repo."""
+        box = self.a
+        box.project(box.slug, box.app, notes or {"MEMORY.md": "- [base](base.md) - first\n", "base.md": "base\n"})
+        result = box.run("migrate")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        return result
+
+    def commits(self, box):
+        return int(git(box.repo, "rev-list", "--count", "HEAD"))
+
+    def remote_file(self, path):
+        return git(self.bare, "show", f"master:{path}")
+
+    # -- migrate
+
+    def test_migrate_into_an_empty_remote_links_every_folder_and_is_repeatable(self):
+        box = self.a
+        box.project(box.slug, box.app, {"MEMORY.md": "- index\n", "topic.md": "t\n"})
+        other = box.checkout("other", "https://github.com/acme/other")
+        box.project("-other", other, {"MEMORY.md": "other\n"})
+        empty = box.checkout("empty", "https://github.com/acme/empty")
+        box.project("-empty", empty, {})
+
+        result = box.run("migrate")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(git(self.bare, "rev-parse", "--abbrev-ref", "HEAD"), "master")
+        self.assertEqual(self.remote_file(f"{KEY}/topic.md"), "t")
+        self.assertIn("*/*/*/MEMORY.md merge=union", self.remote_file(".gitattributes"))
+        for name, key in [(box.slug, KEY), ("-other", "github.com/acme/other"), ("-empty", "github.com/acme/empty")]:
+            memory = box.config / "projects" / name / "memory"
+            self.assertTrue(memory.is_symlink(), name)
+            self.assertEqual(os.path.realpath(memory), os.path.realpath(box.repo / key))
+        self.assertEqual(len(list((box.config / "memory-backup").iterdir())), 2)
+        self.assertIn("folders linked: 3", result.stdout)
+        self.assertIn("claude-memory start", (box.config / "settings.json").read_text())
+        files, _ = load_module().read_archive(box.archive())
+        self.assertEqual(sorted(files), [f"{KEY}/MEMORY.md", f"{KEY}/topic.md", "github.com/acme/other/MEMORY.md"])
+
+        head, applies = git(box.repo, "rev-parse", "HEAD"), len(box.apply_calls())
+        backups = sorted(p.name for p in (box.config / "memory-backup").iterdir())
+        again = box.run("migrate")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(git(box.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(len(box.apply_calls()), applies)
+        self.assertEqual(sorted(p.name for p in (box.config / "memory-backup").iterdir()), backups)
+        self.assertIn("folders linked: 0", again.stdout)
+
+    def test_migrate_stops_for_a_folder_with_a_note_newer_than_the_commit(self):
+        box = self.a
+        seed = box.root / "seed"
+        subprocess.run(["git", "clone", "-q", str(self.bare), str(seed)], check=True, capture_output=True)
+        (seed / KEY).mkdir(parents=True)
+        (seed / KEY / "topic.md").write_text("committed\n")
+        git(seed, "add", "-A")
+        git(seed, "-c", "user.name=s", "-c", "user.email=s@s", "commit", "-q", "-m", "seed")
+        git(seed, "push", "-q", "origin", "HEAD:master")
+        project = box.project(box.slug, box.app, {"topic.md": "edited since\n"})
+        future = time.time() + 3600
+        os.utime(project / "memory" / "topic.md", (future, future))
+        other = box.checkout("other", "https://github.com/acme/other")
+        box.project("-other", other, {"MEMORY.md": "other\n"})
+
+        result = box.run("migrate")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((project / "memory").is_symlink())
+        self.assertEqual((project / "memory" / "topic.md").read_text(), "edited since\n")
+        self.assertIn("topic.md is newer than the committed copy", result.stdout)
+        self.assertTrue((box.config / "projects" / "-other" / "memory").is_symlink())
+
+    def test_migrate_refuses_without_repo_or_exclude_file(self):
+        box = self.a
+        (box.config / "memory-sync.exclude").unlink()
+        self.assertEqual(box.run("migrate").returncode, 1)
+        (box.config / "memory-sync.exclude").write_text("")
+        config = json.loads((box.config / "memory-sync.json").read_text())
+        del config["repo"]
+        (box.config / "memory-sync.json").write_text(json.dumps(config))
+        self.assertEqual(box.run("migrate").returncode, 1)
+
+    # -- start
+
+    def test_start_links_a_missing_folder_and_leaves_an_existing_link_alone(self):
+        self.migrated()
+        b = self.second()
+        result = b.run("start")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"^Memory: git sync, pulled [0-9a-f]{7,}\n$")
+        self.assertTrue(b.memory.is_symlink())
+        self.assertEqual((b.memory / "base.md").read_text(), "base\n")
+        link = os.readlink(b.memory)
+        commits = self.commits(b)
+        self.assertEqual(b.run("start").returncode, 0)
+        self.assertEqual(os.readlink(b.memory), link)
+        self.assertEqual(self.commits(b), commits)
+        self.assertFalse((b.config / "memory-backup").exists())
+
+    def test_start_adopts_a_real_folder_with_notes_and_keeps_a_backup(self):
+        self.migrated()
+        b = self.second()
+        b.project(b.slug, b.app, {"MEMORY.md": "- local\n", "mine.md": "mine\n", "base.md": "stale\n"})
+        past = time.time() - 3600
+        os.utime(b.memory / "base.md", (past, past))
+
+        result = b.run("start")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(b.memory.is_symlink())
+        self.assertEqual((b.repo / KEY / "mine.md").read_text(), "mine\n")
+        self.assertEqual((b.repo / KEY / "base.md").read_text(), "base\n")  # the checkout's copy was newer
+        backups = list((b.config / "memory-backup").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(backups[0].name.startswith(b.slug + "-"))
+        self.assertEqual((backups[0] / "base.md").read_text(), "stale\n")
+        self.assertIn("mine.md", git(b.repo, "show", "--stat", "HEAD"))
+
+    def test_start_in_a_worktree_links_the_main_checkouts_folder(self):
+        self.migrated()
+        b = self.second()
+        subprocess.run(["git", "-C", str(b.app), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        worktree = b.root / "wt"
+        subprocess.run(["git", "-C", str(b.app), "worktree", "add", "-q", str(worktree)], check=True, capture_output=True)
+        result = b.run("start", extra_env={"CLAUDE_PROJECT_DIR": str(worktree)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(b.memory.is_symlink())
+        self.assertFalse((b.config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(worktree))).exists())
+
+    def test_start_with_an_unreadable_checkout_matches_pull(self):
+        self.migrated()
+        b = self.second()
+        cloud = b.checkout("cloud-app", "https://github.com/acme/app")
+        env = {"CLAUDE_PROJECT_DIR": str(cloud)}
+        b.write_secret(self.a.secret())
+        pulled = b.run("pull", extra_env=env)
+        b.repo.chmod(0)
+        started = b.run("start", extra_env=env)
+        self.assertEqual(started.returncode, 0)
+        self.assertEqual(started.stdout, pulled.stdout)
+        self.assertIn("## Mac memory snapshot", started.stdout)
+
+    def test_start_without_a_repo_key_or_checkout_is_pull(self):
+        self.migrated()
+        b = self.machine()  # no repo key
+        b.write_secret(self.a.secret())
+        cloud = b.checkout("cloud-app", "https://github.com/acme/app")
+        env = {"CLAUDE_PROJECT_DIR": str(cloud)}
+        self.assertEqual(b.run("start", extra_env=env).stdout, b.run("pull", extra_env=env).stdout)
+        self.configure(b)  # a repo key but no checkout
+        self.assertIn("## Mac memory snapshot", b.run("start", extra_env=env).stdout)
+
+    def test_start_reports_a_failed_pull_and_still_exits_zero(self):
+        self.migrated()
+        b = self.second()
+        shutil.rmtree(self.bare)
+        result = b.run("start")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("pull failed:", result.stdout)
+        self.assertIn("using the local checkout", result.stdout)
+        self.assertTrue(b.memory.is_symlink())
+
+    # -- excludes
+
+    def test_repo_level_exclude_leaves_the_folder_alone(self):
+        self.migrated()
+        b = self.second()
+        (b.config / "memory-sync.exclude").write_text("github.com/acme/*\n")
+        b.project(b.slug, b.app, {"MEMORY.md": "private\n"})
+        self.assertEqual(b.run("start").returncode, 0)
+        self.assertFalse(b.memory.is_symlink())
+        self.assertEqual((b.memory / "MEMORY.md").read_text(), "private\n")
+        self.assertFalse((b.config / "memory-backup").exists())
+
+    def test_note_level_exclude_is_never_committed_or_archived(self):
+        box = self.a
+        box.project(box.slug, box.app, {"MEMORY.md": "idx\n", "client-a.md": "private\n", "tools.md": "shared\n"})
+        (box.config / "memory-sync.exclude").write_text(f"{KEY}/client-*\n")
+        self.assertEqual(box.run("migrate").returncode, 0)
+        self.assertEqual((box.memory / "client-a.md").read_text(), "private\n")  # still readable through the link
+        (box.memory / "client-b.md").write_text("later\n")
+        self.assertEqual(box.run("end").returncode, 0)
+        self.assertEqual(git(box.repo, "ls-files"), f".gitattributes\n{KEY}/MEMORY.md\n{KEY}/tools.md")
+        self.assertIn(f"{KEY}/client-b.md", (box.repo / ".git" / "info" / "exclude").read_text())
+        files, _ = load_module().read_archive(box.archive())
+        self.assertEqual(sorted(files), [f"{KEY}/MEMORY.md", f"{KEY}/tools.md"])
+        self.assertEqual(git(self.bare, "ls-tree", "-r", "--name-only", "master"), f".gitattributes\n{KEY}/MEMORY.md\n{KEY}/tools.md")
+
+    def test_secrets_refresh_uses_tracked_files_only(self):
+        self.migrated()
+        (self.a.repo / KEY / "untracked.md").write_text("never committed\n")
+        self.assertEqual(self.a.run("push").returncode, 0)
+        files, manifest = load_module().read_archive(self.a.archive())
+        self.assertEqual(sorted(files), [f"{KEY}/MEMORY.md", f"{KEY}/base.md"])
+        self.assertEqual(manifest["repos"], [KEY])
+
+    # -- end
+
+    def test_end_with_nothing_changed_makes_no_commit_and_no_secrets_write(self):
+        self.migrated()
+        commits, applies = self.commits(self.a), len(self.a.apply_calls())
+        result = self.a.run("end")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.commits(self.a), commits)
+        self.assertEqual(len(self.a.apply_calls()), applies)
+        self.assertIn("unchanged", (self.a.root / "push.log").read_text())
+
+    def test_end_commits_pushes_and_refreshes_the_secrets(self):
+        self.migrated()
+        (self.a.memory / "new.md").write_text("new\n")
+        self.assertEqual(self.a.run("end").returncode, 0)
+        self.assertEqual(self.remote_file(f"{KEY}/new.md"), "new")
+        self.assertRegex(git(self.bare, "log", "-1", "--format=%s", "master"), r"^memory: .+ \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        files, _ = load_module().read_archive(self.a.archive())
+        self.assertIn(f"{KEY}/new.md", files)
+
+    def test_end_background_returns_at_once_and_finishes(self):
+        self.migrated()
+        (self.a.memory / "bg.md").write_text("bg\n")
+        self.assertEqual(self.a.run("end", "--background").returncode, 0)
+        for _ in range(100):
+            if "bg.md" in git(self.bare, "ls-tree", "-r", "--name-only", "master"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.remote_file(f"{KEY}/bg.md"), "bg")
+
+    def test_end_outside_git_mode_does_nothing(self):
+        b = self.machine()
+        b.project(b.slug, b.app, {"MEMORY.md": "x\n"})
+        self.assertEqual(b.run("end").returncode, 0)
+        self.assertEqual(b.apply_calls(), [])
+
+    def test_memory_index_lines_from_two_machines_both_survive(self):
+        self.migrated()
+        b = self.second()
+        self.assertEqual(b.run("start").returncode, 0)
+        with open(self.a.memory / "MEMORY.md", "a") as f:
+            f.write("- [from a](a.md) - a\n")
+        with open(b.memory / "MEMORY.md", "a") as f:
+            f.write("- [from b](b.md) - b\n")
+        self.assertEqual(self.a.run("end").returncode, 0)
+        self.assertEqual(b.run("end").returncode, 0)
+        merged = self.remote_file(f"{KEY}/MEMORY.md")
+        self.assertIn("from a", merged)
+        self.assertIn("from b", merged)
+        self.assertIn("base", merged)
+        self.assertFalse(list((b.repo / KEY).glob("*conflict*")))
+
+    def test_conflicting_topic_keeps_local_writes_conflict_file_and_points_to_it(self):
+        self.migrated()
+        b = self.second()
+        self.assertEqual(b.run("start").returncode, 0)
+        (self.a.memory / "base.md").write_text("from a\n")
+        (b.memory / "base.md").write_text("from b\n")
+        self.assertEqual(self.a.run("end").returncode, 0)
+        result = b.run("end")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.assertEqual((b.repo / KEY / "base.md").read_text(), "from b\n")
+        conflicts = sorted((b.repo / KEY).glob("base.conflict-*.md"))
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].read_text(), "from a\n")
+        self.assertIn(conflicts[0].name, (b.repo / KEY / "MEMORY.md").read_text())
+        self.assertFalse((b.repo / ".git" / "rebase-merge").exists())
+        self.assertFalse((b.repo / ".git" / "rebase-apply").exists())
+        self.assertEqual(git(b.repo, "status", "--porcelain"), "")
+        self.assertEqual(self.remote_file(f"{KEY}/base.md"), "from b")
+        self.assertEqual(self.remote_file(f"{KEY}/{conflicts[0].name}"), "from a")
+        self.assertIn("conflict", (b.root / "push.log").read_text())
+        self.assertNotIn("from a", (b.root / "push.log").read_text())
+
+    def test_unexpected_git_failure_aborts_the_rebase_and_keeps_the_local_commit(self):
+        self.migrated()
+        b = self.second()
+        self.assertEqual(b.run("start").returncode, 0)
+        (b.memory / "keep.md").write_text("keep\n")
+        shutil.rmtree(self.bare)
+        result = b.run("end")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse((b.repo / ".git" / "rebase-merge").exists())
+        self.assertIn("keep.md", git(b.repo, "show", "--stat", "HEAD"))
+        self.assertIn("end failed", (b.root / "push.log").read_text())
+
+    def test_push_that_loses_a_race_succeeds_on_the_retry(self):
+        self.migrated()
+        b = self.second()
+        self.assertEqual(b.run("start").returncode, 0)
+        (b.memory / "mine.md").write_text("mine\n")
+        rival = self.root_clone()
+        calls = {"fetch": 0}
+        with unittest.mock.patch.dict(os.environ, b.env):
+            module = load_module()
+        original = module.git
+
+        def racing(checkout, *args, **kwargs):
+            result = original(checkout, *args, **kwargs)
+            if args[0] == "fetch":
+                calls["fetch"] += 1
+                if calls["fetch"] == 1:
+                    (rival / KEY / "rival.md").write_text("rival\n")
+                    git(rival, "add", "-A")
+                    git(rival, "-c", "user.name=r", "-c", "user.email=r@r", "commit", "-q", "-m", "rival")
+                    git(rival, "push", "-q", "origin", "HEAD:master")
+            return result
+
+        module.git = racing
+        with unittest.mock.patch.dict(os.environ, b.env):
+            self.assertEqual(module.end(), 0)
+        self.assertEqual(calls["fetch"], 2)
+        self.assertEqual(self.remote_file(f"{KEY}/mine.md"), "mine")
+        self.assertEqual(self.remote_file(f"{KEY}/rival.md"), "rival")
+
+    def root_clone(self):
+        path = self.a.root / "rival"
+        subprocess.run(["git", "clone", "-q", str(self.bare), str(path)], check=True, capture_output=True)
+        return path
 
 
 if __name__ == "__main__":

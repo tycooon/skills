@@ -6,6 +6,17 @@ Run `bin/setup` to copy the skills and shared references into the Claude, Codex,
 
 Setup installs executable copies in `~/.claude/bin`: `claude-memory`, `wait-pr-ready`, `gh-review-thread`, `agent-watch` and `review-scan`.
 
+## claude-memory
+
+`claude-memory` shares Claude Code's auto-memories between the Mac, trusted dev-box sessions and cloud sessions. Memories are keyed by `host/owner/repo` from each project's git remote.
+
+- **Git mode** is on when `~/.claude/memory-sync.json` has `"repo"` (a private git repo; `"checkout"` optionally sets the local path, default `~/.claude/memory-repo`). Each project's `projects/<slug>/memory` folder becomes a symlink to `<checkout>/<host>/<owner>/<repo>`. `start` (SessionStart) pulls with a rebase, links the folder and prints one status line; `end` (SessionEnd, `--background` detaches) commits, rebases, pushes and refreshes the Secrets snapshot. `MEMORY.md` merges as a union; any other conflict keeps this machine's version, saves upstream's as `<name>.conflict-<host>-<ts>.md` and adds a pointer line to `MEMORY.md`. Without a usable checkout, `start` behaves like `pull`.
+- **Cloud sessions** cannot reach git and read a read-only snapshot in Kubernetes Secrets (`claude-memory`, `-1` to `-7`) with `pull`. Every git writer refreshes it from the tracked files only; `push` does that on its own.
+- **`migrate`** runs once on the Mac: it clones the repo, commits every note, links each project folder (moving the old one to `<config>/memory-backup/`), registers the hooks and refreshes the snapshot. It is safe to run again.
+- **Exclusions**: a glob in `~/.claude/memory-sync.exclude` matching `host/owner/repo` leaves that repo's folder alone; one matching `host/owner/repo/note.md` keeps that note on this machine (listed in `<checkout>/.git/info/exclude`, never committed or archived).
+- **Hooks**: `claude-memory hooks --git` (alias `--mac`) registers `start` and `end --background` and removes older `claude-memory` entries; `--cloud` registers the SessionStart `pull`. `bin/setup` runs `hooks --git` on a Mac and `hooks --cloud` with `--cloud`.
+- **Log**: `CLAUDE_MEMORY_LOG`, default `~/Library/Logs/claude-memory.log` on macOS and `~/.local/state/claude-memory.log` elsewhere. It records every sync result and conflict, never note contents.
+
 `gh-review-thread` exposes only two GitHub review-thread writes:
 
 ```text
