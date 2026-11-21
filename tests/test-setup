@@ -6,6 +6,19 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+check_tools() {
+  local label="$1" tool p mode
+  for tool in wait-pr-ready gh-review-thread review-scan agent-watch; do
+    p="$HOME/.claude/bin/$tool"
+    [ -f "$p" ] && [ ! -L "$p" ] || fail "$label: $tool not installed as a regular file"
+    mode="$(stat -c %a "$p" 2>/dev/null || stat -f %Lp "$p")"
+    [ "$mode" = 755 ] || fail "$label: $tool mode is $mode, want 755"
+  done
+  [ ! -e "$HOME/.claude/bin/claude-memory" ] || fail "$label: setup installed claude-memory"
+  [ ! -e "$HOME/.claude/settings.json" ] || fail "$label: setup registered hooks in settings.json"
+  [ ! -e "$HOME/.claude/skills/references" ] || fail "$label: setup wrote references/"
+}
+
 export HOME="$tmp/home"; mkdir -p "$HOME"
 "$root/bin/setup" >/dev/null
 for skill in "$root"/*/SKILL.md; do
@@ -14,13 +27,12 @@ for skill in "$root"/*/SKILL.md; do
     [ -f "$HOME/$rt/skills/$name/SKILL.md" ] || fail "$name not synced into $rt"
   done
 done
-[ ! -e "$HOME/.claude/bin" ] || fail "setup wrote ~/.claude/bin"
-[ ! -e "$HOME/.claude/skills/references" ] || fail "setup wrote references/"
+check_tools "default"
 
 export HOME="$tmp/home2"; mkdir -p "$HOME"
 "$root/bin/setup" --cloud >/dev/null || fail "--cloud rejected"
 [ -f "$HOME/.claude/skills/rfc/SKILL.md" ] || fail "--cloud did not sync skills"
-[ ! -e "$HOME/.claude/bin" ] || fail "--cloud wrote ~/.claude/bin"
+check_tools "--cloud"
 
 rc=0; "$root/bin/setup" --bogus >/dev/null 2>&1 || rc=$?
 [ "$rc" = 2 ] || fail "bad flag exited $rc, want 2"

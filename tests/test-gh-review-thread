@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Run: tests/test-gh-review-thread"""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "bin/gh-review-thread"
+THREAD = "PRRT_kwDOExample123"
+MARKER = "<!-- posted-by-agent -->"
+STUB = '''#!/usr/bin/env python3
+import json, os, sys
+request = json.load(sys.stdin)
+with open(os.environ["CALLS"], "a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], **request}) + "\\n")
+if os.environ.get("FAIL") == "all" or (os.environ.get("FAIL") == "mutation" and "mutation" in request["query"]):
+    print("API unavailable", file=sys.stderr)
+    sys.exit(1)
+if "RAW_RESPONSE" in os.environ:
+    print(os.environ["RAW_RESPONSE"])
+elif os.environ.get("ERRORS"):
+    print(json.dumps({"errors": [{"message": "GraphQL rejected request"}]}))
+elif "mutation" not in request["query"]:
+    print(json.dumps({"data": {"node": {"pullRequest": {"repository": {"owner": {"login": os.environ.get("OWNER", "acme")}}}}}}))
+elif "addPullRequestReviewThreadReply" in request["query"]:
+    print(json.dumps({"data": {"addPullRequestReviewThreadReply": {"comment": {"id": "PRRC_example"}}}}))
+else:
+    print(json.dumps({"data": {"resolveReviewThread": {"thread": {"id": request["variables"]["thread"], "isResolved": True}}}}))
+'''
+
+
+class Tool(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.owners = self.home / ".config/gh-review-thread/owners"
+        self.owners.parent.mkdir(parents=True)
+        self.owners.write_text("acme\n")
+        self.body = self.home / "body"
+        self.body.write_text("Fixed it.")
+        self.calls = self.home / "calls"
+        stub = self.home / "gh"
+        stub.write_text(STUB)
+        stub.chmod(0o755)
+        self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.home) + os.pathsep + os.environ["PATH"], CALLS=str(self.calls))
+
+    def run_tool(self, *args):
+        return subprocess.run([str(SCRIPT), *args], env=self.env, text=True, capture_output=True)
+
+    def requests(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()] if self.calls.exists() else []
+
+    def test_reply(self):
+        result = self.run_tool("reply", THREAD, str(self.body))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "PRRC_example\n")
+        query, mutation = self.requests()
+        self.assertIn("node(id:", query["query"])
+        self.assertIn("owner", query["query"])
+        self.assertIn("addPullRequestReviewThreadReply", mutation["query"])
+        self.assertEqual(mutation["variables"], {"thread": THREAD, "body": "Fixed it.\n" + MARKER})
+        self.assertEqual(mutation["argv"], ["api", "graphql", "--hostname", "github.com", "--input", "-"])
+
+    def test_marker_once_and_literal_body(self):
+        body = 'Quotes " \\ `command` $(command)\n' + MARKER + '\n'
+        self.body.write_text(body)
+        result = self.run_tool("reply", THREAD, str(self.body))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.requests()[-1]["variables"]["body"], body)
+
+    def test_resolve(self):
+        result = self.run_tool("resolve", THREAD)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "resolved\n")
+        self.assertIn("resolveReviewThread", self.requests()[-1]["query"])
+        self.assertEqual(self.requests()[-1]["variables"], {"thread": THREAD})
+
+    def test_refused_owners(self):
+        for content in (None, "", "other-owner\n"):
+            with self.subTest(content=content):
+                if content is None:
+                    self.owners.unlink()
+                else:
+                    self.owners.write_text(content)
+                for args in (("resolve", THREAD), ("reply", THREAD, str(self.body))):
+                    result = self.run_tool(*args)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertIn(str(self.owners), result.stderr)
+        self.assertTrue(all("mutation" not in r["query"] for r in self.requests()))
+
+    def test_invalid_usage_never_calls_api(self):
+        for args in ((), ("delete", THREAD), ("resolve", "PRRT_"), ("resolve", "PRRT_bad/extra"), ("resolve", "--help"), ("resolve", THREAD, "extra"), ("reply", THREAD, str(self.home)), ("reply", THREAD, str(self.home / "missing"))):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_tool(*args).returncode, 2)
+        for body in ("", " \n\t"):
+            self.body.write_text(body)
+            self.assertEqual(self.run_tool("reply", THREAD, str(self.body)).returncode, 2)
+        self.assertEqual(self.requests(), [])
+
+    def test_api_errors(self):
+        for setting, value, message in (("FAIL", "all", "API unavailable"), ("FAIL", "mutation", "API unavailable"), ("ERRORS", "1", "GraphQL rejected request")):
+            with self.subTest(setting=setting, value=value):
+                self.env[setting] = value
+                result = self.run_tool("resolve", THREAD)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(result.stdout, "")
+                del self.env[setting]
+
+    def test_owner_lookup_fails_closed(self):
+        for response in ('not JSON', 'null', '{"data":{"node":null}}', '{"data":{"node":{}}}'):
+            with self.subTest(response=response):
+                self.env["RAW_RESPONSE"] = response
+                result = self.run_tool("resolve", THREAD)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertEqual(result.stdout, "")
+        self.assertTrue(all("mutation" not in r["query"] for r in self.requests()))
+
+    def test_owner_matching_ignores_case(self):
+        self.owners.write_text("  ACME  \n\n")
+        self.assertEqual(self.run_tool("resolve", THREAD).returncode, 0)
+
+    def test_reply_api_failure(self):
+        self.env["FAIL"] = "mutation"
+        result = self.run_tool("reply", THREAD, str(self.body))
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("API unavailable", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_reply_preserves_line_endings(self):
+        self.body.write_bytes(b"First line.\r\nSecond line.")
+        result = self.run_tool("reply", THREAD, str(self.body))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.requests()[-1]["variables"]["body"], "First line.\r\nSecond line.\n" + MARKER)
+
+    def test_setup_installs_copy(self):
+        rsync = self.home / "rsync"
+        rsync.write_text('''#!/usr/bin/env python3
+import shutil, sys
+shutil.copytree(sys.argv[-2], sys.argv[-1], dirs_exist_ok=True)
+''')
+        rsync.chmod(0o755)
+        result = subprocess.run([str(ROOT / "bin/setup")], env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for tool in ("wait-pr-ready", "gh-review-thread"):
+            installed = self.home / ".claude/bin" / tool
+            self.assertEqual(installed.read_bytes(), (ROOT / "bin" / tool).read_bytes())
+            self.assertTrue(os.access(installed, os.X_OK))
+
+
+if __name__ == "__main__":
+    unittest.main()
