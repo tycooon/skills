@@ -10,9 +10,9 @@ The shared references, the global agent rules and the remaining helper tools (su
 
 `bin/setup` installs executable copies at mode `0755` in `~/.claude/bin`:
 
-- `wait-pr-ready` — background PR/MR readiness waiter used by `babysit-pr`, `release` and `review-open-prs`.
+- `wait-pr-ready` — background PR/MR readiness waiter used by `babysit-pr`, `release` and the `review-scan` skill.
 - `gh-review-thread` — allowlisted GitHub review-thread reply and resolve helper used by `review-pr`, `babysit-pr` and `address-pr`.
-- `review-scan` — scheduled PR/MR review scanner used by `review-pr`, `review-open-prs`, `babysit-pr` and `address-pr`.
+- `review-scan` — scheduled PR/MR review scanner used by `review-pr`, the `review-scan` skill, `babysit-pr` and `address-pr`.
 - `agent-watch` — shared watch engine loaded by `review-scan` from beside itself (along with `wait-pr-ready`).
 
 ### `gh-review-thread`
