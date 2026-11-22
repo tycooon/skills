@@ -10,6 +10,7 @@
   review-scan settle <watch> <pr-url> --head SHA --since TIME --verdict approved|findings|outside-filter
                      [--covered-by SHA] [--weighed THREAD]... [--recheck PR_URL]...
   review-scan nudge <pr-url> --head SHA
+  review-scan wait <pr-url> --head SHA [--after TIME]
   review-scan list
   review-scan status [<watch>]
   review-scan account <watch> [ACCOUNT ...]
@@ -45,12 +46,19 @@ note the trailing `!`) or an MR URL. A PR named by URL is reviewed even as a dra
 an RFC or dormant, and leaves the watch once merged or closed.
 RFC PRs (title tagged `[RFC]`) are skipped like drafts because the owner reviews them.
 
+`wait` reads one PR until a new head or activity makes a review owed, the PR
+merges or closes, or the wait reaches four hours of quiet. Without `--after`,
+the first successful read supplies the activity mark. It uses the session's
+forge login and needs no watch.
+
 State lives in $REVIEW_SCAN_HOME (default ~/.local/state/review-open-prs)/<watch>/.
 
-Exit codes: 0 success; 2 bad usage; 3 settle refused because the head moved;
+Exit codes: 0 success (wait: review owed); 2 bad usage (wait: also repeated read
+failures); 3 settle refused because the head moved;
 4 settle refused because someone else commented after --since; 5 a target could not
 be read or a run could not start (the tick still handled the others); 6 settle refused
-because the PR does not show the claimed verdict.
+because the PR does not show the claimed verdict; wait: 10 merged, 11 closed,
+13 quiet.
 """
 
 import argparse
@@ -62,6 +70,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -285,6 +294,57 @@ def owed_reason(rec, row, full):
     if listed > settled:
         return f"activity at {row['updated']}"
     return None
+
+
+def cmd_wait(a):
+    if not (GH_PR.fullmatch(a.url) or GL_MR.fullmatch(a.url)):
+        print(f"unsupported: {a.url} is neither a GitHub PR nor a GitLab MR URL", file=sys.stderr)
+        return 2
+
+    waiter = wait_pr_ready()
+    mark = a.after
+    if mark is not None:
+        try:
+            parsed_mark = engine.parse_time(mark).astimezone(dt.timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            print("error: --after must be an ISO 8601 activity mark", file=sys.stderr)
+            return 2
+        if parsed_mark > engine.now_utc() + dt.timedelta(seconds=waiter.AFTER_CLOCK_SKEW):
+            print(f"error: --after is more than {waiter.AFTER_CLOCK_SKEW}s ahead of current UTC time", file=sys.stderr)
+            return 2
+        mark = parsed_mark.isoformat()
+
+    deadline = time.monotonic() + waiter.QUIET_LIMIT
+    failures, step = 0, 0
+    while True:
+        try:
+            row, = list_target(a.url)
+            state, updated = row["state"], row["updated"]
+            if state == "merged":
+                print(f"merged: {a.url}; activity {updated}")
+                return 10
+            if state == "closed":
+                print(f"closed: {a.url}; activity {updated}")
+                return 11
+            record = {"settled": {"head": a.head, "updated": mark if mark is not None else updated}}
+            reason = owed_reason(record, row, full=False)
+        except (engine.ScanError, subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError) as e:
+            failures += 1
+            if failures >= waiter.MAX_FAILED_READS:
+                detail = " ".join(str(e).splitlines())
+                print(f"error: could not read {a.url} {failures} times in a row: {detail}")
+                return 2
+        else:
+            failures = 0
+            mark = record["settled"]["updated"]
+            if reason:
+                print(f"owed: {a.url}: {reason}; activity {updated}")
+                return 0
+            if time.monotonic() >= deadline:
+                print(f"quiet: no change on {a.url} for {waiter.QUIET_LIMIT // 3600}h; activity {updated}")
+                return 13
+        time.sleep(waiter.BACKOFF[min(step, len(waiter.BACKOFF) - 1)])
+        step += 1
 
 
 def posting_variable(r):
@@ -770,6 +830,10 @@ def main(argv=None):
     n = sub.add_parser("nudge")
     n.add_argument("url")
     n.add_argument("--head", required=True)
+    w = sub.add_parser("wait", help="wait for one PR to owe another review")
+    w.add_argument("url")
+    w.add_argument("--head", required=True)
+    w.add_argument("--after", help="ISO 8601 activity mark from a previous exit or PR read")
     sub.add_parser("list")
     mod = sub.add_parser("model", help="show or change the model and effort the watch's runs use")
     mod.add_argument("watch")
@@ -789,7 +853,7 @@ def main(argv=None):
     try:
         return {"init": cmd_init, "tick": engine.cmd_tick, "settle": cmd_settle, "nudge": cmd_nudge, "status": engine.cmd_status, "list": engine.cmd_list, "account": engine.cmd_account, "model": engine.cmd_model,
                 "install": engine.cmd_install, "uninstall": engine.cmd_uninstall,
-                "pause": engine.cmd_pause_resume, "resume": engine.cmd_pause_resume}[a.cmd](a)
+                "pause": engine.cmd_pause_resume, "resume": engine.cmd_pause_resume, "wait": cmd_wait}[a.cmd](a)
     except engine.ScanError as e:
         print(f"error: {e}", file=sys.stderr)
         return 5

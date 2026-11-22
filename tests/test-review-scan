@@ -653,6 +653,95 @@ class NamedPr(Base):
         self.assertIn("nothing left to watch", out)
 
 
+class Wait(unittest.TestCase):
+    def run_wait(self, *reads, after=RECENT, url=PR1):
+        now = rs.parse_time(RECENT)
+        elapsed = 0
+        delays = []
+
+        def sleep(seconds):
+            nonlocal elapsed
+            delays.append(seconds)
+            elapsed += seconds
+
+        argv = ["wait", url, "--head", A]
+        if after is not None:
+            argv += ["--after", after]
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(rs, "list_target", side_effect=reads) as listing, \
+             patch.object(rs.engine, "Watch", side_effect=AssertionError("wait accessed watch state")), \
+             patch.object(rs.engine, "now_utc", return_value=now), \
+             patch.object(rs.time, "monotonic", side_effect=lambda: elapsed), \
+             patch.object(rs.time, "sleep", side_effect=sleep), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = rs.main(argv)
+        self.assertEqual(listing.call_count, len(reads))
+        for call in listing.call_args_list:
+            self.assertEqual(call.args, (url,))
+        return code, (out.getvalue() or err.getvalue()).strip(), delays
+
+    def test_new_head_is_owed(self):
+        code, line, delays = self.run_wait([row(PR1, head=B)])
+        self.assertEqual((code, delays), (0, []))
+        self.assertEqual(line, f"owed: {PR1}: new head {B[:12]} (settled at {A[:12]}); activity {RECENT}")
+
+    def test_activity_after_mark_is_owed(self):
+        updated = "2026-10-23T10:00:01Z"
+        code, line, delays = self.run_wait([row(PR1, updated=updated)])
+        self.assertEqual((code, delays), (0, []))
+        self.assertEqual(line, f"owed: {PR1}: activity at {updated}; activity {updated}")
+
+    def test_older_activity_keeps_waiting_even_with_a_different_head(self):
+        older = "2026-10-23T09:59:59Z"
+        code, _, delays = self.run_wait([row(PR1, head=B, updated=older)], [row(PR1, head=B)])
+        self.assertEqual((code, delays), (0, [60]))
+
+    def test_merged_takes_precedence_over_new_head(self):
+        self.assertEqual(self.run_wait([row(PR1, head=B, state="merged")]),
+                         (10, f"merged: {PR1}; activity {RECENT}", []))
+
+    def test_closed_gitlab_mr(self):
+        mr = "https://gitlab.com/acme/app/-/merge_requests/1"
+        self.assertEqual(self.run_wait([row(mr, state="closed")], url=mr),
+                         (11, f"closed: {mr}; activity {RECENT}", []))
+
+    def test_quiet_cap_and_backoff(self):
+        unchanged = [row(PR1)]
+        code, line, delays = self.run_wait(*([unchanged] * 122))
+        self.assertEqual(code, 13)
+        self.assertEqual(line, f"quiet: no change on {PR1} for 4h; activity {RECENT}")
+        self.assertEqual(delays, [60, 60] + [120] * 119)
+
+    def test_six_failed_reads_give_up(self):
+        code, line, delays = self.run_wait(*([rs.ScanError("unreadable")] * 6))
+        self.assertEqual(code, 2)
+        self.assertEqual(line, f"error: could not read {PR1} 6 times in a row: unreadable")
+        self.assertEqual(delays, [60, 60, 120, 120, 120])
+
+    def test_success_resets_failure_streak(self):
+        failures = [rs.ScanError("unreadable")] * 5
+        code, _, _ = self.run_wait(*failures, [row(PR1)], *failures, [row(PR1, head=B)])
+        self.assertEqual(code, 0)
+
+    def test_without_after_first_successful_read_sets_the_mark(self):
+        first, second = "2026-10-23T09:59:58Z", "2026-10-23T09:59:59Z"
+        code, line, delays = self.run_wait(rs.ScanError("unreadable"), [row(PR1, updated=first)],
+                                          [row(PR1, updated=second)], after=None)
+        self.assertEqual((code, delays), (0, [60, 60]))
+        self.assertTrue(line.endswith(f"activity {second}"))
+
+    def test_after_accepts_sixty_seconds_of_clock_skew(self):
+        mark = "2026-10-23T10:01:00Z"
+        code, _, _ = self.run_wait([row(PR1, head=B, updated=mark)], after=mark)
+        self.assertEqual(code, 0)
+
+    def test_bad_usage_fails_before_reading(self):
+        for after, url in (("2026-10-23T10:01:01Z", PR1), ("invalid", PR1), (RECENT, "acme/app")):
+            with self.subTest(after=after, url=url):
+                code, _, delays = self.run_wait(after=after, url=url)
+                self.assertEqual((code, delays), (2, []))
+
+
 class Spawn(Base):
     def setUp(self):
         super().setUp()

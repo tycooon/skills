@@ -7,6 +7,8 @@ description: "Review and monitor all open PRs/MRs across requested repositories,
 
 Find every open, non-draft, non-RFC pull request (GitHub) or merge request (GitLab) across the requested targets, then review each one and keep watching them. A scheduled scan with no model in it finds the PRs that changed, and each one gets a fresh headless review run of its own (see *Running the watch*).
 
+Use [review-loop](../review-loop/SKILL.md) to keep reviewing one PR in a session, and review-scan for scheduled sweeps.
+
 A target is a single repository, a whole group/org, a single PR, or several of any of these. The ask often mixes them, and often attaches a filter to some of them ("this group, all of it; that repo, only the PRs touching X; and this one PR"). One repository is just the one-target case; when the ask names no target at all, the target is the current repository.
 
 Review the code, not the pipeline — the same scope review-pr sets, and it binds every review run. Don't pull up any PR's check or pipeline status, and never turn a failing, pending, or missing check into a finding, into a reason to withhold approval, or into anything you report. CI is the address-pr skill's business, not the reviewer's.

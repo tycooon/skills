@@ -2,6 +2,8 @@
 
 This repo holds agent skills (one folder per skill, each with a `SKILL.md`) and the four helper tools those skills call.
 
+- [`review-loop`](review-loop/SKILL.md) keeps reviewing one PR or MR in the current session as it changes.
+
 Run `bin/setup` to copy the skills into the Claude, Codex, ZCODE, OpenCode and Gemini skills directories and install executable copies of the four tools in `~/.claude/bin`. `--cloud` is accepted for cloud environments and runs the same install.
 
 The shared references, the global agent rules and the remaining helper tools (such as `claude-memory` and its hooks) live in a separate private repo. Install it alongside this one: the skills link `../references/…`, which that repo mirrors beside the skills in every runtime.
@@ -12,7 +14,7 @@ The shared references, the global agent rules and the remaining helper tools (su
 
 - `wait-pr-ready` — background PR/MR readiness waiter used by `babysit-pr`, `release` and the `review-scan` skill.
 - `gh-review-thread` — allowlisted GitHub review-thread reply and resolve helper used by `review-pr`, `babysit-pr` and `address-pr`.
-- `review-scan` — scheduled PR/MR review scanner used by `review-pr`, the `review-scan` skill, `babysit-pr` and `address-pr`.
+- `review-scan` — scheduled PR/MR review scanner and single-PR waiter used by `review-pr`, the `review-scan` skill, `review-loop`, `babysit-pr` and `address-pr`.
 - `agent-watch` — shared watch engine loaded by `review-scan` from beside itself (along with `wait-pr-ready`).
 
 ### `gh-review-thread`

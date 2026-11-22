@@ -7,6 +7,8 @@ description: "Hosted PR/MR review with posted verdict; exclude local-only diffs.
 
 Do a thorough code review of the provided pull request (GitHub) or merge request (GitLab).
 
+Use the [review-loop skill](../review-loop/SKILL.md) to keep reviewing a PR as it changes.
+
 Review the code, not the pipeline. CI belongs to the address-pr skill — don't pull up the PR's check or pipeline status, and never turn a failing, pending, or missing check into a finding, a line in the review body, or a remark to the user: a red pipeline is not a defect in the diff. It doesn't gate the verdict either — a diff you found nothing wrong with is clean and gets approved, whatever the checks are doing.
 
 ## Look past the diff
