@@ -93,6 +93,8 @@ When an approval of yours covers the head, including under the 30-line rule, res
 
 A PR whose title carries `[RFC]` proposes a design and changes no code; the rfc skill writes them. It asks two things of you: a review of the design, and a position on each of its open questions. It is approved only once no question is left.
 
+Review sweeps skip RFC PRs because the owner reviews and merges them. Review one only when someone names it or asks for it directly, and then follow the rules below.
+
 - **Review the design as you would review code.** Check each claim it makes about today's code against the code, and look for what designs get wrong: a gap, a race, a broken invariant, a rollout hazard, two parts that contradict each other. These are ordinary findings, P0 to P2.
 - **Take a position on every open question** that has no thread of yours yet: one thread per question, anchored on its line in the spec and prefixed with its ID in place of a severity (`[Q3]`, qualified with the doc's name when two docs reuse an ID) and your identity. Agree with the author's recommendation or argue for another option — or, where the RFC recommends none, for the one you would take — with evidence either way; that exchange is what lets the author settle a question without the user. Call a question the owner's only when no evidence either of you can reach would settle it: a priority, an appetite for risk or cost, an irreversible step, a fact outside the repo and its data. Before you do, look for an answer the owner already gave: earlier RFCs' decisions, the docs, TODO, and the PRs that built earlier designs.
 - **A question the RFC missed** gets a thread of its own, prefixed `[new question]`, and the author adds it to the open questions.

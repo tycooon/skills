@@ -91,17 +91,28 @@ def gl_note(nid, user, body, at="2026-10-15T10:00:00Z", system=False, resolvable
             "resolvable": resolvable, "resolved": resolved}
 
 
-def gl_pr(pipeline="success", merge="mergeable", discussions=None, sha=HEAD, pipeline_sha=None, ref="feature", **overrides):
+def gl_pr(pipeline="success", merge="mergeable", discussions=None, sha=HEAD, pipeline_sha=None, ref="feature",
+          human_reviewers=(), **overrides):
     mr = {"state": "opened", "iid": 7, "sha": sha, "target_branch": "master", "updated_at": "2026-10-15T10:00:00Z",
           "detailed_merge_status": merge, "has_conflicts": merge == "conflict",
           "head_pipeline": {"id": 1, "sha": pipeline_sha or sha, "ref": ref, "status": pipeline, "finished_at": "2026-10-15T09:30:00Z"}}
     mr.update(overrides)
     if discussions is None:
         discussions = [{"notes": [gl_note(1, "review-bot", f"**APPROVED** at {HEAD} — AI reviewer: Claude")]}]
-    return w.gl_mr_to_pr(mr, discussions, {"committed_date": "2026-10-15T09:00:00Z"})
+    return w.gl_mr_to_pr(mr, discussions, {"committed_date": "2026-10-15T09:00:00Z"}, human_reviewers)
 
 
 class GitLab(unittest.TestCase):
+    def test_marked_note_cannot_change_a_human_system_approval(self):
+        notes = [
+            gl_note(1, "owner", "approved this merge request", system=True),
+            gl_note(2, "owner", f"APPROVED. AI reviewer: Claude. Reviewed {OLD}.\n{w.AGENT_MARKER}",
+                    at="2026-10-15T11:00:00Z"),
+        ]
+        pr = gl_pr(discussions=[{"notes": notes}], human_reviewers={"owner"})
+        ready, reasons = evaluate(pr, reviewers=["owner"])
+        self.assertTrue(ready, reasons)
+
     def test_a_verdict_note_and_green_pipeline_are_ready(self):
         ready, reasons = evaluate(gl_pr(), reviewers=["review-bot"])
         self.assertTrue(ready, reasons)
@@ -1419,8 +1430,8 @@ class Loop(unittest.TestCase):
         asked = []
         original = w.forge
 
-        def counting(url):
-            host = original(url)
+        def counting(url, human_reviewers=()):
+            host = original(url, human_reviewers)
             host["head_runs"] = lambda sha: (asked.append(sha), run)[1]
             return host
 
@@ -1484,6 +1495,50 @@ class Loop(unittest.TestCase):
         pr = ready_pr(reviews={"totalCount": 0, "nodes": []}, comments={"totalCount": 1, "nodes": [comment("review-bot", verdict)]})
         code, out, _ = self.run_main([pr])
         self.assertEqual(code, 0, out)
+
+    def test_human_reviewer_rejects_marked_approvals_on_both_hosts(self):
+        body = f"APPROVED (formal approval refused: self-approval). AI reviewer: Claude (Opus 5.5). Reviewed {HEAD}.\n{w.AGENT_MARKER}"
+        github_formal = ready_pr(reviews={"nodes": [review("owner", "APPROVED", body)]})
+        github_note = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("owner", body)]})
+        gitlab = gl_pr(discussions=[{"notes": [gl_note(1, "owner", body)]}])
+        for url, pr in ((URL, github_formal), (URL, github_note), (GL_URL, gitlab)):
+            with self.subTest(url=url, reviews=len(pr["reviews"]["nodes"])):
+                code, out, _ = self.run_main([pr, {**pr, "headRefOid": OLD}],
+                                             args=["--human-reviewer", "owner"], url=url)
+                self.assertEqual(code, 12, out)
+
+    def test_human_reviewer_ignores_marked_prose_and_counts_unmarked_lgtm(self):
+        later = "2026-10-15T11:00:00Z"
+        marked_go = comment("owner", f"The AI reviewer approved Q2.\n{w.AGENT_MARKER}", at=later)
+        marked_update = comment("owner", f"I replied to the AI reviewer.\n{w.AGENT_MARKER}", at=later)
+        marked_lgtm = comment("owner", f"LGTM\n{w.AGENT_MARKER}")
+        for comments, expected in (([marked_go], 12), ([marked_lgtm], 12),
+                                   ([comment("owner", "LGTM"), marked_update], 0),
+                                   ([comment("owner", "LGTM")], 0)):
+            with self.subTest(comments=comments):
+                pr = ready_pr(reviews={"nodes": []}, comments={"nodes": comments})
+                code, out, _ = self.run_main([pr, {**pr, "headRefOid": OLD}],
+                                             args=["--human-reviewer", "owner"])
+                self.assertEqual(code, expected, out)
+
+    def test_human_reviewers_can_be_repeated_and_combined_with_ai_reviewers(self):
+        for login, args in (
+            ("owner", ["--human-reviewer", "backup", "--human-reviewer", "Owner"]),
+            ("review-bot", ["--human-reviewer", "owner", "--reviewer", "review-bot"]),
+            ("author", ["--reviewer", "author"]),
+        ):
+            with self.subTest(login=login):
+                body = "" if login == "owner" else f"AI reviewer: Claude. Reviewed {HEAD}.\n{w.AGENT_MARKER}"
+                pr = ready_pr(reviews={"nodes": [review(login, "APPROVED", body)]})
+                code, out, _ = self.run_main([pr], args=args)
+                self.assertEqual(code, 0, out)
+
+    def test_reviewer_login_cannot_be_both_human_and_ai(self):
+        errors = io.StringIO()
+        code, _, _ = self.run_main([], args=["--human-reviewer", "Owner", "--reviewer", "owner[bot]"], stderr=errors)
+        self.assertEqual(code, 2)
+        self.assertIn("owner", errors.getvalue())
+        self.assertIn("--human-reviewer", errors.getvalue())
 
     def test_no_ci_never_reports_a_ci_failure(self):
         red = ready_pr(reviews={"totalCount": 0, "nodes": []})

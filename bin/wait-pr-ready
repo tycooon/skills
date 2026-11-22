@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Wait until a GitHub PR or GitLab MR is ready to merge, then exit with the reason.
 
-  wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]... [--after TIME] [--refused MARK] [--known-conflict]
-  wait-pr-ready <pr-url> --until-review [--head SHA] [--reviewer LOGIN]... [--after TIME]
+  wait-pr-ready <pr-url> [--head SHA] [--no-ci] [--reviewer LOGIN]... [--human-reviewer LOGIN]... [--after TIME] [--refused MARK] [--known-conflict]
+  wait-pr-ready <pr-url> --until-review [--head SHA] [--reviewer LOGIN]... [--human-reviewer LOGIN]... [--after TIME]
 
 Run it as one background shell command: the agent's session resumes when it
 exits. It only detects readiness and never changes the PR. Ready means all four
-of babysit-pr's conditions hold on the same head: the external AI reviewer's
+of babysit-pr's conditions hold on the same head: an eligible reviewer's
 newest verdict approves the head (or covers it by a base-sync, read against the
 base the PR had when the verdict was posted, or by answered or resolved
 non-blocking findings with at most CARRY_LINE_CAP changed lines since approval),
@@ -18,7 +18,7 @@ no review thread blocks (answered non-blocking findings no longer do),
 and the base allows the merge (CLEAN, or UNSTABLE/HAS_HOOKS).
 On either host, a finding is non-blocking when its opening comment's leading
 P2/P3 severity tag carries the "non-blocking" marker and its author and identity qualify under the verdict rules
-(--reviewer, or an AI identity line without it). On GitHub, a thread opened by an
+(a listed reviewer, or an AI identity line when no reviewers are listed). On GitHub, a thread opened by an
 APPROVED review also remains non-blocking for compatibility.
 
 Exit codes:
@@ -74,12 +74,18 @@ Options:
                     accounts' verdicts without a role-qualified identity count.
                     A role such as (Codex handoff) or (session reviewer) is a
                     separate reviewer; a model or version such as (Opus 5.5)
-                    still counts. Without --reviewer, role verdicts count too.
+                    still counts. With neither reviewer flag, role verdicts count too.
                     A role's or another account's identity-line go post alone
                     neither approves nor wakes a readiness wait. An unlisted
                     account's formal approval on the head doesn't approve, but
                     wakes with exit 14, naming the account, since it likely
                     means LOGIN is the wrong one.
+  --human-reviewer LOGIN
+                    a human reviewer's account. Repeatable and combinable
+                    with --reviewer for distinct logins. An unmarked post needs
+                    no identity line. Every post from this login carrying
+                    <!-- posted-by-agent --> is ignored, even if signed or APPROVED.
+                    A login listed with both flags is a usage error.
   --after TIME      report a CI failure only once the PR has activity newer
                     than TIME (ISO 8601): the mark of a failure the last round
                     left as it was. It never holds back a ready: a PR that is
@@ -100,7 +106,7 @@ Options:
                     stay held until something on it moves. Readiness mode only.
   --until-review    don't wait for readiness: exit 14 on an open thread awaiting
                     the author, or the first review, comment or review thread
-                    the first read didn't have. With --reviewer, also as soon as
+                    the first read didn't have. With either reviewer flag, also as soon as
                     a listed reviewer's approval is
                     on the watched head (or still covers it, by base-sync or
                     answered findings with at most CARRY_LINE_CAP changed lines),
@@ -523,7 +529,7 @@ def gl_attribute_approvals(reviews, verdict_notes):
         used_verdicts.add(j)
 
 
-def gl_mr_to_pr(mr, discussions, commit):
+def gl_mr_to_pr(mr, discussions, commit, human_reviewers=()):
     """One GitLab read in the GitHub PR shape: approvals (their system notes carry who and
     when) and APPROVED verdict notes as reviews, other top-level notes as comments,
     resolvable discussions as review threads, the head pipeline as the one status check.
@@ -558,12 +564,16 @@ def gl_mr_to_pr(mr, discussions, commit):
             replies += len(human) - 1
             continue
         for n in human:
-            shas = SHA.findall(n.get("body") or "")
-            if VERDICT_NOTE.match(n.get("body") or "") and shas:
-                reviews.append({"id": f"verdict-{n['id']}", "author": gl_user(n.get("author")), "submittedAt": n["created_at"],
-                                "state": "APPROVED", "body": n.get("body") or "", "commit": {"oid": shas[-1]}})
+            body = n.get("body") or ""
+            post = {"author": gl_user(n.get("author")), "body": body}
+            if marked_human_post(post, human_reviewers):
+                continue
+            shas = SHA.findall(body)
+            if VERDICT_NOTE.match(body) and shas:
+                reviews.append({**post, "id": f"verdict-{n['id']}", "submittedAt": n["created_at"],
+                                "state": "APPROVED", "commit": {"oid": shas[-1]}})
             else:
-                comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
+                comments.append({**post, "createdAt": n["created_at"]})
     verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
     gl_attribute_approvals(reviews, verdict_notes)
     for t in threads:
@@ -595,12 +605,12 @@ def gl_mr_to_pr(mr, discussions, commit):
     }
 
 
-def gl_read_mr(host, project, iid):
+def gl_read_mr(host, project, iid, human_reviewers=()):
     base = f"{gl_project(project)}/merge_requests/{iid}"
     mr = glab(host, base)
     discussions = glab_paged(host, f"{base}/discussions")
     commit = glab(host, f"{gl_project(project)}/repository/commits/{mr['sha']}")
-    return gl_mr_to_pr(mr, discussions, commit)
+    return gl_mr_to_pr(mr, discussions, commit, human_reviewers)
 
 
 def gl_compare(host, project, old, new):
@@ -667,7 +677,7 @@ def gl_workflow_runs(host, project, iid, sha):
     return on_sha + len(of_mr)
 
 
-def forge(url):
+def forge(url, human_reviewers=()):
     """The host calls the waiter makes, bound to one PR or MR, or None for an unsupported URL.
     The GitHub ones look the module's functions up at call time, so tests can replace them."""
     gh_target = parse_url(url)
@@ -687,7 +697,7 @@ def forge(url):
     if gl_target:
         host, project, iid = gl_target
         return {
-            "read": lambda: gl_read_mr(host, project, iid),
+            "read": lambda: gl_read_mr(host, project, iid, human_reviewers),
             "authored_lines": lambda base, sha: gl_authored_lines(host, project, base, sha),
             "merged_branch_tip": lambda branch: gl_merged_branch_tip(host, project, branch),
             "changed_hunks": lambda old, new: gl_changed_hunks(host, project, old, new),
@@ -775,9 +785,22 @@ def hard_failures(pr, runs_failed, abandoned=()):
     return failed + [r for r in runs_failed if r.split("=")[-1].upper() in FAILED_CONCLUSIONS] + list(abandoned)
 
 
-def agent_marked(comment):
-    """Whether a plain PR comment is an agent's note (it contains AGENT_MARKER)."""
-    return AGENT_MARKER in (comment.get("body") or "")
+def agent_marked(post):
+    return AGENT_MARKER in (post.get("body") or "")
+
+
+def marked_human_post(post, human_reviewers):
+    return agent_marked(post) and listed(post.get("author"), human_reviewers)
+
+
+def ignore_marked_human_posts(pr, human_reviewers):
+    for key in ("reviews", "comments"):
+        connection = pr[key]
+        nodes = connection["nodes"]
+        kept = [post for post in nodes if not marked_human_post(post, human_reviewers)]
+        connection["nodes"] = kept
+        if "totalCount" in connection:
+            connection["totalCount"] -= len(nodes) - len(kept)
 
 
 def has_checks(pr):
@@ -918,7 +941,7 @@ def counts_as_verdict(author, body, reviewers):
 
 
 def verdicts(pr, reviewers):
-    """Each AI reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
+    """Each reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
     newest = {}
     for _, author, body, at, state, commit in posts(pr):
         if not counts_as_verdict(author, body, reviewers) or is_thread_reply(body, state):
@@ -1025,7 +1048,7 @@ def approval_state(pr, reviewers, same_authored_lines, hunks_between=None):
         if st == "APPROVED" and commit == head and a and not counts_as_verdict(a, "", reviewers)
     })
     if reviewers and unlisted:
-        reason += f" ({', '.join(unlisted)} approved it formally but is not a listed --reviewer)"
+        reason += f" ({', '.join(unlisted)} approved it formally but is not a listed --reviewer or --human-reviewer)"
     return False, reason, None
 
 
@@ -1077,6 +1100,8 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     parser.add_argument("--head")
     parser.add_argument("--no-ci", action="store_true")
     parser.add_argument("--reviewer", action="append", default=[])
+    parser.add_argument("--human-reviewer", action="append", default=[], metavar="LOGIN",
+                        help="human reviewer's login; ignore all agent-marked posts from it (repeatable)")
     parser.add_argument("--after", type=ts, default=0.0,
                         help="ISO 8601 mark from a previous exit or your own PR read; never a typed future time (60s clock-skew allowance)")
     parser.add_argument("--refused", type=ts, default=0.0,
@@ -1084,6 +1109,14 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     parser.add_argument("--until-review", action="store_true")
     parser.add_argument("--known-conflict", action="store_true")
     args = parser.parse_args(argv)
+    ai_reviewers = {login_key(login) for login in args.reviewer}
+    human_reviewers = {login_key(login) for login in args.human_reviewer}
+    overlap = ai_reviewers & human_reviewers
+    if overlap:
+        print(f"error: list each login under only one of --reviewer and --human-reviewer: {', '.join(sorted(overlap))}",
+              file=sys.stderr)
+        return 2
+    reviewers = ai_reviewers | human_reviewers
 
     started = now()
     for flag in ("after", "refused"):
@@ -1094,7 +1127,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         print("error: --refused holds back a ready, which --until-review never reports", file=sys.stderr)
         return 2
 
-    host = forge(args.url)
+    host = forge(args.url, human_reviewers)
     if not host:
         print(f"unsupported: {args.url} is neither a GitHub PR nor a GitLab MR URL", file=sys.stderr)
         return 2
@@ -1129,6 +1162,8 @@ def main(argv=None, now=time.time, sleep=time.sleep):
     def read_once():
         """One read: (exit code, line) to stop, or (None, waiting reason) and the activity mark."""
         pr = host["read"]()
+        if human_reviewers:
+            ignore_marked_human_posts(pr, human_reviewers)
         head = pr["headRefOid"]
         if pr["state"] == "MERGED":
             return (10, f"merged: {args.url}"), 0
@@ -1164,7 +1199,7 @@ def main(argv=None, now=time.time, sleep=time.sleep):
             state["seen"] = {key for key, *_ in posts(pr)}
         new_reviews = review_count(pr) > state["reviews"] or bool(comment_keys(pr) - state["comments"])
         gates = {
-            "reviewers": {login_key(r) for r in args.reviewer},
+            "reviewers": reviewers,
             "same_authored_lines": lambda o, n, at: same_authored_lines(pr, o, n, at),
             "hunks_between": host["changed_hunks"],
         }

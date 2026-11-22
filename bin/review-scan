@@ -41,8 +41,9 @@ A watch never stops on its own. A single tick that cannot read any target is log
 
 Targets: GitHub `owner/repo`, `owner` (every repo of an org or user) or a PR URL;
 GitLab `gitlab:HOST/group[/subgroup]`, `gitlab:HOST/group/project!` (a single project:
-note the trailing `!`) or an MR URL. A PR named by URL is reviewed even as a draft or
-dormant, and leaves the watch once merged or closed.
+note the trailing `!`) or an MR URL. A PR named by URL is reviewed even as a draft,
+an RFC or dormant, and leaves the watch once merged or closed.
+RFC PRs (title tagged `[RFC]`) are skipped like drafts because the owner reviews them.
 
 State lives in $REVIEW_SCAN_HOME (default ~/.local/state/review-open-prs)/<watch>/.
 
@@ -140,6 +141,10 @@ def glab_paged(host, path):
 def pr_row(url, head, updated, draft, title, base, branch, author, state="open", named=False):
     return {"url": url, "head": head, "updated": updated, "draft": bool(draft), "title": title,
             "base": base, "branch": branch, "author": author, "state": state, "named": named}
+
+
+def is_rfc(title):
+    return "[rfc]" in title.casefold()
 
 
 def list_target(spec):
@@ -617,12 +622,15 @@ class PRSource:
                 failed.append(t["spec"])
                 accounting.append(f"{t['spec']}: UNREAD ({e})")
                 continue
-            kept = dormant = drafts = 0
+            kept = dormant = drafts = rfcs = 0
             for r in rows:
                 if r["state"] != "open":
                     continue
                 if r["draft"] and not r["named"]:
                     drafts += 1
+                    continue
+                if not r["named"] and is_rfc(r["title"]):
+                    rfcs += 1
                     continue
                 if engine.parse_time(r["updated"]) < cutoff and not r["named"]:
                     dormant += 1
@@ -630,7 +638,7 @@ class PRSource:
                 r["target"], r["filter"], r["token"] = t["spec"], t.get("filter"), t.get("token")
                 listed[r["url"]] = r
                 kept += 1
-            accounting.append(f"{t['spec']}: {len(rows)} listed, {kept} kept, {drafts} draft, {dormant} dormant")
+            accounting.append(f"{t['spec']}: {len(rows)} listed, {kept} kept, {drafts} draft, {dormant} dormant, {rfcs} rfc")
         finished = [t for t in w.config["targets"] if (GH_PR.match(t["spec"]) or GL_MR.match(t["spec"]))
                     and t["spec"] not in failed and not any(r["target"] == t["spec"] for r in listed.values())]
         return listed, failed, accounting, finished

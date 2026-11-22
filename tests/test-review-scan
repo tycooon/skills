@@ -46,8 +46,9 @@ def act(head=A, updated=RECENT, authors=(), approvers=("review-bot",), threads=(
 SINCE = ["--since", "2026-10-23T11:00:00Z", "--verdict", "approved"]
 
 
-def row(url, head=A, updated=RECENT, draft=False, state="open", named=False):
-    return rs.pr_row(url, head, updated, draft, f"title {url[-1]}", "master", f"br{url[-1]}", "dev", state, named)
+def row(url, head=A, updated=RECENT, draft=False, state="open", named=False, title=None):
+    return rs.pr_row(url, head, updated, draft, title if title is not None else f"title {url[-1]}",
+                     "master", f"br{url[-1]}", "dev", state, named)
 
 
 class Base(unittest.TestCase):
@@ -286,6 +287,21 @@ class Tick(Base):
         _, out = self.cli("tick", self.watch)
         self.assertEqual(self.spawned, [])
         self.assertIn("1 draft, 1 dormant", out)
+
+    def test_listed_rfc_prs_are_skipped_but_bare_rfc_is_kept(self):
+        self.listing["acme/app"] = [
+            row(PR1, title="ABC-123 [rfc] Move rate limits"),
+            row(PR2, title="Implement the RFC"),
+        ]
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR2])
+        self.assertIn("2 listed, 1 kept, 0 draft, 0 dormant, 1 rfc", out)
+
+    def test_draft_rfc_counts_only_as_draft(self):
+        self.listing["acme/app"] = [row(PR1, draft=True, title="[RFC] Move rate limits")]
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual(self.spawned, [])
+        self.assertIn("1 listed, 0 kept, 1 draft, 0 dormant, 0 rfc", out)
 
     def test_parallel_cap_holds_the_rest_for_a_later_tick(self):
         self.listing["acme/app"] = [row(f"https://github.com/acme/app/pull/{n}") for n in range(1, 6)]
@@ -619,6 +635,13 @@ class Settle(Base):
 
 
 class NamedPr(Base):
+    def test_named_rfc_pr_is_reviewed(self):
+        self.cli("init", self.watch, "--target", PR1, "--own", "review-bot")
+        self.listing[PR1] = [row(PR1, named=True, title="[RFC] Move rate limits")]
+        _, out = self.cli("tick", self.watch)
+        self.assertEqual([u for u, _ in self.spawned], [PR1])
+        self.assertIn("1 listed, 1 kept, 0 draft, 0 dormant, 0 rfc", out)
+
     def test_named_pr_reviewed_as_draft_and_leaves_when_merged(self):
         self.cli("init", self.watch, "--target", PR1, "--own", "review-bot")
         self.listing[PR1] = [row(PR1, draft=True, named=True)]
