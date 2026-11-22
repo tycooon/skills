@@ -558,12 +558,13 @@ def gl_mr_to_pr(mr, discussions, commit):
             replies += len(human) - 1
             continue
         for n in human:
-            shas = SHA.findall(n.get("body") or "")
-            if VERDICT_NOTE.match(n.get("body") or "") and shas:
+            body = n.get("body") or ""
+            shas = SHA.findall(body)
+            if VERDICT_NOTE.match(body) and shas and not marked_without_reviewer_identity(body):
                 reviews.append({"id": f"verdict-{n['id']}", "author": gl_user(n.get("author")), "submittedAt": n["created_at"],
-                                "state": "APPROVED", "body": n.get("body") or "", "commit": {"oid": shas[-1]}})
+                                "state": "APPROVED", "body": body, "commit": {"oid": shas[-1]}})
             else:
-                comments.append({"author": gl_user(n.get("author")), "body": n.get("body") or "", "createdAt": n["created_at"]})
+                comments.append({"author": gl_user(n.get("author")), "body": body, "createdAt": n["created_at"]})
     verdict_notes = sorted((r for r in reviews if r["id"].startswith("verdict-")), key=lambda r: ts(r["submittedAt"]))
     gl_attribute_approvals(reviews, verdict_notes)
     for t in threads:
@@ -780,6 +781,10 @@ def agent_marked(comment):
     return AGENT_MARKER in (comment.get("body") or "")
 
 
+def marked_without_reviewer_identity(body):
+    return AGENT_MARKER in body and not IDENTITY.search(body)
+
+
 def has_checks(pr):
     rollup = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] if pr["commits"]["nodes"] else None
     return bool(rollup and rollup["contexts"]["nodes"])
@@ -918,9 +923,11 @@ def counts_as_verdict(author, body, reviewers):
 
 
 def verdicts(pr, reviewers):
-    """Each AI reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
+    """Each reviewer's newest verdict-bearing post: (login, is_go, named_sha, posted_at)."""
     newest = {}
     for _, author, body, at, state, commit in posts(pr):
+        if marked_without_reviewer_identity(body):
+            continue
         if not counts_as_verdict(author, body, reviewers) or is_thread_reply(body, state):
             continue
         login = author["login"]

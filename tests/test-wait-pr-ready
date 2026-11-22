@@ -247,6 +247,47 @@ class Approval(unittest.TestCase):
         pr = ready_pr(reviews={"nodes": [review("alice", "APPROVED", "")]})
         self.assertTrue(evaluate(pr, reviewers=["alice"])[0])
 
+    def test_marked_lgtm_does_not_approve_as_owner(self):
+        body = f"LGTM\n{w.AGENT_MARKER}"
+        github = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("owner", body)]})
+        gitlab = gl_pr(discussions=[{"notes": [gl_note(1, "owner", body)]}])
+        for host, pr in (("GitHub", github), ("GitLab", gitlab)):
+            with self.subTest(host=host):
+                self.assertFalse(evaluate(pr, reviewers=["owner"])[0])
+
+    def test_marked_update_does_not_replace_owner_lgtm(self):
+        body = f"Pushed the updated text.\n{w.AGENT_MARKER}"
+        later = "2026-10-15T11:00:00Z"
+        github = ready_pr(reviews={"nodes": []}, comments={"nodes": [
+            comment("owner", "LGTM"), comment("owner", body, at=later),
+        ]})
+        gitlab = gl_pr(discussions=[
+            {"notes": [gl_note(1, "owner", "LGTM")]},
+            {"notes": [gl_note(2, "owner", body, at=later)]},
+        ])
+        for host, pr in (("GitHub", github), ("GitLab", gitlab)):
+            with self.subTest(host=host):
+                ready, reasons = evaluate(pr, reviewers=["owner"])
+                self.assertTrue(ready, reasons)
+
+    def test_marked_bot_verdict_with_identity_approves(self):
+        body = f"APPROVED. AI reviewer: Claude. Reviewed {HEAD}.\n{w.AGENT_MARKER}"
+        github = ready_pr(reviews={"nodes": []}, comments={"nodes": [comment("review-bot", body)]})
+        gitlab = gl_pr(discussions=[{"notes": [gl_note(1, "review-bot", body)]}])
+        for host, pr in (("GitHub", github), ("GitLab", gitlab)):
+            with self.subTest(host=host):
+                ready, reasons = evaluate(pr, reviewers=["review-bot"])
+                self.assertTrue(ready, reasons)
+
+    def test_marked_gitlab_note_does_not_replace_formal_owner_approval(self):
+        pr = gl_pr(discussions=[
+            {"notes": [gl_note(1, "owner", "approved this merge request", system=True)]},
+            {"notes": [gl_note(2, "owner", f"APPROVED earlier at {OLD}.\n{w.AGENT_MARKER}",
+                               at="2026-10-15T11:00:00Z")]},
+        ])
+        ready, reasons = evaluate(pr, reviewers=["owner"])
+        self.assertTrue(ready, reasons)
+
     def test_listed_reviewers_are_the_only_verdict_source(self):
         # A session reviewer posting from the author's account carries the identity line too.
         session = review("author", "COMMENTED", f"APPROVED. AI reviewer: Claude (session reviewer). Reviewed {HEAD}.")

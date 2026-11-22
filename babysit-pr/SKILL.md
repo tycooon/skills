@@ -42,7 +42,7 @@ Stop immediately, without waiting for the four, when any of these is true instea
 
 Condition 1 is met when the required reviewer has signed off on the current head, or on an earlier head that covers it by base-sync or the answered-findings rule (see below). It's an *approval* when that reviewer's latest review is a formal approval (GitHub: its newest `reviews` entry is `APPROVED`; GitLab: an active MR approval) **or** a review/comment genuinely signals go (LGTM, "approved", "ship it", 👍) — judge intent, not keywords: "not approving until you fix X" is not approval, and neither is a comment that merely describes or acknowledges the change, the loop's own address-pr replies included.
 
-For a PR titled with `[RFC]`, the required reviewer is the human owner who owns the repo or requested the RFC. When using `~/.claude/bin/wait-pr-ready`, pass only the owner's login as `--reviewer LOGIN` and verify the sign-off came from the owner. For other PRs, the required reviewer is the external AI reviewer.
+For a PR titled with `[RFC]`, the required reviewer is the human owner who owns the repo or requested the RFC. When using `~/.claude/bin/wait-pr-ready`, pass only the owner's login as `--reviewer LOGIN`. Verify that the sign-off came from that login and carries no `<!-- posted-by-agent -->` marker. The waiter ignores marked posts without an AI reviewer identity when reading verdicts. For other PRs, the required reviewer is the external AI reviewer.
 
 **The watch never supplies that approval itself.** Reviewing the PR yourself and then stopping on your own verdict is the watch approving its own work. If nothing reviews this PR, condition 1 simply never comes true and the watch ends at the quiet cap — report that plainly instead of signing off in the reviewer's place.
 
@@ -139,7 +139,7 @@ For the base, GitHub reports `mergeable` and `mergeStateStatus` (`gh pr view <pr
 - **GitHub:** `gh pr view <pr> --json state,mergedAt,reviews,comments` — stop on a `state` of `MERGED`/`CLOSED`, or count condition 1 met on a reviewer whose *latest* `reviews` entry is `APPROVED`, or on an approval-style go-signal (a "LGTM"/`APPROVED` left as a plain comment or review, not just the Approve button) landing either as a top-level `comments` entry or in a `reviews` body. GitHub keeps stale `APPROVED` reviews in the list after later changes, so go by each reviewer's newest review, not any historical one.
 - **GitLab:** `glab mr view <mr>` shows the MR's state, its approvals (who has approved), and its notes — stop on a merge/close, or count condition 1 met on an approval-style note. An AI reviewer's verdict usually arrives as a note, with or without a formal approval, so read the notes and not just the approvals list.
 
-When checking an RFC's approval, use the owner's login and check that the verdict came from the owner. For AI verdicts, look for the reviewer's identity line. The posting account does not settle it: a reviewer posts under a dedicated bot account when one is configured for the repo and under the PR author's own account when none is.
+When checking an RFC's approval, use the owner's login and marker check above. For AI verdicts, look for the reviewer's identity line. The posting account does not settle it: a reviewer posts under a dedicated bot account when one is configured for the repo and under the PR author's own account when none is.
 
 ## Report
 
