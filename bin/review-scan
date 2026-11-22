@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive a review-open-prs watch without a long-running agent session.
+"""Drive a review-scan watch without a long-running agent session.
 
   review-scan init <watch> --target SPEC... [--filter SPEC=TEXT]... [--token SPEC=ENV_VAR]...
                    [--reviewer-model MODEL] [--effort LEVEL]
@@ -22,7 +22,7 @@ starts a fresh `claude -p` or `codex exec` run, on the watch's reviewer model, f
 since a run last settled it: a new head, new activity, or a recheck someone asked for.
 The model selects the CLI: Claude IDs and opus/sonnet/haiku aliases use Claude;
 gpt-*, codex/codex-* and o-series IDs use Codex. Unknown model names are rejected.
-A PR that has not changed costs nothing: no agent runs. The run follows review-open-prs'
+A PR that has not changed costs nothing: no agent runs. The run follows the review-scan skill's
 *One run reviews one PR* and ends with `settle`, which records the PR's state only when
 nothing but our own posts landed while the run was working, and only once the PR shows
 the verdict the run claims: an approval of ours at the head, or an open thread of ours.
@@ -412,7 +412,7 @@ def build_brief(w, r, rec, reason, siblings, now):
     lines = [
         f"Review one pull request for the `{w.name}` review watch: {r['url']}",
         "",
-        "Use the review-open-prs skill, section *One run reviews one PR*, and follow it exactly; it points at",
+        "Use the review-scan skill, section *One run reviews one PR*, and follow it exactly; it points at",
         "review-pr for how to review and post. This is a headless run: nobody reads your chat output,",
         "so the PR is the whole report.",
         "",
