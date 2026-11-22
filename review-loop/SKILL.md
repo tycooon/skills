@@ -17,7 +17,7 @@ Run one [review-pr](../review-pr/SKILL.md) pass in full, including *Re-reviewing
 
 ## Wait for a change
 
-Run `~/.claude/bin/review-scan wait <url> --head <head> --after <activity mark>` as one background command. In Claude Code, use `run_in_background` so the exit re-invokes this session. After your own posts or thread resolutions, read the PR again and take its activity mark from that read. Otherwise use the mark from the previous waiter's exit line or your own PR read. Always take the mark from the PR.
+Run `~/.claude/bin/review-scan wait <url> --head <head> --after <activity mark>` as one background command. In Claude Code, use `run_in_background` so the exit re-invokes this session. Pass the mark the round started from: the previous waiter's exit line, or for the first round your own PR read before reviewing. Never re-read the PR after the round's own posts or thread resolutions to take a fresher mark: a reply that landed in between would fold into it and never wake the waiter. Your own posts then wake one extra round, which review-pr's coverage and last-commenter checks settle without a post, and its exit line gives the next mark. Always take the mark from the PR, never a typed time.
 
 Keep one waiter per PR. Stop the previous one before arming another, and say you are waiting only after arming it. Use no `ScheduleWakeup` or `CronCreate` for this loop.
 
