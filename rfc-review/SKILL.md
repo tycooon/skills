@@ -28,7 +28,7 @@ Give every number with its window and source. Say what you could not measure.
 
 Verify its claims about current code against the code, as review-pr asks. Look hardest at the claims the design leans on: who decides what at run time, what is stored and what is derived, which process may act on which resource. A design built on a wrong picture of today fails in the part nobody reviewed.
 
-These three steps are independent, so run them in parallel where the runtime allows: one pass per part of the RFC for the code, one for production. Verify yourself the findings your review will rest on.
+Steps 2 and 3 are independent once the problem is written down, so run them in parallel where the runtime allows: one pass per part of the RFC for the code, one for production. Verify yourself the findings your review will rest on.
 
 ## 4. Test the chosen path
 
@@ -50,7 +50,9 @@ If the path is right, say that plainly and keep the findings to its gaps.
 
 ## 6. Post and report
 
-Post per review-pr. In the session, tell the owner, in this order:
+Post per review-pr. In a headless review run, such as one a review-scan watch starts, stop there: the PR is the whole report, a question only the owner can settle stays a thread waiting on the owner, and the watch carries the later rounds, so skip the rest of this step and step 7.
+
+In a session the owner is reading, tell them, in this order:
 
 1. the verdict on the path in one sentence;
 2. the problem as measured;
