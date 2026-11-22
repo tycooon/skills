@@ -3,6 +3,7 @@
 This repo holds agent skills (one folder per skill, each with a `SKILL.md`) and the four helper tools those skills call.
 
 - [`review-loop`](review-loop/SKILL.md) keeps reviewing one PR or MR in the current session as it changes.
+- [`rfc-review`](rfc-review/SKILL.md) reviews an RFC from the problem up: it measures the problem, tests the chosen path against it and offers a smaller one when it fits.
 
 Run `bin/setup` to copy the skills into the Claude, Codex, ZCODE, OpenCode and Gemini skills directories and install executable copies of the four tools in `~/.claude/bin`. `--cloud` is accepted for cloud environments and runs the same install.
 
