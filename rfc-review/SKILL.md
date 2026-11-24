@@ -62,9 +62,15 @@ In a session the owner is reading, tell them, in this order:
 
 Ask the owner nothing in the session. A question only the owner can settle stays a thread on the PR, marked waiting on the owner, and the owner answers there. If the owner answers in the session anyway, post their answer on its thread so the author can move it into the spec.
 
+The review ends at the design. Never suggest implementing it: don't offer to start a delivery step, write its code or delegate it, during the review or after the RFC merges. The owner asks for that when they want it.
+
 ## 7. Keep reviewing
 
-Use [review-loop](../review-loop/SKILL.md) until the RFC merges, closes or goes quiet. Two rules for the later rounds:
+Use [review-loop](../review-loop/SKILL.md) until the RFC merges, closes or goes quiet.
+
+**Stop watching while anything waits on the owner.** When a question is waiting on the owner, on a thread or in the session, arm no waiter and stop one that is running. Nothing the author pushes can settle it, and each round would only repeat the question. Start the loop again once the owner has answered everything that was waiting and the answers are on their threads.
+
+Two rules for the later rounds:
 
 - **Review your own proposal as hard as the author's.** When the author adopts your alternative, the next round is a first review of a new design. Look for the gaps your suggestion left, and name them as yours.
 - **Correct your own numbers in the open.** When new evidence shows a figure you gave was wrong or too narrow, post the correction as a finding on the line that now relies on it, before anything else. A decision may already rest on it.
