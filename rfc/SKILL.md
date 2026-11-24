@@ -7,7 +7,9 @@ description: "Agree a design with the user, write it as a docs-only RFC PR or MR
 
 Put a design up for review as a docs-only pull request (GitHub) or merge request (GitLab) before any of it is built. The design is worked out with the user first, and the RFC publishes what they approved. The PR is the RFC. Its spec docs say what today's code does, what should change and how it ships, and they list the questions the evidence could not settle, each with your recommendation. The owner settles those questions in review and approves the PR once none is left.
 
-You are the author. The user is the owner and shapes the design with you, reviews the RFC and merges it. Review sweeps skip `[RFC]` PRs. An AI review happens only when you or the owner name the PR to a reviewer, for example by running review-pr on it. Then review-pr's *RFC pull requests* rules apply. Address-pr passes settle questions with whoever reviews.
+You are the author. The user is the owner and shapes the design with you, reviews the RFC and merges it. Review sweeps skip `[RFC]` PRs. An AI review happens only when you or the owner name the PR to a reviewer, with the rfc-review skill. Then review-pr's *RFC pull requests* rules apply. Address-pr passes settle questions with whoever reviews.
+
+Steps 1–4 happen in the session with the user. **Once the PR is open, every exchange about the RFC happens on the PR.** Ask the user nothing in the session about it: not an open question, not a decision the review reopened, not a go-ahead. A question only the owner can settle becomes a thread on the PR, marked waiting on the owner, and the owner answers there.
 
 ## 1. Agree the design with the user
 
@@ -129,11 +131,18 @@ Where the host has a description template of its own, fill that and carry these 
 **How to review this RFC.** This PR proposes a design and changes no code. Review the design itself, and settle every open question before approving:
 - Give each open question its own thread on its line: agree with the recommendation, or argue for another option, with evidence.
 - Don't approve while any question is open or waiting on the owner.
-- If you are reviewing by request, bring a question to the owner when you and the author cannot settle it or only the owner can decide.
+- If you are reviewing by request and you and the author cannot settle a question, or only the owner can decide it, say so on its thread and mark it waiting on the owner. The owner answers on the PR.
 ```
 
 ## 7. See it through
 
-Watch the PR with the babysit-pr skill, unless the rules for your machine hand a PR's follow-up to something else. Either way, run address-pr passes on the owner's threads. When you report the opened PR, list its open questions to the owner, each with your recommendation, so they can settle them in review. The watch is done when the owner approves the settled text.
+Watch the PR with the babysit-pr skill, unless the rules for your machine hand a PR's follow-up to something else. Either way, run address-pr passes on every reviewer's and the owner's threads. The review itself is the rfc-review skill's, run by whoever the owner or you name.
+
+Report the opened PR once in the session: its link and the open questions' IDs. Ask nothing there. The questions, your recommendations and every later exchange live on the PR:
+- a question the review can't settle, or a decision it reopens, is marked waiting on the owner in the spec, in the description's table and on its thread;
+- the owner's answer on a thread is recorded as their decision in the next address-pr pass;
+- a later session report says only what changed on the PR, never a question for the user.
+
+The watch is done when the owner approves the settled text.
 
 Merging is the user's call, even where the repo's standing rules let agents merge ready PRs. Only the owner merges an RFC. Once the RFC has merged, the design-implementation skill builds it from the repo's copy of the doc.

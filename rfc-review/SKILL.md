@@ -60,7 +60,7 @@ In a session the owner is reading, tell them, in this order:
 4. the alternative, if you proposed one;
 5. your position on each open question, with the data behind it.
 
-Bring a question only the owner can settle to the owner in the session. When they answer, record the decision on its thread so the author can move it into the spec.
+Ask the owner nothing in the session. A question only the owner can settle stays a thread on the PR, marked waiting on the owner, and the owner answers there. If the owner answers in the session anyway, post their answer on its thread so the author can move it into the spec.
 
 ## 7. Keep reviewing
 
