@@ -141,7 +141,8 @@ Watch the PR with the babysit-pr skill, unless the rules for your machine hand a
 Report the opened PR once in the session: its link and the open questions' IDs. Ask nothing there. The questions, your recommendations and every later exchange live on the PR:
 - a question the review can't settle, or a decision it reopens, is marked waiting on the owner in the spec, in the description's table and on its thread;
 - the owner's answer on a thread is recorded as their decision in the next address-pr pass;
-- a later session report says only what changed on the PR, never a question for the user.
+- when a question becomes waiting on the owner, the pass that marks it sends address-pr's pointer: the PR's link and the waiting IDs, with a push notification where the runtime has one;
+- any later session report says only what changed on the PR, never a question for the user.
 
 The watch is done when the owner approves the settled text.
 
