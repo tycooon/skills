@@ -68,7 +68,7 @@ The review ends at the design. Never suggest implementing it: don't offer to sta
 
 Use [review-loop](../review-loop/SKILL.md) until the RFC merges, closes or goes quiet.
 
-**Stop watching while anything waits on the owner.** When a question is waiting on the owner, on a thread or in the session, arm no waiter and stop one that is running. Nothing the author pushes can settle it, and each round would only repeat the question. Start the loop again once the owner has answered everything that was waiting and the answers are on their threads.
+**Stop watching while anything waits on the owner.** When a question is waiting on the owner, arm no waiter and stop one that is running. Their answer can replace the design, so the author's pushes in the meantime aren't worth a round, and each round would bring the same question back. Tell the owner once, in one line, which threads wait on them and that the review is paused until they are answered. The pause ends at the owner's next message in the session: re-read those threads first, post an answer given in the session on its thread, and start the loop again once nothing waits.
 
 Two rules for the later rounds:
 
