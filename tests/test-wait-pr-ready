@@ -1579,8 +1579,8 @@ class FakeGh:
     """Stands in for w.gh: answers GraphQL reads in turn, and Actions and status reads per poll.
     runs and statuses hold one list of printed rows per poll (the last repeats)."""
 
-    def __init__(self, graphql, runs=(), statuses=()):
-        self.graphql, self.runs, self.statuses = list(graphql), list(runs), list(statuses)
+    def __init__(self, graphql, runs=(), statuses=(), workflows=1):
+        self.graphql, self.runs, self.statuses, self.workflows = list(graphql), list(runs), list(statuses), workflows
         self.polls, self.queries, self.requests = 0, [], []
 
     def __call__(self, args, stdin=None):
@@ -1594,7 +1594,7 @@ class FakeGh:
             errors = body.get("errors")
             return subprocess.CompletedProcess([], 1 if errors else 0, json.dumps(body), errors[0]["message"] if errors else "")
         if "/actions/workflows" in args[1]:
-            return subprocess.CompletedProcess([], 0, "1", "")
+            return subprocess.CompletedProcess([], 0, str(self.workflows), "")
         rows = self.runs if "/actions/runs" in args[1] else self.statuses
         rows = rows[min(self.polls, len(rows)) - 1] if rows else []
         if "total_count" in args[-1]:
@@ -1691,6 +1691,31 @@ class UnreadableChecks(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("no CI for this head", out)
         self.assertIn("no checks reported yet", stderr)
+
+    def test_a_repository_without_workflows_or_statuses_is_not_taken_for_one_without_ci(self):
+        # Its CI may be a GitHub App's check, which this token can't see.
+        tips = {"data": {"repository": {"ref": {"target": {"oid": "1" * 40}}, "pullRequests": {"nodes": []}}}}
+        fake = FakeGh([refused(), tips], workflows=0)
+        code, out, stderr, waits = self.run_main(fake)
+        self.assertEqual(code, 2, out)
+        self.assertIn("unreadable with this token", out)
+        self.assertIn("--no-ci", out)
+        self.assertEqual(waits, [])
+        self.assertNotIn("read failed", stderr)
+
+    def test_no_ci_lets_that_repository_go_ready(self):
+        fake = FakeGh([refused(), self.bare()], workflows=0)
+        code, out, _, _ = self.run_main(fake, args=("--reviewer", "review-bot", "--no-ci"))
+        self.assertEqual(code, 0, out)
+
+    def test_a_status_on_a_recent_head_still_means_external_ci_to_wait_for(self):
+        tips = {"data": {"repository": {"ref": {"target": {"oid": "1" * 40}}, "pullRequests": {"nodes": []}}}}
+        fake = FakeGh([refused(), tips] + [self.bare()] * 300, workflows=0,
+                      statuses=[[], ["ci/external\tsuccess\t2026-10-15T09:20:00Z"]])
+        code, out, _, waits = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 checks green", out)
+        self.assertEqual(len(waits), 1)
 
     def test_another_error_still_fails_the_read(self):
         other = {"type": "NOT_FOUND", "message": "Could not resolve to a Repository", "path": ["repository"]}

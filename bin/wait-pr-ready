@@ -23,7 +23,10 @@ APPROVED review also remains non-blocking for compatibility.
 
 A token that can't read check runs (a fine-grained personal access token) is refused them by
 GitHub; the first such answer prints one stderr line, and the checks are then read from the head's
-Actions runs (each workflow's newest run) and commit statuses, with the same meaning.
+Actions runs (each workflow's newest run) and commit statuses, with the same meaning, except that
+the waiter then never decides a repository has no CI: a check posted by a GitHub App outside Actions
+stays invisible, so with no Actions workflow and no commit status on the base or recent heads it
+exits 2 and asks for --no-ci, which a repository that really has no CI passes.
 
 Exit codes:
   0  ready; the line ends with the PR's activity mark, for --refused
@@ -49,7 +52,8 @@ Exit codes:
      a workflow's newest run for the head ended cancelled (a job killed by
      timeout-minutes reads so, and nothing reruns it); a GitLab pipeline needs the age alone. Where Auto-fix also reports CI
      failures, whichever wakes the session first runs it
-  2  usage error, an unsupported URL, or the PR could not be read for too long
+  2  usage error, an unsupported URL, the PR could not be read for too long, or its checks are
+     unreadable with this token and nothing shows the repository has CI (see above)
 
 GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab and
 the same four conditions: an approval (a formal one, or a verdict note), every
@@ -262,6 +266,10 @@ def gh(args, stdin=None):
 
 # Set once a read shows this token can't read check runs; later reads then skip them.
 checks_unreadable = False
+
+
+class ChecksUnreadable(Exception):
+    """The head's CI can't be judged with this token. Not a RuntimeError: a retry reads the same."""
 
 
 def refused_checks(error):
@@ -1236,6 +1244,13 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         if state["workflows"] == 0:
             if state.get("recent_checks") is None:
                 state["recent_checks"] = host["recent_checks"](pr["baseRefName"])
+            if state["recent_checks"] == 0 and checks_unreadable:
+                # A GitHub App's check, outside Actions, is invisible to this token: no workflow
+                # and no status says nothing about whether the repository has CI.
+                raise ChecksUnreadable(
+                    f"checks are unreadable with this token, and the repository has no Actions workflow and no commit "
+                    f"status on {pr['baseRefName']} or recently merged heads, so whether it has CI can't be told; "
+                    f"pass --no-ci if it really has none")
             if state["recent_checks"] == 0:
                 return f"no CI: the repository has no Actions workflow and no check on {pr['baseRefName']} or recently merged heads"
         # External CI (a GitHub App or commit status) posts its first check some time
@@ -1361,6 +1376,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         try:
             (code, line), latest = read_once()
             failures = 0
+        except ChecksUnreadable as e:
+            print(f"error: {e}")
+            return 2
         except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as e:
             failures += 1
             if failures >= MAX_FAILED_READS:
