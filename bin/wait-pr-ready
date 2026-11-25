@@ -21,6 +21,13 @@ P2/P3 severity tag carries the "non-blocking" marker and its author and identity
 (a listed reviewer, or an AI identity line when no reviewers are listed). On GitHub, a thread opened by an
 APPROVED review also remains non-blocking for compatibility.
 
+A token that can't read check runs (a fine-grained personal access token) is refused them by
+GitHub; the first such answer prints one stderr line, and the checks are then read from the head's
+Actions runs (each workflow's newest run) and commit statuses, with the same meaning, except that
+the waiter then never decides a repository has no CI: a check posted by a GitHub App outside Actions
+stays invisible, so with no Actions workflow and no commit status on the base or recent heads it
+exits 2 and asks for --no-ci, which a repository that really has no CI passes.
+
 Exit codes:
   0  ready; the line ends with the PR's activity mark, for --refused
   10 merged
@@ -45,7 +52,8 @@ Exit codes:
      a workflow's newest run for the head ended cancelled (a job killed by
      timeout-minutes reads so, and nothing reruns it); a GitLab pipeline needs the age alone. Where Auto-fix also reports CI
      failures, whichever wakes the session first runs it
-  2  usage error, an unsupported URL, or the PR could not be read for too long
+  2  usage error, an unsupported URL, the PR could not be read for too long, or its checks are
+     unreadable with this token and nothing shows the repository has CI (see above)
 
 GitLab MRs (https://HOST/GROUP/PROJECT/-/merge_requests/N) are read with glab and
 the same four conditions: an approval (a formal one, or a verdict note), every
@@ -153,7 +161,7 @@ AGENT_MARKER = "<!-- posted-by-agent -->"
 AFTER_CLOCK_SKEW = 60
 MAX_FAILED_READS = 6
 
-QUERY = """
+QUERY_TEMPLATE = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
@@ -197,15 +205,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           commit {
             oid
             committedDate
-            statusCheckRollup {
-              contexts(first: 100) {
-                nodes {
-                  __typename
-                  ... on CheckRun { name status conclusion completedAt }
-                  ... on StatusContext { context state createdAt }
-                }
-              }
-            }
+#CHECKS#
           }
         }
       }
@@ -213,6 +213,21 @@ query($owner: String!, $name: String!, $number: Int!) {
   }
 }
 """
+
+# A fine-grained token can't be given the Checks permission, so GitHub refuses it the
+# rollup's contexts. Once it has, the query leaves them out and the checks come from
+# Actions runs and commit statuses (actions_rollup).
+CHECKS_SELECTION = """            statusCheckRollup {
+              contexts(first: 100) {
+                nodes {
+                  __typename
+                  ... on CheckRun { name status conclusion completedAt }
+                  ... on StatusContext { context state createdAt }
+                }
+              }
+            }"""
+QUERY = QUERY_TEMPLATE.replace("#CHECKS#", CHECKS_SELECTION)
+QUERY_NO_CHECKS = QUERY_TEMPLATE.replace("#CHECKS#", "")
 
 # review-pr's verdicts carry an identity line ("AI reviewer: Claude."); a teammate's
 # Approve, or a person merely naming an agent, does not.
@@ -249,13 +264,47 @@ def gh(args, stdin=None):
     return subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, timeout=120)
 
 
-def read_pr(owner, name, number):
-    r = gh(["api", "graphql", "-f", f"query={QUERY}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={number}"])
-    if r.returncode != 0:
+# Set once a read shows this token can't read check runs; later reads then skip them.
+checks_unreadable = False
+
+
+class ChecksUnreadable(Exception):
+    """The head's CI can't be judged with this token. Not a RuntimeError: a retry reads the same."""
+
+
+def refused_checks(error):
+    """Whether a GraphQL error is the refusal of the checks: FORBIDDEN, inside statusCheckRollup."""
+    forbidden = error.get("type") == "FORBIDDEN" or "not accessible" in (error.get("message") or "").lower()
+    return forbidden and "statusCheckRollup" in (error.get("path") or [])
+
+
+def graphql(query, **variables):
+    """The data of one GraphQL read. A response whose errors all refuse the checks still
+    counts: its data is complete but for the checks, and checks_unreadable is set. Any
+    other error fails the read."""
+    global checks_unreadable
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for key, value in variables.items():
+        args += ["-F", f"{key}={value}"]
+    r = gh(args)
+    body = json.loads(r.stdout) if r.stdout.lstrip().startswith("{") else {}
+    errors = body.get("errors") or []
+    if errors and body.get("data") is not None and all(refused_checks(e) for e in errors):
+        if not checks_unreadable:
+            checks_unreadable = True
+            print("checks unreadable with this token; reading CI from Actions runs", file=sys.stderr)
+    elif r.returncode != 0 or errors:
         raise RuntimeError(r.stderr.strip() or "gh api graphql failed")
-    pr = json.loads(r.stdout)["data"]["repository"]["pullRequest"]
+    return body["data"]
+
+
+def read_pr(owner, name, number):
+    pr = graphql(QUERY_NO_CHECKS if checks_unreadable else QUERY, owner=owner, name=name, number=number)["repository"]["pullRequest"]
     if pr is None:
         raise RuntimeError("no such pull request")
+    if checks_unreadable:
+        for node in pr["commits"]["nodes"]:
+            node["commit"]["statusCheckRollup"] = actions_rollup(owner, name, node["commit"]["oid"])
     return pr
 
 
@@ -376,15 +425,39 @@ query($owner: String!, $name: String!, $ref: String!) {
 """
 
 
+RECENT_HEADS_QUERY = """
+query($owner: String!, $name: String!, $ref: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $ref) { target { oid } }
+    pullRequests(states: MERGED, first: 5, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      nodes { commits(last: 1) { nodes { commit { oid } } } }
+    }
+  }
+}
+"""
+
+
+def commit_statuses(owner, name, sha):
+    """The latest commit status of each context on sha: [(context, state, created_at)]."""
+    r = gh(["api", f"repos/{owner}/{name}/commits/{sha}/status?per_page=100", "--jq",
+            ".statuses[] | [.context, .state, .created_at] | @tsv"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api commits/status failed")
+    return [tuple(line.split("\t")) for line in r.stdout.splitlines()]
+
+
 def recent_checks(owner, name, base):
     """How many of the base's tip and the last few merged PRs' heads carry a check or status.
-    A PR-only integration (a CLA or title check, a deploy preview) never posts on the base."""
-    r = gh(["api", "graphql", "-f", f"query={RECENT_CHECKS_QUERY}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"ref=refs/heads/{base}"])
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "gh api graphql failed")
-    repo = json.loads(r.stdout)["data"]["repository"]
+    A PR-only integration (a CLA or title check, a deploy preview) never posts on the base.
+    A token refused the checks counts commit statuses only; the Actions runs are workflow_count's."""
+    variables = {"owner": owner, "name": name, "ref": f"refs/heads/{base}"}
+    repo = None if checks_unreadable else graphql(RECENT_CHECKS_QUERY, **variables)["repository"]
+    if checks_unreadable:
+        repo = graphql(RECENT_HEADS_QUERY, **variables)["repository"]
     tips = [((repo.get("ref") or {}).get("target") or {})]
     tips += [n["commit"] for pr in repo["pullRequests"]["nodes"] for n in pr["commits"]["nodes"]]
+    if checks_unreadable:
+        return sum(1 for c in tips if c.get("oid") and commit_statuses(owner, name, c["oid"]))
     return sum(1 for c in tips if c.get("statusCheckRollup"))
 
 
@@ -396,6 +469,28 @@ def workflow_runs(owner, name, sha):
 
 
 GREEN_RUN_CONCLUSIONS = {"success", "skipped", "neutral"}
+
+
+def run_rows(owner, name, sha):
+    """Each Actions run for sha, as (workflow, run number, name, status, conclusion, created, updated)."""
+    r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100", "--jq",
+            ".workflow_runs[] | [.workflow_id, .run_number, .name, .status, (.conclusion // \"\"), .created_at, .updated_at] | @tsv"])
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
+    rows = []
+    for line in r.stdout.splitlines():
+        workflow, number, run_name, status, conclusion, created, *updated = line.split("\t")
+        rows.append((workflow, int(number), run_name, status, conclusion, created, updated[0] if updated else created))
+    return rows
+
+
+def newest_runs(rows):
+    """Each workflow's newest run: a rerun is the same run, with a newer attempt."""
+    newest = {}
+    for row in rows:
+        if row[0] not in newest or row[1] > newest[row[0]][1]:
+            newest[row[0]] = row
+    return list(newest.values())
 
 
 def head_runs(owner, name, sha):
@@ -411,21 +506,23 @@ def head_runs(owner, name, sha):
     run's creation time (epoch seconds), or None without runs: Actions can
     create a push run minutes after a quicker pull_request run, so a head whose
     runs are all young may still get one."""
-    r = gh(["api", f"repos/{owner}/{name}/actions/runs?head_sha={sha}&per_page=100", "--jq",
-            ".workflow_runs[] | [.workflow_id, .run_number, .name, .status, (.conclusion // \"\"), .created_at] | @tsv"])
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "gh api actions/runs failed")
-    active, newest, oldest = [], {}, None
-    for line in r.stdout.splitlines():
-        workflow, number, run_name, status, conclusion, created = line.split("\t")
-        if status != "completed":
-            active.append(run_name)
-        if workflow not in newest or int(number) > newest[workflow][0]:
-            newest[workflow] = (int(number), run_name, status, conclusion)
-        oldest = ts(created) if oldest is None else min(oldest, ts(created))
-    failed = [f"{run_name}={conclusion}" for _, run_name, status, conclusion in newest.values()
+    rows = run_rows(owner, name, sha)
+    active = [run_name for _, _, run_name, status, *_ in rows if status != "completed"]
+    failed = [f"{run_name}={conclusion}" for _, _, run_name, status, conclusion, *_ in newest_runs(rows)
               if status == "completed" and conclusion not in GREEN_RUN_CONCLUSIONS]
-    return active, failed, oldest
+    return active, failed, min((ts(row[5]) for row in rows), default=None)
+
+
+def actions_rollup(owner, name, sha):
+    """The head's statusCheckRollup for a token refused the checks, from its Actions runs
+    (each workflow's newest run as a CheckRun) and commit statuses: None without either,
+    as a head no check has reported on."""
+    checks = [{"__typename": "CheckRun", "name": run_name, "status": status.upper(),
+               "conclusion": conclusion.upper() or None, "completedAt": updated if status == "completed" else None}
+              for _, _, run_name, status, conclusion, _, updated in newest_runs(run_rows(owner, name, sha))]
+    statuses = [{"__typename": "StatusContext", "context": context, "state": state.upper(), "createdAt": created}
+                for context, state, created in commit_statuses(owner, name, sha)]
+    return {"contexts": {"nodes": checks + statuses}} if checks or statuses else None
 
 
 # --- GitLab: each read is mapped onto the GitHub PR shape the gates read -----------
@@ -1147,6 +1244,13 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         if state["workflows"] == 0:
             if state.get("recent_checks") is None:
                 state["recent_checks"] = host["recent_checks"](pr["baseRefName"])
+            if state["recent_checks"] == 0 and checks_unreadable:
+                # A GitHub App's check, outside Actions, is invisible to this token: no workflow
+                # and no status says nothing about whether the repository has CI.
+                raise ChecksUnreadable(
+                    f"checks are unreadable with this token, and the repository has no Actions workflow and no commit "
+                    f"status on {pr['baseRefName']} or recently merged heads, so whether it has CI can't be told; "
+                    f"pass --no-ci if it really has none")
             if state["recent_checks"] == 0:
                 return f"no CI: the repository has no Actions workflow and no check on {pr['baseRefName']} or recently merged heads"
         # External CI (a GitHub App or commit status) posts its first check some time
@@ -1272,6 +1376,9 @@ def main(argv=None, now=time.time, sleep=time.sleep):
         try:
             (code, line), latest = read_once()
             failures = 0
+        except ChecksUnreadable as e:
+            print(f"error: {e}")
+            return 2
         except (RuntimeError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as e:
             failures += 1
             if failures >= MAX_FAILED_READS:

@@ -1565,5 +1565,192 @@ class Loop(unittest.TestCase):
         self.assertIsNone(w.parse_gitlab_url(URL))
 
 
+FORBIDDEN = {"type": "FORBIDDEN", "message": "Resource not accessible by personal access token",
+             "path": ["repository", "pullRequest", "commits", "nodes", 0, "commit", "statusCheckRollup", "contexts", "nodes", 0]}
+
+
+def run_row(name, status="completed", conclusion="success", number=1, workflow=1,
+            created="2026-10-15T09:00:00Z", updated="2026-10-15T09:30:00Z"):
+    """One Actions run as the jq filter of run_rows prints it."""
+    return "\t".join([str(workflow), str(number), name, status, conclusion, created, updated])
+
+
+class FakeGh:
+    """Stands in for w.gh: answers GraphQL reads in turn, and Actions and status reads per poll.
+    runs and statuses hold one list of printed rows per poll (the last repeats)."""
+
+    def __init__(self, graphql, runs=(), statuses=(), workflows=1):
+        self.graphql, self.runs, self.statuses, self.workflows = list(graphql), list(runs), list(statuses), workflows
+        self.polls, self.queries, self.requests = 0, [], []
+
+    def __call__(self, args, stdin=None):
+        self.requests.append(args[1])
+        if args[1] == "graphql":
+            self.queries.append(args[3])
+            self.polls += 1
+            body = self.graphql[min(self.polls, len(self.graphql)) - 1]
+            if isinstance(body, str):
+                return subprocess.CompletedProcess([], 1, "", body)
+            errors = body.get("errors")
+            return subprocess.CompletedProcess([], 1 if errors else 0, json.dumps(body), errors[0]["message"] if errors else "")
+        if "/actions/workflows" in args[1]:
+            return subprocess.CompletedProcess([], 0, str(self.workflows), "")
+        rows = self.runs if "/actions/runs" in args[1] else self.statuses
+        rows = rows[min(self.polls, len(rows)) - 1] if rows else []
+        if "total_count" in args[-1]:
+            return subprocess.CompletedProcess([], 0, str(len(rows)), "")
+        return subprocess.CompletedProcess([], 0, "\n".join(rows), "")
+
+
+def refused(pr=None, errors=(FORBIDDEN,)):
+    """What GitHub answers a token that can't read checks: the data with the rollup nulled, and errors."""
+    pr = pr or ready_pr()
+    pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"] = None
+    return {"data": {"repository": {"pullRequest": pr}}, "errors": list(errors)}
+
+
+def readable(pr=None):
+    return {"data": {"repository": {"pullRequest": pr or ready_pr()}}}
+
+
+class UnreadableChecks(unittest.TestCase):
+    """A fine-grained token is refused the checks: CI is read from Actions runs and commit statuses."""
+
+    def setUp(self):
+        w.checks_unreadable = False
+        self.addCleanup(setattr, w, "checks_unreadable", False)
+
+    def run_main(self, fake, args=("--reviewer", "review-bot")):
+        clock, waits, stderr, out = [w.ts("2026-10-15T10:00:00Z")], [], io.StringIO(), io.StringIO()
+
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+
+        original = w.gh
+        w.gh = fake
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(stderr):
+                code = w.main([URL, *args], now=lambda: clock[0], sleep=sleep)
+        finally:
+            w.gh = original
+        return code, out.getvalue(), stderr.getvalue(), waits
+
+    def bare(self, pr=None):
+        """The PR as the next reads see it: no rollup at all, since the query leaves it out."""
+        pr = pr or ready_pr()
+        del pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+        return readable(pr)
+
+    def test_successful_runs_make_the_head_ready(self):
+        fake = FakeGh([refused()], runs=[[run_row("CI"), run_row("lint", workflow=2)]])
+        code, out, stderr, waits = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 checks green", out)
+        self.assertEqual(waits, [])
+        self.assertEqual(stderr.count("checks unreadable with this token; reading CI from Actions runs"), 1)
+
+    def test_a_failed_run_is_a_failed_check(self):
+        fake = FakeGh([refused()], runs=[[run_row("CI"), run_row("lint", conclusion="failure", workflow=2)]])
+        code, out, _, waits = self.run_main(fake)
+        self.assertEqual(code, 16, out)
+        self.assertIn("lint=FAILURE", out)
+        self.assertEqual(waits, [])
+
+    def test_a_rerun_that_passed_replaces_the_failed_run(self):
+        fake = FakeGh([refused()], runs=[[run_row("CI", conclusion="failure", number=3), run_row("CI", number=4)]])
+        self.assertEqual(self.run_main(fake)[0], 0)
+
+    def test_a_run_in_progress_keeps_waiting_and_later_reads_skip_the_checks(self):
+        fake = FakeGh([refused(), self.bare(), self.bare()],
+                      runs=[[run_row("CI", status="in_progress", conclusion="")], [run_row("CI")]])
+        code, out, stderr, waits = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(waits), 1)
+        self.assertIn("statusCheckRollup", fake.queries[0])
+        self.assertTrue(all("statusCheckRollup" not in q for q in fake.queries[1:]), fake.queries)
+        self.assertEqual(stderr.count("checks unreadable"), 1)
+        self.assertIn("checks not green: CI=IN_PROGRESS", stderr)
+
+    def test_a_queued_run_is_pending_not_failed(self):
+        fake = FakeGh([refused(), self.bare()], runs=[[run_row("CI", status="queued", conclusion="")], [run_row("CI")]])
+        self.assertEqual(self.run_main(fake)[0], 0)
+
+    def test_commit_statuses_count_as_status_contexts(self):
+        ok = "ci/external\tsuccess\t2026-10-15T09:20:00Z"
+        for rows, code in (([ok], 0), (["ci/external\tfailure\t2026-10-15T09:20:00Z"], 16), (["ci/external\tpending\t2026-10-15T09:20:00Z"], 13)):
+            with self.subTest(rows=rows):
+                w.checks_unreadable = False
+                fake = FakeGh([refused()] + [self.bare()] * 300, runs=[[run_row("CI")]], statuses=[rows])
+                outcome = self.run_main(fake)
+                self.assertEqual(outcome[0], code, outcome[1])
+
+    def test_a_head_without_runs_or_statuses_has_no_ci_yet(self):
+        fake = FakeGh([refused()] + [self.bare()] * 300)
+        code, out, stderr, _ = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("no CI for this head", out)
+        self.assertIn("no checks reported yet", stderr)
+
+    def test_a_repository_without_workflows_or_statuses_is_not_taken_for_one_without_ci(self):
+        # Its CI may be a GitHub App's check, which this token can't see.
+        tips = {"data": {"repository": {"ref": {"target": {"oid": "1" * 40}}, "pullRequests": {"nodes": []}}}}
+        fake = FakeGh([refused(), tips], workflows=0)
+        code, out, stderr, waits = self.run_main(fake)
+        self.assertEqual(code, 2, out)
+        self.assertIn("unreadable with this token", out)
+        self.assertIn("--no-ci", out)
+        self.assertEqual(waits, [])
+        self.assertNotIn("read failed", stderr)
+
+    def test_no_ci_lets_that_repository_go_ready(self):
+        fake = FakeGh([refused(), self.bare()], workflows=0)
+        code, out, _, _ = self.run_main(fake, args=("--reviewer", "review-bot", "--no-ci"))
+        self.assertEqual(code, 0, out)
+
+    def test_a_status_on_a_recent_head_still_means_external_ci_to_wait_for(self):
+        tips = {"data": {"repository": {"ref": {"target": {"oid": "1" * 40}}, "pullRequests": {"nodes": []}}}}
+        fake = FakeGh([refused(), tips] + [self.bare()] * 300, workflows=0,
+                      statuses=[[], ["ci/external\tsuccess\t2026-10-15T09:20:00Z"]])
+        code, out, _, waits = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 checks green", out)
+        self.assertEqual(len(waits), 1)
+
+    def test_another_error_still_fails_the_read(self):
+        other = {"type": "NOT_FOUND", "message": "Could not resolve to a Repository", "path": ["repository"]}
+        elsewhere = {**FORBIDDEN, "path": ["repository", "pullRequest", "reviews"]}
+        for errors in ([other], [FORBIDDEN, other], [elsewhere]):
+            with self.subTest(errors=errors):
+                w.checks_unreadable = False
+                code, out, stderr, waits = self.run_main(FakeGh([refused(errors=errors)]))
+                self.assertEqual(code, 2, out)
+                self.assertEqual(stderr.count("read failed"), w.MAX_FAILED_READS - 1)
+                self.assertNotIn("checks unreadable", stderr)
+                self.assertFalse(w.checks_unreadable)
+
+    def test_a_token_that_reads_checks_keeps_the_query_and_asks_for_no_runs_or_statuses(self):
+        fake = FakeGh([readable()])
+        code, out, stderr, _ = self.run_main(fake)
+        self.assertEqual(code, 0, out)
+        self.assertIn("statusCheckRollup", fake.queries[0])
+        self.assertEqual([r for r in fake.requests if r != "graphql"], [f"repos/acme/app/actions/runs?head_sha={HEAD}&per_page=100"])
+        self.assertNotIn("checks unreadable", stderr)
+
+    def test_recent_checks_count_commit_statuses_for_a_refused_token(self):
+        tips = {"data": {"repository": {"ref": {"target": {"oid": "1" * 40}}, "pullRequests": {"nodes": [
+            {"commits": {"nodes": [{"commit": {"oid": "2" * 40}}]}}]}}}}
+        fake = FakeGh([refused(), tips], statuses=[["ci/external\tsuccess\t2026-10-15T09:20:00Z"]])
+        original = w.gh
+        w.gh = fake
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                w.read_pr("acme", "app", 7)
+                self.assertEqual(w.recent_checks("acme", "app", "master"), 2)
+        finally:
+            w.gh = original
+        self.assertNotIn("statusCheckRollup", fake.queries[1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
